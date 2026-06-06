@@ -12,6 +12,7 @@
 #include "buffer_pool.hpp"
 #include "detail/fiber.hpp"
 #include "error.hpp"
+#include "fd.hpp"
 #include <bits/move_only_function.h>
 
 namespace tinyio
@@ -135,6 +136,126 @@ public:
     Result<void> register_buffers(FixedBufferPool& pool) noexcept;
     [[nodiscard]] Result<FixedBuffer> take_fixed_buffer(const size_t size) noexcept { return buffer_pool_.take(size); }
 
+    // =====
+    // IO Methods
+    // =====
+    /// Write up to @p len bytes from @p buf (a registered fixed buffer) to @p fd
+    /// starting at @p offset.
+    ///
+    /// Uses io_uring's WRITE_FIXED operation, which avoids the kernel copy into
+    /// a pinned buffer because @p buf is already registered with the ring.
+    /// Pass @p offset = -1 to use the file's current position.
+    ///
+    /// @return Number of bytes written, or an error code.
+    ///
+    /// @code
+    /// FIBER_TRY(auto buf, fio.take_fixed_buffer(4096));
+    /// std::memcpy(buf.ptr(), data.data(), data.size());
+    /// FIBER_TRY(auto n, fio.write_fixed(fd, buf, data.size(), file_offset));
+    /// @endcode
+    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset = -1);
+
+    /// Write the whole contents of @p buf to @p fd starting at @p offset.
+    /// Equivalent to write_fixed(fd, buf, buf.size(), offset).
+    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, off_t offset = -1);
+    /// Read up to @p len bytes from @p fd into @p buf (a registered fixed buffer)
+    /// starting at @p offset.
+    ///
+    /// Uses io_uring's READ_FIXED operation.
+    /// Pass @p offset = -1 to use the file's current position.
+    ///
+    /// @return Number of bytes read, or an error code.
+    ///
+    /// @code
+    /// FIBER_TRY(auto buf, fio.take_fixed_buffer(4096));
+    /// FIBER_TRY(auto n, fio.read_fixed(fd, buf, 4096, 0));
+    /// std::string_view content{reinterpret_cast<const char*>(buf.ptr()),
+    ///                          static_cast<size_t>(n)};
+    /// @endcode
+    [[nodiscard]] Result<uint32_t> read_fixed(Fd& fd, FixedBuffer& buf, size_t len, off_t offset = -1) noexcept;
+
+    /// Read up to buf.size() bytes from @p fd into @p buf starting at @p offset.
+    /// Equivalent to read_fixed(fd, buf, buf.size(), offset).
+    [[nodiscard]] Result<uint32_t> read_fixed(Fd& fd, FixedBuffer& buf, off_t offset = -1) noexcept;
+
+    /// Read up to buf.size() bytes from @p fd into the caller-provided span @p buf.
+    ///
+    /// Unlike read_fixed, this works with any user buffer but requires the kernel
+    /// to copy data through an intermediate bounce buffer.
+    /// Pass @p offset = -1 to use the file's current position.
+    ///
+    /// @return Number of bytes read, or an error code.
+    [[nodiscard]] Result<uint32_t> read(Fd& fd, std::span<std::byte> buf, off_t offset = -1) noexcept;
+
+    /// Write the scatter-gather vector @p iovecs to @p fd starting at @p offset.
+    ///
+    /// Wraps pwritev2 via io_uring's WRITEV operation.
+    /// Pass @p offset = -1 to use the file's current position.
+    ///
+    /// @return Total bytes written, or an error code.
+    [[nodiscard]] Result<uint32_t> writev(Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
+
+    /// Flush pending writes on @p fd to the storage device.
+    ///
+    /// @param datasync  If true, flushes data only (fdatasync semantics —
+    ///                  metadata such as mtime may lag).  If false, flushes
+    ///                  both data and metadata (fsync semantics).
+    /// @return {} on success, or an error code.
+    [[nodiscard]] Result<void> fsync(Fd& fd, bool datasync = false) noexcept;
+
+    /// Open or create the file at @p path and return a file descriptor.
+    ///
+    /// @param path
+    /// @param flags  Standard open(2) flags such as O_RDONLY, O_CREAT | O_WRONLY.
+    /// @param mode   Permission bits used when O_CREAT creates a new file.
+    ///               Ignored if O_CREAT is not set.
+    /// @return An owned Fd on success, or an error code (e.g. ENOENT, EACCES).
+    ///
+    /// @code
+    /// FIBER_TRY(auto fd, fio.open("/var/log/app.log",
+    ///                              O_CREAT | O_WRONLY | O_APPEND, 0644));
+    /// @endcode
+    [[nodiscard]] Result<Fd> open(const std::filesystem::path& path, int flags, mode_t mode = 0644) noexcept;
+
+    /// Accept a new connection on @p server_fd, retrieving the client address.
+    ///
+    /// @return An owned Fd on success, or an error code.
+    [[nodiscard]] Result<Fd> accept(Fd& server_fd, SocketAddress& client_addr, int flags = kDefaultAcceptFlags) noexcept;
+
+    /// Accept a new connection on @p server_fd without retrieving the client address.
+    ///
+    /// @return An owned Fd on success, or an error code.
+    [[nodiscard]] Result<Fd> accept(Fd& server_fd, int flags = kDefaultAcceptFlags) noexcept;
+
+    /// Close @p fd asynchronously via io_uring.
+    ///
+    /// Takes ownership of @p fd so that it is released exactly once even if the
+    /// close CQE returns an error.  Callers should use std::move:
+    ///
+    /// @code
+    /// FIBER_TRY_VOID(fio.close(std::move(fd)));
+    /// @endcode
+    [[nodiscard]] Result<void> close(Fd&& fd) noexcept;
+
+    /// Allocate or deallocate disk space for @p fd in the range [@p offset, @p offset + @p len).
+    ///
+    /// @param mode  fallocate(2) mode flags (0 for a simple pre-allocation,
+    ///              FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to punch a hole, etc.).
+    /// @return {} on success, or an error code.
+    [[nodiscard]] Result<void> fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept;
+
+    /// Truncate or extend @p fd to exactly @p len bytes.
+    ///
+    /// Requires kernel 6.9+ and liburing 2.6+.
+    /// @return {} on success, or an error code.
+    [[nodiscard]] Result<void> ftruncate(Fd& fd, off_t len) noexcept;
+
+    /// Suspend the current fiber for the given duration.
+    ///
+    /// @param duration The duration to sleep for.
+    /// @return {} on success, or an error code.
+    [[nodiscard]] Result<void> sleep_for_ns(std::chrono::nanoseconds duration) noexcept;
+
 private:
     //
     // IO Uring management
@@ -189,7 +310,7 @@ private:
             return static_cast<T>(op.cqe_res);
         }
     }
-    
+
     //
     // event fd for cross-thread signaling
     //

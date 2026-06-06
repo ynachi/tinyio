@@ -311,4 +311,96 @@ Result<io_uring_sqe*> Runtime::get_sqe() noexcept
     }
     return sqe;
 }
+
+Result<uint32_t> Runtime::read(Fd& fd, const std::span<std::byte> buf, const off_t offset) noexcept
+{
+    return syscall("read", [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
+}
+
+Result<uint32_t> Runtime::read_fixed(Fd& fd, FixedBuffer& buf, size_t len, off_t offset) noexcept
+{
+    return syscall("read_fixed", [&](io_uring_sqe* sqe)
+                   { io_uring_prep_read_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
+}
+
+Result<uint32_t> Runtime::read_fixed(Fd& fd, FixedBuffer& buf, off_t offset) noexcept
+{
+    return read_fixed(fd, buf, buf.size(), offset);
+}
+
+Result<uint32_t> Runtime::writev(Fd& fd, std::span<const iovec> iovecs, off_t offset) noexcept
+{
+    return syscall("writev",
+                   [&](io_uring_sqe* sqe) { io_uring_prep_writev(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
+}
+
+Result<void> Runtime::fsync(Fd& fd, bool datasync) noexcept
+{
+    return syscall<void>(
+        "fsync", [&](io_uring_sqe* sqe) { io_uring_prep_fsync(sqe, fd.fd, datasync ? IORING_FSYNC_DATASYNC : 0); });
+}
+
+Result<Fd> Runtime::open(const std::filesystem::path& path, int flags, mode_t mode) noexcept
+{
+    return syscall<Fd>("open",
+                       [&](io_uring_sqe* sqe) { io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode); });
+}
+
+Result<void> Runtime::close(Fd&& fd) noexcept
+{
+    // Nullify so Fd destructor doesn't close it twice
+    int raw_fd = fd.Release();
+    return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, raw_fd); });
+}
+
+Result<void> Runtime::fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept
+{
+    return syscall<void>("fallocate",
+                         [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
+}
+
+Result<void> Runtime::ftruncate(Fd& fd, off_t len) noexcept
+{
+    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) {
+        io_uring_prep_ftruncate(sqe, fd.fd, len);
+    });
+}
+
+Result<Fd> Runtime::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
+{
+    return syscall<Fd>("accept", [&](io_uring_sqe* sqe) {
+        client_addr.addrlen = sizeof(sockaddr_storage);
+        io_uring_prep_accept(sqe, server_fd.fd, client_addr.GetMutable(), &client_addr.addrlen, flags);
+    });
+}
+
+Result<Fd> Runtime::accept(Fd& server_fd, int flags) noexcept
+{
+    return syscall<Fd>("accept", [&](io_uring_sqe* sqe) {
+        io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags);
+    });
+}
+
+Result<void> Runtime::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
+{
+    if (duration.count() <= 0)
+    {
+        return {};
+    }
+
+    auto r = syscall<void>("sleep_for", [&](io_uring_sqe* sqe) {
+        const auto ns = duration.count();
+        auto& ts = current_fiber_->operation.timeout_ts;
+        ts.tv_sec = static_cast<decltype(ts.tv_sec)>(ns / 1'000'000'000LL);
+        ts.tv_nsec = static_cast<decltype(ts.tv_nsec)>(ns % 1'000'000'000LL);
+        io_uring_prep_timeout(sqe, &ts, 0U, 0U);
+    });
+
+    if (!r && r.error().code == ETIME)
+    {
+        return {}; // ETIME is the expected success code for timeout
+    }
+
+    return r;
+}
 }  // namespace tinyio
