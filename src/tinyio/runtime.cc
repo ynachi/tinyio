@@ -1,0 +1,314 @@
+#include "tinyio/runtime.hpp"
+
+#include <cassert>
+#include <cerrno>
+#include <format>
+
+#include <sys/eventfd.h>
+
+namespace tinyio
+{
+Result<void> Runtime::initialize() noexcept
+{
+    io_uring_params params{};
+
+    // disable the ring first
+    params.flags = kUringBaseFlags | IORING_SETUP_R_DISABLED;
+
+    params.cq_entries = opts_.cq_entries;
+
+    // Safely configure SQPOLL if requested
+    if (params.flags & IORING_SETUP_SQPOLL)
+    {
+        params.sq_thread_idle = opts_.sq_thread_idle_ms;
+        if (opts_.sq_thread_cpu >= 0)
+        {
+            params.flags |= IORING_SETUP_SQ_AFF;
+            params.sq_thread_cpu = opts_.sq_thread_cpu;
+        }
+    }
+
+    // io uring requirement, cq_entries * 2
+    if (const int rc = io_uring_queue_init_params(opts_.cq_entries * 2, &ring_, &params); rc < 0)
+    {
+        return fail(-rc, "io_uring_queue_init_params");
+    }
+
+    wake_fd_ = eventfd(0, EFD_CLOEXEC);
+    if (wake_fd_ < 0)
+    {
+        io_uring_queue_exit(&ring_);
+        return fail(errno, "eventfd");
+    }
+
+    // register pool if not empty
+    if (buffer_pool_.bucket_count() != 0)
+    {
+        TRY(register_buffers(buffer_pool_));
+        ALOG_INFO("the buffer pool have been registered to io_uring");
+    }
+
+    ALOG_INFO("Initialized IO context with {} submission entries (SQPOLL: {})", opts_.sq_entries,
+              (opts_.additional_uring_flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
+
+    return {};
+}
+
+Result<void> Runtime::register_buffers(FixedBufferPool& pool) noexcept
+{
+    if (pool.is_registered())
+    {
+        return fail(EALREADY, "register_buffers: pool already registered");
+    }
+
+    if (const int ret = io_uring_register_buffers(&ring_, pool.iovecs_ptr(), pool.total_capacity()); ret < 0)
+    {
+        return fail(-ret, "io_uring_register_buffers");
+    }
+
+    pool.set_registered();
+
+    return {};
+}
+
+//
+// Fiber management
+//
+void Runtime::push_ready(detail::fiber::Fiber* fiber) noexcept
+{
+    if (fiber == nullptr || fiber->state == detail::fiber::FiberState::done)
+    {
+        return;
+    }
+
+    // Ask the specific hook if it is already in a list
+    auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
+    if (hook->is_linked())
+    {
+        return;
+    }
+
+    fiber->state = detail::fiber::FiberState::ready;
+    ready_queue_.push_back(fiber);
+}
+
+void Runtime::remove_ready(detail::fiber::Fiber* fiber) noexcept
+{
+    if (fiber != nullptr)
+    {
+        // We don't even need to check if it's in the queue here!
+        // IntrusiveList::remove() already safely checks `is_linked()` internally
+        // and does nothing if the fiber isn't in the list.
+        ready_queue_.remove(fiber);
+    }
+}
+
+[[nodiscard]] detail::fiber::Fiber* Runtime::pop_ready() noexcept
+{
+    // pop_front() automatically resets the hook to an unlinked state!
+    return ready_queue_.pop_front();
+}
+
+void Runtime::destroy_fiber(detail::fiber::Fiber* fiber) noexcept
+{
+    if (fiber == nullptr)
+    {
+        return;
+    }
+
+    ready_queue_.remove(fiber);
+    all_fibers_.remove(fiber);
+    fiber->task = nullptr;  // Clean user memory
+
+    // Enforce the High-Water Mark!
+    if (idle_fibers_.size() >= opts_.max_idle_fibers)
+    {
+        all_fibers_.remove(fiber);
+        delete fiber;  // The pool is full, return memory to the OS
+    }
+    else
+    {
+        idle_fibers_.push_back(fiber);  // Cache it for later
+    }
+
+    --live_fibers_;
+}
+
+void Runtime::destroy_all_fibers() noexcept
+{
+    // Clean up active fibers
+    while (detail::fiber::Fiber* fiber = all_fibers_.pop_front())
+    {
+        ready_queue_.remove(fiber);
+        delete fiber;
+    }
+
+    // Clean up cached/idle fibers
+    while (const detail::fiber::Fiber* fiber = idle_fibers_.pop_front())
+    {
+        delete fiber;
+    }
+}
+
+Result<FiberId> Runtime::spawn_task(std::move_only_function<void(Runtime&) noexcept> task) noexcept
+{
+    if (!is_owner_thread())
+    {
+        return fail(EPERM, "spawn");
+    }
+
+    auto* fiber = idle_fibers_.pop_front();
+
+    if (fiber == nullptr)
+    {
+        fiber = new (std::nothrow) detail::fiber::Fiber();
+
+        // if fiber is null again
+        if (fiber == nullptr)
+        {
+            return fail(ENOMEM, "spawn");
+        }
+
+        const auto stack = TRY(detail::stack::allocate_stack(opts_.stack_size, opts_.guard_size));
+
+        fiber->stack = stack;
+
+        // Only push to all_fibers_ when it's newly allocated
+        all_fibers_.push_front(fiber);
+    }
+
+    ++live_fibers_;
+
+    //  Reset state  for all fibers
+    fiber->id = next_fiber_id_++;  // give every execution a unique ID for logging!
+    fiber->task = std::move(task);
+    fiber->state = detail::fiber::FiberState::ready;
+    detail::tools_create_fiber(fiber->tools);
+
+// Reset CPU registers
+#if defined(__x86_64__)
+    auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
+    *--sp = 0U;
+    fiber->context.rsp = reinterpret_cast<std::uint64_t>(sp);
+    fiber->context.rip = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
+    fiber->context.r12 = reinterpret_cast<std::uint64_t>(fiber);
+#elif defined(__aarch64__)
+    fiber->context.sp = reinterpret_cast<std::uint64_t>(fiber->stack.high);
+    fiber->context.pc = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
+    fiber->context.x19 = reinterpret_cast<std::uint64_t>(fiber);
+#else
+    #error "unsupported architecture"
+#endif
+
+    // push to active list
+    push_ready(fiber);
+
+    return fiber->id;
+}
+
+void Runtime::resume_fiber(detail::fiber::Fiber* fiber) noexcept
+{
+    // Mark this fiber as the currently running one
+    current_fiber_ = fiber;
+
+    fiber->state = detail::fiber::FiberState::running;
+
+    detail::tools_before_switch(scheduler_tools_, &fiber->tools, &fiber->stack);
+    // Jump into the fiber's execution!
+    tinyio_ctx_switch(&scheduler_context_, &fiber->context);
+    detail::tools_after_switch(scheduler_tools_);
+
+    // Clear it when we jump back to the scheduler
+    current_fiber_ = nullptr;
+}
+
+void Runtime::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
+{
+    detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
+
+    tinyio_ctx_switch(&fiber->context, &scheduler_context_);
+
+    detail::tools_after_switch(fiber->tools);
+}
+
+[[nodiscard]] Result<void> Runtime::yield() noexcept
+{
+    // Check 1: Did the user try to cheat and call this from a different OS thread?
+    // Check 2: Did the user call this from main() instead of inside a fiber?
+    if (!is_owner_thread() || current_fiber_ == nullptr)
+    {
+        return fail(EPERM, "yield");
+    }
+
+    assert(current_fiber_->runtime == this);
+    assert(current_fiber_->state == detail::fiber::FiberState::running);
+
+    push_ready(current_fiber_);
+    suspend_fiber(current_fiber_);
+
+    return {};
+}
+
+bool Runtime::has_live_fibers() const noexcept
+{
+    return live_fibers_ > 0;
+}
+
+Result<void> Runtime::submit_or_wait_for() noexcept
+{
+    // Only block if we have no local work to do.
+    if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.empty())
+    {
+        int ret;
+        if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN)
+        {
+            ret = io_uring_submit_and_get_events(&ring_);
+        }
+        else
+        {
+            ret = io_uring_submit(&ring_);
+        }
+
+        if (ret < 0 && ret != -EINTR)
+        {
+            return fail(-ret, "submit_or_wait_for.io_uring_submit");
+        }
+    }
+    else
+    {
+        // Thundering herd mitigation
+        is_sleeping_.store(true, std::memory_order_seq_cst);
+
+        // Double check all sources of work before sleeping
+        if (io_uring_cq_ready(&ring_) == 0 && ready_queue_.empty())
+        {
+            if (const auto ret = io_uring_submit_and_wait(&ring_, 1); ret < 0 && ret != -EINTR)
+            {
+                return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait");
+            }
+        }
+
+        is_sleeping_.store(false, std::memory_order_relaxed);
+    }
+
+    return {};
+}
+
+Result<io_uring_sqe*> Runtime::get_sqe() noexcept
+{
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (sqe == nullptr)
+    {
+        // SQ is full. Try one submit to clear space.
+        io_uring_submit(&ring_);
+        sqe = io_uring_get_sqe(&ring_);
+    }
+
+    // its a fatal error if its null again
+    if (sqe == nullptr)
+    {
+        return fail(ENOSPC, "get_sqe");
+    }
+    return sqe;
+}
+}  // namespace tinyio
