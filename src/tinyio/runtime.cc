@@ -440,7 +440,7 @@ namespace tinyio
 Result<void> IO::submit_or_wait_for() noexcept
 {
     // Only block if we have no local work to do.
-    if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.empty())
+    if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.empty() || !post_queue_.empty())
     {
         int ret;
         if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN)
@@ -771,7 +771,10 @@ void IO::run_until_done() noexcept
 
     // Also drain the cross-thread post queue: tasks posted before run_until_done()
     // is called would be silently dropped if we only checked live_fibers_.
-    while (has_live_fibers() || inflight_ops_ > 0 || !ready_queue_.empty() ||
+    // Note: inflight_ops_ is always at least 1 because the cross-thread wake_fd_
+    // is constantly armed for reading. We check for > 1 to ensure there are
+    // no active user I/O operations pending.
+    while (has_live_fibers() || inflight_ops_ > 1 || !ready_queue_.empty() ||
            !post_queue_.empty())
     {
         if (auto res = tick(); !res)

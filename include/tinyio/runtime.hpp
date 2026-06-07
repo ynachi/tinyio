@@ -6,7 +6,6 @@
 #include <thread>
 #include <vector>
 
-// Removed moodycamel::ConcurrentQueue, using tiny MpscQueue instead.
 #include "detail/mpsc_queue.hpp"
 
 #include <fcntl.h>

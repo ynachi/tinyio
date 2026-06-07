@@ -22,3 +22,6 @@ add_sanitizers(tinyio_disk_bench)
 add_executable(tinyio_http_bench tinyio_http_bench.cpp)
 target_link_libraries(tinyio_http_bench PRIVATE tinyio gflags::gflags)
 add_sanitizers(tinyio_http_bench)
+
+add_executable(tinyio_post_smoke tinyio_post_smoke.cpp)
+target_link_libraries(tinyio_post_smoke PRIVATE tinyio gflags::gflags)
