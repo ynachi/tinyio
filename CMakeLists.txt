@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(tinyio)
+project(tinyio LANGUAGES CXX C ASM)
 
 set(CMAKE_CXX_STANDARD 23)
 # We need that fr our TRY macro, the code is Linux only so this is fine
@@ -77,7 +77,7 @@ function(tio_add_demo target_name source_file)
     # Create the Target (If we passed the checks)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE ${ARG_LIBS})
-    kio_target_compile_options(${target_name})
+    tio_target_compile_options(${target_name})
 
     # Install to bin/examples
     install(TARGETS ${target_name}
@@ -147,9 +147,9 @@ function(tio_add_test target_name source_file)
     # Create the Target (If we passed the checks)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE ${ARG_LIBS})
-    kio_target_compile_options(${target_name})
+    tio_target_compile_options(${target_name})
     # always enable sanitizer on debug builds
-    kio_add_sanitizers(${target_name})
+    tio_add_sanitizers(${target_name})
 
     add_test(NAME ${target_name} COMMAND ${target_name})
     gtest_discover_tests(${target_name})
@@ -291,6 +291,12 @@ add_library(tinyio
         src/tinyio/stack.cc
         src/tinyio/tcp_listener.cc
 )
+
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")
+    target_sources(tinyio PRIVATE include/tinyio/asm/context_x86_64.S)
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64)")
+    target_sources(tinyio PRIVATE include/tinyio/asm/context_aarch64.S)
+endif()
 # Include directories
 target_include_directories(tinyio PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -304,7 +310,7 @@ target_link_libraries(tinyio PUBLIC
         OpenSSL::SSL
         OpenSSL::Crypto
 )
-kio_add_sanitizers(tinyio)
+tio_add_sanitizers(tinyio)
 
 #-----------------------------------------------
 # bitcask lib
@@ -331,7 +337,7 @@ if (KIO_BUILD_BITCASK)
             PRIVATE
             crc32c
     )
-    kio_add_sanitizers(bitcask)
+    tio_add_sanitizers(bitcask)
 endif ()
 
 
@@ -374,50 +380,50 @@ endif ()
 if (TIO_BUILD_SEGMENT_BENCH)
     add_executable(segment_append_bench benchmarks/cpp/segment_append_bench.cpp)
     target_link_libraries(segment_append_bench PRIVATE bitcask)
-    kio_target_compile_options(segment_append_bench)
+    tio_target_compile_options(segment_append_bench)
 endif ()
 
 if (TIO_BUILD_FIBER_BENCH)
     add_executable(fiber_vs_coro_bench benchmarks/cpp/fiber_vs_coro_bench.cpp)
     target_link_libraries(fiber_vs_coro_bench PRIVATE uring)
-    kio_target_compile_options(fiber_vs_coro_bench)
+    tio_target_compile_options(fiber_vs_coro_bench)
 endif ()
 
 # TODO: need cleanup
 if (TIO_BUILD_HTTP_BENCH)
-    add_executable(kio_http_bench benchmarks/cpp/kio_http_bench.cpp)
-    target_link_libraries(kio_http_bench PRIVATE uring)
-    kio_target_compile_options(kio_http_bench)
+    add_executable(tio_http_bench benchmarks/cpp/tio_http_bench.cpp)
+    target_link_libraries(tio_http_bench PRIVATE uring)
+    tio_target_compile_options(tio_http_bench)
 
-    add_executable(kio_fiber_http_bench benchmarks/cpp/kio_fiber_http_bench.cpp)
-    target_link_libraries(kio_fiber_http_bench PRIVATE uring)
-    kio_target_compile_options(kio_fiber_http_bench)
+    add_executable(tio_fiber_http_bench benchmarks/cpp/tio_fiber_http_bench.cpp)
+    target_link_libraries(tio_fiber_http_bench PRIVATE uring)
+    tio_target_compile_options(tio_fiber_http_bench)
 
     add_executable(zio_http_bench zio/bench/http_bench.cpp)
     target_link_libraries(zio_http_bench PRIVATE uring mimalloc-static pthread)
-    kio_target_compile_options(zio_http_bench)
+    tio_target_compile_options(zio_http_bench)
 
     add_executable(zio_file_io_bench zio/bench/file_io_bench.cpp)
     target_link_libraries(zio_file_io_bench PRIVATE uring mimalloc-static)
-    kio_target_compile_options(zio_file_io_bench)
+    tio_target_compile_options(zio_file_io_bench)
 
     add_executable(zio_cross_thread_spawn_smoke zio/bench/cross_thread_spawn_smoke.cpp)
     target_link_libraries(zio_cross_thread_spawn_smoke PRIVATE uring mimalloc-static pthread)
-    kio_target_compile_options(zio_cross_thread_spawn_smoke)
+    tio_target_compile_options(zio_cross_thread_spawn_smoke)
 
     add_executable(other_baseline_http_bench zio/bench/other_baseline_http_bench.cpp)
     target_link_libraries(other_baseline_http_bench PRIVATE uring mimalloc-static pthread)
-    kio_target_compile_options(other_baseline_http_bench)
+    tio_target_compile_options(other_baseline_http_bench)
 
     add_executable(other_baseline_file_io_bench zio/bench/other_baseline_file_io_bench.cpp)
     target_link_libraries(other_baseline_file_io_bench PRIVATE uring mimalloc-static)
-    kio_target_compile_options(other_baseline_file_io_bench)
+    tio_target_compile_options(other_baseline_file_io_bench)
 
     add_executable(asio_http_bench benchmarks/cpp/asio_http_bench.cpp)
     target_link_libraries(asio_http_bench PRIVATE pthread)
-    kio_target_compile_options(asio_http_bench)
+    tio_target_compile_options(asio_http_bench)
 
-    add_executable(kio_asio_disk_bench benchmarks/cpp/kio_asio_disk_bench.cpp)
-    target_link_libraries(kio_asio_disk_bench PRIVATE uring pthread)
-    kio_target_compile_options(kio_asio_disk_bench)
+    add_executable(tio_asio_disk_bench benchmarks/cpp/tio_asio_disk_bench.cpp)
+    target_link_libraries(tio_asio_disk_bench PRIVATE uring pthread)
+    tio_target_compile_options(tio_asio_disk_bench)
 endif ()

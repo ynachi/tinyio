@@ -96,10 +96,10 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd, std::span<const 
     while (!data.empty())
     {
         iovec iov{.iov_base = const_cast<std::byte*>(data.data()), .iov_len = data.size()};
-        FIBER_TRY(const auto written, fio.writev(fd, std::span<const iovec>{&iov, 1}));
+        auto written = TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}));
         if (written <= 0)
         {
-            return tinyio::error_from_errc(std::errc::io_error);
+            return tinyio::fail(EIO, "writev");
         }
         data = data.subspan(static_cast<size_t>(written));
     }
@@ -133,7 +133,7 @@ void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size)
     auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
-        std::cerr << "bind failed on worker " << worker.id() << ": " << listener.error().message() << '\n';
+        std::cerr << "bind failed: " << listener.error().error_code().message() << '\n';
         return;
     }
 
@@ -145,13 +145,13 @@ void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size)
         {
             if (!g_stop_requested.load(std::memory_order_relaxed))
             {
-                std::cerr << "accept failed: " << client_res.error().message() << '\n';
+                std::cerr << "accept failed: " << client_res.error().error_code().message() << '\n';
             }
             return;
         }
 
-        const int raw_fd = client_res->release();
-        worker.spawn([raw_fd](tinyio::IO& fio) { handle_client(fio, raw_fd); });
+        const int raw_fd = client_res->Release();
+        (void)worker.spawn([raw_fd](tinyio::IO& fio) noexcept { handle_client(fio, raw_fd); });
     }
 }
 }  // namespace
@@ -165,7 +165,7 @@ int main(int argc, char** argv)
         std::signal(SIGTERM, signal_handler);
         std::signal(SIGPIPE, SIG_IGN);
         
-        tinyio::ALOG::set_level(tinyio::ALOG::Level::Disabled);
+        tinyio::log::set_level(tinyio::log::Level::Disabled);
 
         std::vector<std::jthread> threads;
         std::vector<std::stop_source> stop_sources;
@@ -180,9 +180,9 @@ int main(int argc, char** argv)
             threads.emplace_back([i, opts, st] {
                 tinyio::IoOptions io_opts;
                 io_opts.stack_size = opts.stack_size;
-                tinyio::IO worker(i, io_opts);
+                tinyio::IO worker(i, io_opts, {});
                 
-                worker.spawn([opts](tinyio::IO& io) {
+                (void)worker.spawn([opts](tinyio::IO& io) noexcept {
                     accept_loop(io, opts.port, opts.stack_size);
                 });
                 

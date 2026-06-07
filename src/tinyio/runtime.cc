@@ -11,8 +11,8 @@
 
 namespace tinyio
 {
-IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> pool_configs) try
-    : id_(id), opts_(opts), buffer_pool_(pool_configs)
+IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> pool_configs)
+try : id_(id), opts_(opts), buffer_pool_(pool_configs)
 {
     if (auto res = initialize(); !res.has_value())
     {
@@ -78,7 +78,7 @@ Result<void> IO::initialize() noexcept
     // disable the ring first
     params.flags |= kUringBaseFlags | opts_.additional_uring_flags | IORING_SETUP_R_DISABLED;
 
-    params.cq_entries = opts_.sq_entries;
+    params.cq_entries = opts_.sq_entries * 2;
 
     // Safely configure SQPOLL if requested
     if (params.flags & IORING_SETUP_SQPOLL)
@@ -91,8 +91,7 @@ Result<void> IO::initialize() noexcept
         }
     }
 
-    // io uring requirement, cq_entries * 2
-    if (const int rc = io_uring_queue_init_params(opts_.sq_entries * 2, &ring_, &params); rc < 0)
+    if (const int rc = io_uring_queue_init_params(opts_.sq_entries, &ring_, &params); rc < 0)
     {
         return fail(-rc, "io_uring_queue_init_params");
     }
@@ -345,9 +344,11 @@ bool IO::has_live_fibers() const noexcept
 // IO Uring methods
 //
 
+}  // namespace tinyio
+
 extern "C" [[noreturn]] void tinyio_fiber_entry(void* fiber_ptr) noexcept
 {
-    auto* fiber = static_cast<detail::fiber::Fiber*>(fiber_ptr);
+    auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(fiber_ptr);
     if (fiber == nullptr || fiber->runtime == nullptr)
     {
         std::terminate();
@@ -358,8 +359,12 @@ extern "C" [[noreturn]] void tinyio_fiber_entry(void* fiber_ptr) noexcept
     tinyio::detail::tools_after_switch(rt.scheduler_tools_);
     fiber->task(rt);
     rt.finish_current_fiber(fiber);
+
+    std::terminate();
 }
 
+namespace tinyio
+{
 Result<void> IO::submit_or_wait_for() noexcept
 {
     // Only block if we have no local work to do.
@@ -457,7 +462,11 @@ Result<void> IO::activate()
     }
 
     // we need to submit a first read, and this is a good place
-    arm_wake_read();
+    if (auto res = arm_wake_read(); !res)
+    {
+        const auto err = res.error();
+        ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
+    }
     is_activated_ = true;
 
     // set thread id

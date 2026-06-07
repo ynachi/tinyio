@@ -129,10 +129,10 @@ tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::Fd& fd, std
     {
         const auto len = std::min<std::uint64_t>(block.size(), bytes - offset);
         iovec iov{.iov_base = const_cast<std::byte*>(block.data()), .iov_len = static_cast<std::size_t>(len)};
-        FIBER_TRY(auto written, fio.writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
+        auto written = TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
         if (written != static_cast<int32_t>(len))
         {
-            return tinyio::error_from_errc(std::errc::io_error);
+            return tinyio::fail(EIO, "writev");
         }
         offset += len;
     }
@@ -152,26 +152,24 @@ BenchResult bench_tinyio_fiber(const Options& opts, const std::vector<std::byte>
 
     tinyio::Fd fd{raw_fd};
     tinyio::IoOptions io_opts;
-    tinyio::IO io(0, io_opts);
+    tinyio::IO io(0, io_opts, {});
     
     // We want to run the write inside a fiber, and wait for it to finish
     bool finished = false;
     std::optional<tinyio::Result<void>> result;
     
     const auto start = Clock::now();
-    io.spawn([&](tinyio::IO& fio) {
+    (void)io.spawn([&](tinyio::IO& fio) noexcept {
         result = tinyio_fiber_write_all(fio, fd, block, opts.bytes);
         finished = true;
     });
     
-    while (!finished) {
-        io.tick();
-    }
+    io.run_until_done();
     const auto end = Clock::now();
     
     if (!result.value())
     {
-        throw std::runtime_error("tinyio write failed: " + result.value().error().message());
+        throw std::runtime_error("tinyio write failed: " + result.value().error().error_code().message());
     }
 
     const double seconds = std::chrono::duration<double>(end - start).count();
@@ -186,7 +184,7 @@ int main(int argc, char** argv)
         const auto opts = parse_args(argc, argv);
         std::vector<std::byte> block(opts.block, std::byte{0x42});
         
-        tinyio::ALOG::set_level(tinyio::ALOG::Level::Disabled);
+        tinyio::log::set_level(tinyio::log::Level::Disabled);
 
         std::cout << "Benchmarking disk write:\n"
                   << "  Bytes: " << opts.bytes << '\n'
