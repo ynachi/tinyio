@@ -17,7 +17,7 @@
     #define LOG_BUILD_LEVEL 0
 #endif
 
-namespace URing::ALOG
+namespace tinyio::log
 {
 
 enum class Level : uint8_t
@@ -228,16 +228,16 @@ void log_impl(const std::source_location loc, std::format_string<Args...> fmt, A
     }
 }
 
-}  // namespace URing::ALOG
+}  // namespace tinyio::log
 
 #define ALOG_DETAIL_WRITE(LEVEL, ...)                                                                               \
     do                                                                                                              \
     {                                                                                                               \
-        if constexpr (::URing::ALOG::Level::LEVEL >= ::URing::ALOG::kBuildLevel)                                    \
+        if constexpr (::tinyio::log::Level::LEVEL >= ::tinyio::log::kBuildLevel)                                    \
         {                                                                                                           \
-            if (::URing::ALOG::should_log(::URing::ALOG::Level::LEVEL)) [[unlikely]]                                \
+            if (::tinyio::log::should_log(::tinyio::log::Level::LEVEL)) [[unlikely]]                                \
             {                                                                                                       \
-                ::URing::ALOG::log_impl<::URing::ALOG::Level::LEVEL>(std::source_location::current(), __VA_ARGS__); \
+                ::tinyio::log::log_impl<::tinyio::log::Level::LEVEL>(std::source_location::current(), __VA_ARGS__); \
             }                                                                                                       \
         }                                                                                                           \
     } while (0)

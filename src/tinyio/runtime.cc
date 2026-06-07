@@ -11,7 +11,7 @@
 
 namespace tinyio
 {
-IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> pool_configs)
+IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> pool_configs) try
     : id_(id), opts_(opts), buffer_pool_(pool_configs)
 {
     if (auto res = initialize(); !res.has_value())
@@ -22,6 +22,16 @@ IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> p
     }
 
     ALOG_INFO("initialized io worker {}", id_);
+}
+catch (const std::exception& e)
+{
+    ALOG_ERROR("failed to construct IO worker {}: {}", id, e.what());
+    std::abort();
+}
+catch (...)
+{
+    ALOG_ERROR("failed to construct IO worker {}: unknown exception", id);
+    std::abort();
 }
 
 IO::~IO() noexcept

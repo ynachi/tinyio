@@ -150,9 +150,9 @@ public:
     /// @return Number of bytes written, or an error code.
     ///
     /// @code
-    /// FIBER_TRY(auto buf, fio.take_fixed_buffer(4096));
+    /// auto buf = TRY(fio.take_fixed_buffer(4096));
     /// std::memcpy(buf.ptr(), data.data(), data.size());
-    /// FIBER_TRY(auto n, fio.write_fixed(fd, buf, data.size(), file_offset));
+    /// auto n = TRY(fio.write_fixed(fd, buf, data.size(), file_offset));
     /// @endcode
     [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset = -1) noexcept;
 
@@ -168,8 +168,8 @@ public:
     /// @return Number of bytes read, or an error code.
     ///
     /// @code
-    /// FIBER_TRY(auto buf, fio.take_fixed_buffer(4096));
-    /// FIBER_TRY(auto n, fio.read_fixed(fd, buf, 4096, 0));
+    /// auto buf = TRY(fio.take_fixed_buffer(4096));
+    /// auto n = TRY(fio.read_fixed(fd, buf, 4096, 0));
     /// std::string_view content{reinterpret_cast<const char*>(buf.ptr()),
     ///                          static_cast<size_t>(n)};
     /// @endcode
@@ -228,8 +228,7 @@ public:
     /// @return An owned Fd on success, or an error code (e.g. ENOENT, EACCES).
     ///
     /// @code
-    /// FIBER_TRY(auto fd, fio.open("/var/log/app.log",
-    ///                              O_CREAT | O_WRONLY | O_APPEND, 0644));
+    /// auto fd = TRY(fio.open("/var/log/app.log", O_CREAT | O_WRONLY | O_APPEND, 0644));
     /// @endcode
     [[nodiscard]] Result<Fd> open(const std::filesystem::path& path, int flags, mode_t mode = 0644) noexcept;
 
@@ -250,7 +249,7 @@ public:
     /// close CQE returns an error.  Callers should use std::move:
     ///
     /// @code
-    /// FIBER_TRY_VOID(fio.close(std::move(fd)));
+    /// TRY(fio.close(std::move(fd)));
     /// @endcode
     [[nodiscard]] Result<void> close(Fd&& fd) noexcept;
 

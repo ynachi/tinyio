@@ -84,6 +84,12 @@ struct Fiber : IntrusiveHook<AllFibersTag>, IntrusiveHook<ReadyQueueTag>
 
     /// The pre-allocated I/O operation data. By embedding this inside the fiber,
     /// we avoid heap allocations for every single read/write operation.
+    ///
+    /// Invariant: only one operation may be in flight per fiber at a time.
+    /// This is enforced structurally — the fiber is suspended (state == waiting)
+    /// for the entire duration of an operation, so it cannot submit a second one
+    /// until the first CQE is received and the fiber is resumed. The assertion
+    /// `state == FiberState::running` in IO::syscall() makes this explicit.
     Operation operation{};
 
     /// The current lifecycle status of the fiber.

@@ -8,8 +8,8 @@
 #include <liburing.h>
 
 #include "error.hpp"
-#include "uring/error.hpp"
-#include "uring/logger.hpp"
+#include "tinyio/error.hpp"
+#include "tinyio/logger.hpp"
 
 namespace tinyio
 {
