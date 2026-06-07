@@ -35,7 +35,7 @@ using Clock = std::chrono::steady_clock;
 
 struct Options
 {
-    std::filesystem::path path = "/tmp/kio-asio-disk-bench.dat";
+    std::filesystem::path path = "/tmp/tinyio-asio-disk-bench.dat";
     std::uint64_t bytes = 1024ull * 1024ull * 1024ull;
     std::size_t block = 64ull * 1024ull;
 };
@@ -142,11 +142,11 @@ URing::Task<void> kio_write_all(URing::IO& io, URing::Fd& fd, std::span<const st
         const auto res = co_await io.write(fd, block.first(static_cast<std::size_t>(len)), static_cast<off_t>(offset));
         if (!res)
         {
-            throw std::runtime_error("kio write failed: " + res.error().message());
+            throw std::runtime_error("tinyio write failed: " + res.error().message());
         }
         if (*res != static_cast<int>(len))
         {
-            throw std::runtime_error("kio short write");
+            throw std::runtime_error("tinyio short write");
         }
         offset += len;
     }
@@ -155,13 +155,13 @@ URing::Task<void> kio_write_all(URing::IO& io, URing::Fd& fd, std::span<const st
 
 BenchResult bench_kio(const Options& opts, const std::vector<std::byte>& block)
 {
-    const auto path = opts.path.string() + ".kio";
+    const auto path = opts.path.string() + ".tinyio";
     prepare_file(path, opts.bytes);
 
     const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
     if (raw_fd < 0)
     {
-        throw std::runtime_error("open kio file failed: " + std::string(std::strerror(errno)));
+        throw std::runtime_error("open tinyio file failed: " + std::string(std::strerror(errno)));
     }
 
     URing::Fd fd{raw_fd};
@@ -172,11 +172,11 @@ BenchResult bench_kio(const Options& opts, const std::vector<std::byte>& block)
     const auto end = Clock::now();
     if (!res)
     {
-        throw std::runtime_error("kio write coroutine failed: " + res.error().message());
+        throw std::runtime_error("tinyio write coroutine failed: " + res.error().message());
     }
 
     const double seconds = std::chrono::duration<double>(end - start).count();
-    return {"kio", seconds, static_cast<double>(opts.bytes) / (1024.0 * 1024.0) / seconds};
+    return {"tinyio", seconds, static_cast<double>(opts.bytes) / (1024.0 * 1024.0) / seconds};
 }
 
 URing::Result<void> kio_fiber_write_all(URing::FiberIO& fio, URing::Fd& fd, std::span<const std::byte> block,
@@ -199,13 +199,13 @@ URing::Result<void> kio_fiber_write_all(URing::FiberIO& fio, URing::Fd& fd, std:
 
 BenchResult bench_kio_fiber(const Options& opts, const std::vector<std::byte>& block)
 {
-    const auto path = opts.path.string() + ".kio-fiber";
+    const auto path = opts.path.string() + ".tinyio-fiber";
     prepare_file(path, opts.bytes);
 
     const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
     if (raw_fd < 0)
     {
-        throw std::runtime_error("open kio fiber file failed: " + std::string(std::strerror(errno)));
+        throw std::runtime_error("open tinyio fiber file failed: " + std::string(std::strerror(errno)));
     }
 
     URing::Fd fd{raw_fd};
@@ -228,7 +228,7 @@ BenchResult bench_kio_fiber(const Options& opts, const std::vector<std::byte>& b
                        else
                        {
                            const double seconds = std::chrono::duration<double>(end - start).count();
-                           result = {"kio-fiber", seconds,
+                           result = {"tinyio-fiber", seconds,
                                      static_cast<double>(opts.bytes) / (1024.0 * 1024.0) / seconds};
                        }
                        done.store(true, std::memory_order_release);
@@ -246,7 +246,7 @@ BenchResult bench_kio_fiber(const Options& opts, const std::vector<std::byte>& b
 
     if (error)
     {
-        throw std::runtime_error("kio fiber write failed: " + error->message());
+        throw std::runtime_error("tinyio fiber write failed: " + error->message());
     }
     return result;
 }

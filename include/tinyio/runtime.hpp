@@ -6,10 +6,8 @@
 #include <thread>
 #include <vector>
 
-// Must be included before <liburing.h>: liburing pulls in kernel headers that
-// define BLOCK_SIZE as a numeric macro, which conflicts with moodycamel's
-// static member identifier of the same name.
-#include "libs/concurrentqueue.hpp"
+// Removed moodycamel::ConcurrentQueue, using tiny MpscQueue instead.
+#include "detail/mpsc_queue.hpp"
 
 #include <fcntl.h>
 #include <liburing.h>
@@ -429,7 +427,7 @@ private:
 
     /// MPSC queue for tasks posted from remote threads via post().
     /// Drained on the owner thread inside tick().
-    moodycamel::ConcurrentQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
+    detail::MpscQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
 
     [[noreturn]] void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
     friend void ::tinyio_fiber_entry(void*) noexcept;

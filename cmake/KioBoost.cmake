@@ -1,14 +1,14 @@
-# kio/cmake/KioBoost.cmake
+# tinyio/cmake/KioBoost.cmake
 #
 # Do not provide a project-local FindBoost.cmake.
 #
 # CMake already ships a maintained FindBoost module, and modern Boost
 # installations may also provide BoostConfig.cmake. A local FindBoost.cmake in
-# this directory would shadow CMake's built-in module because kio prepends
+# this directory would shadow CMake's built-in module because tinyio prepends
 # cmake/ to CMAKE_MODULE_PATH. That makes Boost discovery less portable, not
 # more portable.
 #
-# This wrapper gives kio one place to define Boost policy while still using the
+# This wrapper gives tinyio one place to define Boost policy while still using the
 # upstream discovery logic:
 #
 # - prefer BoostConfig.cmake when the installation provides it

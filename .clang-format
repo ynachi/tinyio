@@ -100,7 +100,7 @@ IncludeCategories:
     Priority:        1
     SortPriority:    1
   # Project headers
-  - Regex:           '^"kio/'
+  - Regex:           '^"tinyio/'
     Priority:        2
     SortPriority:    2
   # Third-party libraries

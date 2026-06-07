@@ -1,4 +1,4 @@
-# kio/cmake/Findmimalloc.cmake
+# tinyio/cmake/Findmimalloc.cmake
 include(FetchContent)
 
 message(STATUS "Setting up mimalloc")

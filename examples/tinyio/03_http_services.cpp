@@ -8,17 +8,22 @@
 #include <string_view>
 #include <thread>
 
-#include "uring/core/task.hpp"
-#include "uring/extention/io_pool.hpp"
-#include "uring/logger.hpp"
-#include "uring/tcp_listener.hpp"
+#include "tinyio/tinyio.hpp"
 
-using namespace URing;
+using namespace tinyio;
 
 namespace
 {
 constexpr bool kUseRemoteDispatch = false;
 volatile std::sig_atomic_t g_stop_requested = 0;
+
+struct Options
+{
+    uint16_t port = 8080;
+    size_t workers = 4;
+    size_t stack_size = 64 * 1024;
+};
+
 
 void signal_handler(int)
 {
@@ -55,20 +60,23 @@ static Task<void> handle_client(IO& worker, Fd client_fd)
 
         std::span out_buf(reinterpret_cast<const std::byte*>(kHttpResponse.data()), kHttpResponse.size());
 
-        auto write_res = co_await worker.write(client_fd, out_buf);
-        if (!write_res)
-        {
-            co_return std::unexpected(write_res.error());
-        }
-
-        if (*write_res == 0)
-        {
-            break;
-        }
     }
-    co_return {};
 }
 
+Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
+{
+    while (!data.empty())
+    {
+        iovec iov{.iov_base = const_cast<std::byte*>(data.data()), .iov_len = data.size()};
+        auto written = TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}));
+        if (written <= 0)
+        {
+            return fail(EIO, "writev");
+        }
+        data = data.subspan(written);
+    }
+    return {};
+}
 // Accept incoming connections on a single worker
 static Task<void> server_loop(IO& worker, uint16_t port, std::stop_token st)
 {

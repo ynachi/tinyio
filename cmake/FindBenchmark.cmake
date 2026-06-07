@@ -1,4 +1,4 @@
-# kio/cmake/FindBenchmark.cmake
+# tinyio/cmake/FindBenchmark.cmake
 include(FetchContent)
 
 message(STATUS "Setting up Google Benchmark")

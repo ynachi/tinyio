@@ -772,7 +772,7 @@ void IO::run_until_done() noexcept
     // Also drain the cross-thread post queue: tasks posted before run_until_done()
     // is called would be silently dropped if we only checked live_fibers_.
     while (has_live_fibers() || inflight_ops_ > 0 || !ready_queue_.empty() ||
-           post_queue_.size_approx() > 0)
+           !post_queue_.empty())
     {
         if (auto res = tick(); !res)
         {
