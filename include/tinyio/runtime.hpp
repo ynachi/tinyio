@@ -39,9 +39,6 @@ struct RuntimeOptions
     /// Number of submission queue entries requested from io_uring.
     std::uint32_t sq_entries = 4096;
 
-    /// Number of completion queue entries requested from io_uring.
-    std::uint32_t cq_entries = 8192;
-
     /// Default usable stack size for newly spawned fibers.
     std::size_t stack_size = 256 * 1024;
 
@@ -126,6 +123,12 @@ public:
     /// This is owner-thread-only in v1. Cross-runtime wakeup must be explicit in a later API.
     void request_stop() noexcept;
 
+    /// Run a single iteration of the event loop (process kernel completions and run ready fibers).
+    void tick() noexcept;
+
+    /// Run the event loop continuously until all fibers have finished.
+    void run() noexcept;
+
     /// Returns true when there are live fibers still owned by this runtime.
     [[nodiscard]] bool has_live_fibers() const noexcept;
 
@@ -153,11 +156,11 @@ public:
     /// std::memcpy(buf.ptr(), data.data(), data.size());
     /// FIBER_TRY(auto n, fio.write_fixed(fd, buf, data.size(), file_offset));
     /// @endcode
-    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset = -1);
+    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset = -1) noexcept;
 
     /// Write the whole contents of @p buf to @p fd starting at @p offset.
     /// Equivalent to write_fixed(fd, buf, buf.size(), offset).
-    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, off_t offset = -1);
+    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, off_t offset = -1) noexcept;
     /// Read up to @p len bytes from @p fd into @p buf (a registered fixed buffer)
     /// starting at @p offset.
     ///
@@ -187,6 +190,13 @@ public:
     /// @return Number of bytes read, or an error code.
     [[nodiscard]] Result<uint32_t> read(Fd& fd, std::span<std::byte> buf, off_t offset = -1) noexcept;
 
+    /// Write up to buf.size() bytes from the caller-provided span @p buf to @p fd.
+    ///
+    /// Pass @p offset = -1 to use the file's current position.
+    ///
+    /// @return Number of bytes written, or an error code.
+    [[nodiscard]] Result<uint32_t> write(Fd& fd, std::span<const std::byte> buf, off_t offset = -1) noexcept;
+
     /// Write the scatter-gather vector @p iovecs to @p fd starting at @p offset.
     ///
     /// Wraps pwritev2 via io_uring's WRITEV operation.
@@ -194,6 +204,14 @@ public:
     ///
     /// @return Total bytes written, or an error code.
     [[nodiscard]] Result<uint32_t> writev(Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
+
+    /// Read the scatter-gather vector @p iovecs from @p fd starting at @p offset.
+    ///
+    /// Wraps preadv2 via io_uring's READV operation.
+    /// Pass @p offset = -1 to use the file's current position.
+    ///
+    /// @return Total bytes read, or an error code.
+    [[nodiscard]] Result<uint32_t> readv(Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
 
     /// Flush pending writes on @p fd to the storage device.
     ///
@@ -220,7 +238,8 @@ public:
     /// Accept a new connection on @p server_fd, retrieving the client address.
     ///
     /// @return An owned Fd on success, or an error code.
-    [[nodiscard]] Result<Fd> accept(Fd& server_fd, SocketAddress& client_addr, int flags = kDefaultAcceptFlags) noexcept;
+    [[nodiscard]] Result<Fd> accept(Fd& server_fd, SocketAddress& client_addr,
+                                    int flags = kDefaultAcceptFlags) noexcept;
 
     /// Accept a new connection on @p server_fd without retrieving the client address.
     ///
@@ -236,6 +255,22 @@ public:
     /// FIBER_TRY_VOID(fio.close(std::move(fd)));
     /// @endcode
     [[nodiscard]] Result<void> close(Fd&& fd) noexcept;
+
+    /// Remove (unlink) the file at @p path.
+    [[nodiscard]] Result<void> remove(const std::filesystem::path& path) noexcept;
+
+    /// Rename the file from @p from to @p to.
+    [[nodiscard]] Result<void> rename(const std::filesystem::path& from, const std::filesystem::path& to) noexcept;
+
+    /// Poll for the specified events on @p fd.
+    ///
+    /// @param poll_mask Standard poll(2) mask (e.g. POLLIN, POLLOUT).
+    /// @return The triggered events, or an error code.
+    [[nodiscard]] Result<uint32_t> poll(Fd& fd, unsigned poll_mask) noexcept;
+
+    /// Connect @p fd to the remote address @p addr.
+    /// Note: @p addr must outlive this function call.
+    [[nodiscard]] Result<void> connect(Fd& fd, const SocketAddress& addr) noexcept;
 
     /// Allocate or deallocate disk space for @p fd in the range [@p offset, @p offset + @p len).
     ///
@@ -257,12 +292,21 @@ public:
     [[nodiscard]] Result<void> sleep_for_ns(std::chrono::nanoseconds duration) noexcept;
 
 private:
+    static constexpr uint64_t kWakeupSentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
+    static constexpr uint64_t kFiberCancelSentinel = 0xDEAD'C0DE'DEAD'C0CCULL;
+    static constexpr size_t kMaxResumesPerTick = 128;
     //
     // IO Uring management
     //
     io_uring ring_{};
     Result<void> submit_or_wait_for() noexcept;
     Result<io_uring_sqe*> get_sqe() noexcept;
+
+    Result<void> activate();
+    void tick() noexcept;
+    Result<void> arm_wake_read() noexcept;
+    void wake() const noexcept;
+    Result<std::size_t> drain_completions() noexcept;
 
     // Internal executor for I/O operations. Factorizes the SQE acquisition,
     // fiber suspension, and error mapping logic.
@@ -349,6 +393,9 @@ private:
     std::size_t live_fibers_ = 0;
     std::size_t inflight_ops_ = 0;
     // std::size_t pending_submissions_ = 0;
+
+    [[noreturn]] void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
+    friend void ::tinyio_fiber_entry(void*) noexcept;
 
     void push_ready(detail::fiber::Fiber* fiber) noexcept;
     void remove_ready(detail::fiber::Fiber* fiber) noexcept;
