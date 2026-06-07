@@ -95,11 +95,10 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd, std::span<const 
 {
     while (!data.empty())
     {
-        iovec iov{.iov_base = const_cast<std::byte*>(data.data()), .iov_len = data.size()};
-        auto written = TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}));
-        if (written <= 0)
+        auto written = TRY(fio.write(fd, data));
+        if (written == 0)
         {
-            return tinyio::fail(EIO, "writev");
+            return tinyio::fail(EIO, "write");
         }
         data = data.subspan(static_cast<size_t>(written));
     }

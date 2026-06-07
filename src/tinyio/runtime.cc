@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <format>
+#include <memory>
 
 #include <sys/eventfd.h>
 
@@ -11,8 +12,8 @@
 
 namespace tinyio
 {
-IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> pool_configs)
-try : id_(id), opts_(opts), buffer_pool_(pool_configs)
+IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs)
+try : id_(id), opts_(opts), buffer_pool_(std::move(pool_configs))
 {
     if (auto res = initialize(); !res.has_value())
     {
@@ -70,45 +71,7 @@ IO::~IO() noexcept
 
         ALOG_WARN("IO #{} destroyed with {} live fiber(s); issuing cancels and draining", id_, live_fibers_);
         stopping_ = true;
-
-        // Cancel every fiber that is blocked waiting for a kernel CQE.
-        bool issued_cancels = false;
-        all_fibers_.for_each(
-            [&](detail::fiber::Fiber& fiber) noexcept
-            {
-                if (fiber.state != detail::fiber::FiberState::waiting)
-                {
-                    return;
-                }
-                auto res = get_sqe();
-                if (!res)
-                {
-                    ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
-                    return;
-                }
-                io_uring_prep_cancel(res.value(), &fiber.operation, 0);
-                io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
-                ++inflight_ops_;
-                issued_cancels = true;
-            });
-
-        if (issued_cancels)
-        {
-            io_uring_submit(&ring_);
-        }
-
-        // Drive tick() until the kernel has acknowledged all cancellations and
-        // the ready queue has been fully flushed.  Resumed fibers see ECANCELED
-        // from syscall() (because stopping_ == true), return from their tasks,
-        // and are destroyed via finish_current_fiber() -> destroy_fiber().
-        while (inflight_ops_ > 0 || !ready_queue_.empty())
-        {
-            if (auto res = tick(); !res)
-            {
-                ALOG_ERROR("failed  to process io: [{}] {}", res.error().op, res.error().error_code().message());
-                return;
-            }
-        }
+        cancel_and_drain();
     }
 
     if (live_fibers_ > 0)
@@ -307,15 +270,21 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
 
     if (fiber == nullptr)
     {
-        fiber = new detail::fiber::Fiber();
-        fiber->id = ++next_fiber_id_;
-        fiber->runtime = this;
+        // Use unique_ptr so the Fiber is freed if allocate_stack fails below.
+        // We do NOT add to all_fibers_ until the stack is successfully allocated.
+        std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow) detail::fiber::Fiber());
+        if (!owned)
+        {
+            return fail(ENOMEM, "spawn");
+        }
+        owned->runtime = this;
+
         const auto stack = TRY(detail::stack::allocate_stack(opts_.stack_size, opts_.guard_size));
+        owned->stack = stack;
 
-        fiber->stack = stack;
-
-        // Only push to all_fibers_ when it's newly allocated
-        all_fibers_.push_front(fiber);
+        // Only push to all_fibers_ once all allocations have succeeded.
+        all_fibers_.push_front(owned.get());
+        fiber = owned.release();
     }
 
     ++live_fibers_;
@@ -410,6 +379,44 @@ bool IO::has_live_fibers() const noexcept
 //
 // IO Uring methods
 //
+
+void IO::cancel_and_drain() noexcept
+{
+    bool issued_cancels = false;
+    all_fibers_.for_each(
+        [&](detail::fiber::Fiber& fiber) noexcept
+        {
+            if (fiber.state != detail::fiber::FiberState::waiting)
+            {
+                return;
+            }
+            auto res = get_sqe();
+            if (!res)
+            {
+                ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
+                return;
+            }
+            io_uring_prep_cancel(res.value(), &fiber.operation, 0);
+            io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
+            ++inflight_ops_;
+            issued_cancels = true;
+        });
+
+    if (issued_cancels)
+    {
+        io_uring_submit(&ring_);
+    }
+
+    while (inflight_ops_ > 0 || !ready_queue_.empty())
+    {
+        if (auto res = tick(); !res)
+        {
+            ALOG_ERROR("tick failed during cancel_and_drain: [{}] {}", res.error().op,
+                       res.error().error_code().message());
+            break;
+        }
+    }
+}
 
 }  // namespace tinyio
 
@@ -515,7 +522,7 @@ Result<void> IO::arm_wake_read() noexcept
     return {};
 }
 
-Result<void> IO::activate()
+Result<void> IO::activate() noexcept
 {
     if (is_activated_)
     {
@@ -544,19 +551,17 @@ Result<std::size_t> IO::drain_completions() noexcept
     io_uring_cqe* cqe;
     unsigned head;
     unsigned count = 0;
+    bool needs_rearm = false;
 
     io_uring_for_each_cqe(&ring_, head, cqe)
     {
-        // Grab the raw 64-bit value first
         const uint64_t raw_data = io_uring_cqe_get_data64(cqe);
 
         if (raw_data == kWakeupSentinel)
         {
-            if (auto res = arm_wake_read(); !res)
-            {
-                const auto err = res.error();
-                ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
-            }
+            // Defer re-arm until after cq_advance to avoid submitting a new SQE
+            // while the CQ ring is still being iterated.
+            needs_rearm = true;
         }
         else if (raw_data == kFiberCancelSentinel)
         {
@@ -564,7 +569,6 @@ Result<std::size_t> IO::drain_completions() noexcept
         }
         else if (raw_data != 0)
         {
-            // It's a valid Fiber pointer! Now it's safe to cast.
             auto* op = static_cast<detail::fiber::Operation*>(io_uring_cqe_get_data(cqe));
 
             op->cqe_res = cqe->res;
@@ -583,6 +587,16 @@ Result<std::size_t> IO::drain_completions() noexcept
     if (count > 0)
     {
         io_uring_cq_advance(&ring_, count);
+    }
+
+    // Re-arm the wakeup read after advancing the CQ, not mid-iteration.
+    if (needs_rearm)
+    {
+        if (auto res = arm_wake_read(); !res)
+        {
+            const auto err = res.error();
+            ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
+        }
     }
 
     return count;
@@ -700,47 +714,16 @@ void IO::run(const std::stop_token& st) noexcept
     std::stop_callback wake_on_stop{st, [this] { wake(); }};
     while (!st.stop_requested())
     {
-        tick();
+        if (auto res = tick(); !res)
+        {
+            const auto err = res.error();
+            ALOG_ERROR("tick failed: [{}] {}", err.op, err.error_code().message());
+        }
     }
 
     stopping_ = true;
     ALOG_INFO("Worker {} quiescing...", id_);
-
-    // Issue cancels for waiting fibers
-    bool issued_cancels = false;
-    all_fibers_.for_each(
-        [&](detail::fiber::Fiber& fiber) noexcept
-        {
-            if (fiber.state != detail::fiber::FiberState::waiting)
-            {
-                return;
-            }
-
-            auto res = get_sqe();
-            if (!res)
-            {
-                auto err = res.error();
-                ALOG_ERROR("failed to allocate cancel SQE: [{}] {}", err.op, err.error_code().message());
-                return;
-            }
-
-            auto* sqe = res.value();
-            io_uring_prep_cancel(sqe, &fiber.operation, 0);
-            io_uring_sqe_set_data64(sqe, kFiberCancelSentinel);
-            ++inflight_ops_;
-            issued_cancels = true;
-        });
-
-    if (issued_cancels)
-    {
-        io_uring_submit(&ring_);
-    }
-
-    // Drain completions and ready fibers
-    while (inflight_ops_ > 0 || !ready_queue_.empty())
-    {
-        tick();
-    }
+    cancel_and_drain();
 
     is_running_ = false;
 

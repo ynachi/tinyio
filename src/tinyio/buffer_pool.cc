@@ -78,11 +78,10 @@ FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs)
     }
 
     // Sort by slot_size ascending for efficient binary search in take()
-    std::vector sorted_configs(configs);
-    std::ranges::sort(sorted_configs, [](const auto& a, const auto& b) { return a.size < b.size; });
+    std::ranges::sort(configs, [](const auto& a, const auto& b) { return a.size < b.size; });
 
     // Validate: all sizes must be page-aligned for io_uring + O_DIRECT compatibility
-    for (const auto& cfg : sorted_configs)
+    for (const auto& cfg : configs)
     {
         if (cfg.size % 4096 != 0)
         {
@@ -93,7 +92,7 @@ FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs)
     // Build buckets + global iovec array
     uint32_t current_global_index = 0;
     buckets_.reserve(configs.size());
-    for (const auto& config : sorted_configs)
+    for (const auto& config : configs)
     {
         buckets_.emplace_back(config.size, config.count, current_global_index);
 

@@ -20,10 +20,9 @@ class MpscQueue {
         explicit Node(T&& d) : data(std::move(d)) {}
     };
 
-    // head_ is modified by multiple producers and the consumer.
-    std::atomic<Node*> head_;
-    // tail_ is only modified by the single consumer.
-    // alignas is used to avoid false sharing.
+    // head_ is modified by all producers — keep on its own cache line.
+    alignas(64) std::atomic<Node*> head_;
+    // tail_ is only modified by the single consumer — separate cache line.
     alignas(64) Node* tail_;
 
 public:
@@ -48,8 +47,11 @@ public:
     /// Enqueue an item. Can be called from any thread.
     /// Returns true on success, false on allocation failure.
     bool enqueue(T&& data) noexcept {
-        Node* node = new Node(std::move(data));
-
+        Node* node = new (std::nothrow) Node(std::move(data));
+        if (node == nullptr) [[unlikely]]
+        {
+            return false;
+        }
         Node* prev = head_.exchange(node, std::memory_order_acq_rel);
         prev->next.store(node, std::memory_order_release);
         return true;
@@ -85,8 +87,9 @@ public:
 
     /// Check if the queue is empty. Must only be called from the single consumer thread.
     bool empty() const noexcept {
-        // If head_ == tail_, there are no fully or partially enqueued items.
-        return head_.load(std::memory_order_acquire) == tail_;
+        // Consumer owns tail_; relaxed is sufficient — producers synchronise
+        // through the acq_rel exchange in enqueue, not through this load.
+        return head_.load(std::memory_order_relaxed) == tail_;
     }
 };
 

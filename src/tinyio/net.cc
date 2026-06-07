@@ -92,17 +92,19 @@ Result<SocketAddress> ResolveIp(const std::string_view host, const uint16_t port
 
     if (const int rc = getaddrinfo(hostname.c_str(), service.c_str(), &hints, &res); rc != 0)
     {
-        // getaddrinfo returns EAI_* errors, not errno, but we map to std::error_code generically
-        return fail(EADDRINUSE, "getaddrinfo");
+        // EAI_SYSTEM means check errno; all other EAI_* codes map to EIO.
+        return fail(rc == EAI_SYSTEM ? errno : EIO, "getaddrinfo");
+    }
+
+    if (!res)
+    {
+        return fail(EIO, "getaddrinfo_null_result");
     }
 
     SocketAddress out;
-    if (res)
-    {
-        std::memcpy(&out.addr, res->ai_addr, res->ai_addrlen);
-        out.addrlen = res->ai_addrlen;
-        freeaddrinfo(res);
-    }
+    std::memcpy(&out.addr, res->ai_addr, res->ai_addrlen);
+    out.addrlen = res->ai_addrlen;
+    freeaddrinfo(res);
     return out;
 }
 }  // namespace tinyio

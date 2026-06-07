@@ -72,11 +72,10 @@ static Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
 {
     while (!data.empty())
     {
-        iovec iov{.iov_base = const_cast<std::byte*>(data.data()), .iov_len = data.size()};
-        auto written = TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}));
-        if (written <= 0)
+        auto written = TRY(fio.write(fd, data));
+        if (written == 0)
         {
-            return fail(EIO, "writev");
+            return fail(EIO, "write");
         }
         data = data.subspan(written);
     }

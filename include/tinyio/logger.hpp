@@ -215,7 +215,7 @@ void log_impl(const std::source_location loc, std::format_string<Args...> fmt, A
 
         if (detail::g_queue.size() < 1024)
         {
-            detail::g_queue.push_back(r);
+            detail::g_queue.push_back(std::move(r));
             // Only execute syscall wake if the queue transitioned from empty to 1
             notify = (detail::g_queue.size() == 1);
         }
@@ -235,7 +235,7 @@ void log_impl(const std::source_location loc, std::format_string<Args...> fmt, A
     {                                                                                                               \
         if constexpr (::tinyio::log::Level::LEVEL >= ::tinyio::log::kBuildLevel)                                    \
         {                                                                                                           \
-            if (::tinyio::log::should_log(::tinyio::log::Level::LEVEL)) [[unlikely]]                                \
+            if (::tinyio::log::should_log(::tinyio::log::Level::LEVEL))                                             \
             {                                                                                                       \
                 ::tinyio::log::log_impl<::tinyio::log::Level::LEVEL>(std::source_location::current(), __VA_ARGS__); \
             }                                                                                                       \

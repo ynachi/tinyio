@@ -6,7 +6,7 @@
 #include "context.hpp"
 #include "sanitizer_hooks.hpp"
 #include "tinyio/intrusive_list.hpp"
-#include <bits/move_only_function.h>
+#include <functional>
 
 namespace tinyio
 {

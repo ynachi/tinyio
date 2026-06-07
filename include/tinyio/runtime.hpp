@@ -16,7 +16,7 @@
 #include "error.hpp"
 #include "fd.hpp"
 #include "logger.hpp"
-#include <bits/move_only_function.h>
+#include <functional>
 
 namespace tinyio
 {
@@ -331,7 +331,7 @@ private:
     Result<void> submit_or_wait_for() noexcept;
     Result<io_uring_sqe*> get_sqe() noexcept;
 
-    Result<void> activate();
+    Result<void> activate() noexcept;
     /// Run a single iteration of the event loop (process kernel completions and run ready fibers).
     Result<void> tick() noexcept;
     Result<void> arm_wake_read() noexcept;
@@ -447,6 +447,10 @@ private:
 
     /// Initializes the io_uring instance and validates required opcodes.
     [[nodiscard]] Result<void> initialize() noexcept;
+
+    /// Issue IORING_OP_ASYNC_CANCEL for every waiting fiber, submit, then drive
+    /// tick() until all in-flight ops and ready fibers are drained.
+    void cancel_and_drain() noexcept;
 
     /// Spawns a fiber from an already-erased task object.
     [[nodiscard]] Result<FiberId> spawn_task(std::move_only_function<void(IO&) noexcept> task) noexcept;
