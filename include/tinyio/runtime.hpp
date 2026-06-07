@@ -1,8 +1,8 @@
 #pragma once
-#include "uring/core/io.h"
 
 #include <cassert>
 #include <concepts>
+#include <filesystem>
 #include <thread>
 
 #include <fcntl.h>
@@ -13,6 +13,7 @@
 #include "detail/fiber.hpp"
 #include "error.hpp"
 #include "fd.hpp"
+#include "logger.hpp"
 #include <bits/move_only_function.h>
 
 namespace tinyio
@@ -28,8 +29,11 @@ static constexpr unsigned kUringBaseFlags = IORING_SETUP_CQSIZE | IORING_SETUP_C
 /// Default io accept flags
 static constexpr int kDefaultAcceptFlags = SOCK_NONBLOCK | SOCK_CLOEXEC;
 
-struct RuntimeOptions
+struct IoOptions
 {
+    // list of cpus, if empty, no pinning
+    std::vector<int> worker_cpu_affinity{};
+
     /// Additional flags passed to io_uring
     unsigned additional_uring_flags = kUringDefaultAdditionalFlag;
 
@@ -64,40 +68,41 @@ struct RuntimeOptions
     std::size_t max_idle_fibers = 1024;
 };
 
-class Runtime final
+class IO final
 {
 public:
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
-    explicit Runtime(RuntimeOptions options) noexcept;
+    // TODO: pool_configs should use vector for a stable storage
+    explicit IO(size_t id, const IoOptions& opts, std::initializer_list<BucketConfig> pool_configs);
 
     /// Destroys the runtime and releases ring resources and all fiber stacks.
     ///
     /// Production code should call run() until all spawned fibers complete before destruction.
-    ~Runtime() noexcept;
+    ~IO() noexcept;
 
     /// Runtime is not copyable because it uniquely owns fibers and an io_uring instance.
-    Runtime(const Runtime&) = delete;
+    IO(const IO&) = delete;
 
     /// Runtime is not copy-assignable because ownership is unique and stable.
-    Runtime& operator=(const Runtime&) = delete;
+    IO& operator=(const IO&) = delete;
 
     /// Runtime is not movable because Fiber objects store their owning Runtime address.
-    Runtime(Runtime&&) = delete;
+    IO(IO&&) = delete;
 
     /// Runtime is not move-assignable because address stability is part of the design.
-    Runtime& operator=(Runtime&&) = delete;
+    IO& operator=(IO&&) = delete;
 
     /// Spawns one stackful fiber owned by this runtime.
     ///
     /// The callable is invoked as fn(IO&). The fiber never migrates to another Runtime.
     /// This method is owner-thread-only. It catches construction/allocation failures and returns Result.
     template <class Fn>
-        requires std::constructible_from<std::move_only_function<void(Runtime&) noexcept>, Fn>
+        requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
     [[nodiscard]] Result<FiberId> spawn(Fn&& fn) noexcept
     {
         try
         {
-            return spawn_task(std::move_only_function<void(Runtime&) noexcept>(std::forward<Fn>(fn)));
+            return spawn_task(std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
         }
         catch (const std::bad_alloc&)
         {
@@ -113,21 +118,19 @@ public:
     ///
     /// This method is owner-thread-only. It blocks the owner thread only when no fiber is ready and
     /// the runtime is waiting for io_uring completions.
-    [[nodiscard]] Result<void> run() noexcept;
+    void run(const std::stop_token& st) noexcept;
+
+    /// Run until there is no more IO
+    void run_until_done() noexcept
+    {
+        pin_to_cpu();
+        activate();
+        // TODO: fix me
+        tick();
+    }
 
     /// Suspend the current fiber to give bck the control to the runtime
     [[nodiscard]] Result<void> yield() noexcept;
-
-    /// Requests the run loop to stop after the current scheduler turn.
-    ///
-    /// This is owner-thread-only in v1. Cross-runtime wakeup must be explicit in a later API.
-    void request_stop() noexcept;
-
-    /// Run a single iteration of the event loop (process kernel completions and run ready fibers).
-    void tick() noexcept;
-
-    /// Run the event loop continuously until all fibers have finished.
-    void run() noexcept;
 
     /// Returns true when there are live fibers still owned by this runtime.
     [[nodiscard]] bool has_live_fibers() const noexcept;
@@ -137,6 +140,7 @@ public:
 
     /// Register a fixed buffer pool
     Result<void> register_buffers(FixedBufferPool& pool) noexcept;
+    Result<void> unregister_buffers() noexcept;
     [[nodiscard]] Result<FixedBuffer> take_fixed_buffer(const size_t size) noexcept { return buffer_pool_.take(size); }
 
     // =====
@@ -303,7 +307,8 @@ private:
     Result<io_uring_sqe*> get_sqe() noexcept;
 
     Result<void> activate();
-    void tick() noexcept;
+    /// Run a single iteration of the event loop (process kernel completions and run ready fibers).
+    Result<void> tick() noexcept;
     Result<void> arm_wake_read() noexcept;
     void wake() const noexcept;
     Result<std::size_t> drain_completions() noexcept;
@@ -375,14 +380,14 @@ private:
     //
     std::thread::id thread_id_;
     std::size_t id_;  ///  Id of the worker in a multi-threaded context
-    RuntimeOptions opts_;
+    IoOptions opts_;
 
     FixedBufferPool buffer_pool_{};
 
     //
     // Fiber management
     //
-    bool inside_run_ = false;
+    // bool inside_run_ = false;
     detail::context::Context scheduler_context_{};
     detail::ToolFiberState scheduler_tools_{};
     IntrusiveList<detail::fiber::Fiber, AllFibersTag> all_fibers_;
@@ -392,7 +397,6 @@ private:
     FiberId next_fiber_id_ = 1;
     std::size_t live_fibers_ = 0;
     std::size_t inflight_ops_ = 0;
-    // std::size_t pending_submissions_ = 0;
 
     [[noreturn]] void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
     friend void ::tinyio_fiber_entry(void*) noexcept;
@@ -413,6 +417,8 @@ private:
     [[nodiscard]] Result<void> initialize() noexcept;
 
     /// Spawns a fiber from an already-erased task object.
-    [[nodiscard]] Result<FiberId> spawn_task(std::move_only_function<void(Runtime&) noexcept> task) noexcept;
+    [[nodiscard]] Result<FiberId> spawn_task(std::move_only_function<void(IO&) noexcept> task) noexcept;
+
+    void pin_to_cpu() const;
 };
 }  // namespace tinyio

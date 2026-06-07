@@ -10,7 +10,7 @@
 
 namespace tinyio
 {
-class Runtime;
+class IO;
 
 using FiberId = std::uint64_t;
 }  // namespace tinyio
@@ -64,7 +64,7 @@ struct Operation
 struct Fiber : IntrusiveHook<AllFibersTag>, IntrusiveHook<ReadyQueueTag>
 {
     /// Pointer to the main event loop / scheduler that owns this fiber.
-    Runtime* runtime = nullptr;
+    IO* runtime = nullptr;
 
     /// A unique, monotonically increasing identifier for debugging.
     FiberId id = 0;
@@ -80,7 +80,7 @@ struct Fiber : IntrusiveHook<AllFibersTag>, IntrusiveHook<ReadyQueueTag>
     ToolFiberState tools{};
 
     /// The actual user-provided function or lambda that this fiber executes.
-    std::move_only_function<void(Runtime&) noexcept> task;
+    std::move_only_function<void(IO&) noexcept> task;
 
     /// The pre-allocated I/O operation data. By embedding this inside the fiber,
     /// we avoid heap allocations for every single read/write operation.

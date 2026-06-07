@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(kio)
+project(tinyio)
 
 set(CMAKE_CXX_STANDARD 23)
 # We need that fr our TRY macro, the code is Linux only so this is fine
@@ -13,15 +13,10 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 # Cmake find modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
-option(ENABLE_AIO_STATS "Enable AIO observability metrics" ON)
-if (ENABLE_AIO_STATS)
-    add_compile_definitions(AIO_STATS=1)
-endif ()
-
 # -----------------------------------------
 # Common Build Functions
 #------------------------------------------
-function(kio_target_compile_options target_name)
+function(tio_target_compile_options target_name)
     # Check if target is an INTERFACE library
     get_target_property(target_type ${target_name} TYPE)
 
@@ -48,10 +43,10 @@ function(kio_target_compile_options target_name)
 endfunction()
 
 # -----------------------------------------------------------------------------
-# Function: kio_add_demo
-# Usage: kio_add_demo(demo_name source.cpp TAGS core network LIBS <libs to link>)
+# Function: tio_add_demo
+# Usage: tio_add_demo(demo_name source.cpp TAGS core network LIBS <libs to link>)
 # -----------------------------------------------------------------------------
-function(kio_add_demo target_name source_file)
+function(tio_add_demo target_name source_file)
     # Parse Arguments (supports optional TAGS list)
     set(options "")
     set(oneValueArgs "")
@@ -59,16 +54,16 @@ function(kio_add_demo target_name source_file)
     cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # 2. Check Global Toggle
-    if (NOT KIO_BUILD_DEMOS)
+    if (NOT TIO_BUILD_DEMOS)
         return()
     endif ()
 
     # Check Tag Filtering
-    # If KIO_DEMO_FILTER is set (and not "all"), we check if this demo has a matching tag.
-    if (DEFINED KIO_DEMO_FILTER AND NOT "${KIO_DEMO_FILTER}" STREQUAL "all")
+    # If TIO_DEMO_FILTER is set (and not "all"), we check if this demo has a matching tag.
+    if (DEFINED TIO_DEMO_FILTER AND NOT "${TIO_DEMO_FILTER}" STREQUAL "all")
         set(MATCH_FOUND FALSE)
         foreach (tag IN LISTS ARG_TAGS)
-            if ("${tag}" IN_LIST KIO_DEMO_FILTER)
+            if ("${tag}" IN_LIST TIO_DEMO_FILTER)
                 set(MATCH_FOUND TRUE)
                 break()
             endif ()
@@ -92,25 +87,25 @@ function(kio_add_demo target_name source_file)
     message(STATUS "Enabled Demo: ${target_name} [${ARG_TAGS}]")
 endfunction()
 
-set(KIO_SANITIZER "thread" CACHE STRING "Sanitizer to use (address, thread, undefined, none)")
+set(TIO_SANITIZER "thread" CACHE STRING "Sanitizer to use (address, thread, undefined, none)")
 
-function(kio_add_sanitizers target_name)
-    if (KIO_SANITIZER STREQUAL "none")
+function(tio_add_sanitizers target_name)
+    if (TIO_SANITIZER STREQUAL "none")
         return()
     endif ()
 
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-        message(STATUS "🔍 ${KIO_SANITIZER} Sanitizer enabled on target ${target_name}")
+        message(STATUS "🔍 ${TIO_SANITIZER} Sanitizer enabled on target ${target_name}")
 
         target_compile_options(${target_name}
                 PRIVATE
-                -fsanitize=${KIO_SANITIZER}
+                -fsanitize=${TIO_SANITIZER}
                 -g -O1
                 -fno-omit-frame-pointer
         )
-        target_link_options(${target_name} PRIVATE -fsanitize=${KIO_SANITIZER})
+        target_link_options(${target_name} PRIVATE -fsanitize=${TIO_SANITIZER})
 
-        if (KIO_SANITIZER STREQUAL "thread")
+        if (TIO_SANITIZER STREQUAL "thread")
             target_compile_definitions(${target_name} PUBLIC __SANITIZE_THREAD__=1)
         endif ()
     endif ()
@@ -118,10 +113,10 @@ endfunction()
 
 
 # -----------------------------------------------------------------------------
-# Function: kio_add_test
-# Usage: kio_add_test(test_name source.cpp TAGS core network LIBS <libs to link>)
+# Function: tio_add_test
+# Usage: tio_add_test(test_name source.cpp TAGS core network LIBS <libs to link>)
 # -----------------------------------------------------------------------------
-function(kio_add_test target_name source_file)
+function(tio_add_test target_name source_file)
     # Parse Arguments (supports optional TAGS list)
     set(options "")
     set(oneValueArgs "")
@@ -129,16 +124,16 @@ function(kio_add_test target_name source_file)
     cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # 2. Check Global Toggle
-    if (NOT KIO_BUILD_TESTS)
+    if (NOT TIO_BUILD_TESTS)
         return()
     endif ()
 
     # Check Tag Filtering
-    # If KIO_TEST_FILTER is set (and not "all"), we check if this demo has a matching tag.
-    if (DEFINED KIO_TEST_FILTER AND NOT "${KIO_TEST_FILTER}" STREQUAL "all")
+    # If TIO_TEST_FILTER is set (and not "all"), we check if this demo has a matching tag.
+    if (DEFINED TIO_TEST_FILTER AND NOT "${TIO_TEST_FILTER}" STREQUAL "all")
         set(MATCH_FOUND FALSE)
         foreach (tag IN LISTS ARG_TAGS)
-            if ("${tag}" IN_LIST KIO_TEST_FILTER)
+            if ("${tag}" IN_LIST TIO_TEST_FILTER)
                 set(MATCH_FOUND TRUE)
                 break()
             endif ()
@@ -165,16 +160,16 @@ endfunction()
 # -----------------------------------------
 # Optional Components
 #------------------------------------------
-set(KIO_DEMO_FILTER "all" CACHE STRING "List of tags to build (or 'all')")
-option(KIO_BUILD_TESTS "Build the kio test suite" ON)
-set(KIO_TEST_FILTER "all" CACHE STRING "List of tags to build (or 'all')")
-option(KIO_BUILD_BITCASK "Build bitcask storage engine" ON)
-option(KIO_BUILD_DEMOS "Build the kio demo executables" ON)
-option(KIO_BUILD_SEGMENT_BENCH "Build temporary bitcask segment benchmark" OFF)
-option(KIO_BUILD_FIBER_BENCH "Build stackful vs stackless benchmark" OFF)
-option(KIO_BUILD_HTTP_BENCH "Build HTTP server benchmark targets" OFF)
-# pass -DKIO_DEMO_FILTER="core;http" to build specific subsets of demo.
-option(KIO_BUILD_BENCHMARK "Build codes used to benchmark kio against other libs" OFF)
+set(TIO_DEMO_FILTER "all" CACHE STRING "List of tags to build (or 'all')")
+option(TIO_BUILD_TESTS "Build the kio test suite" ON)
+set(TIO_TEST_FILTER "all" CACHE STRING "List of tags to build (or 'all')")
+option(TIO_BUILD_BITCASK "Build bitcask storage engine" ON)
+option(TIO_BUILD_DEMOS "Build the kio demo executables" ON)
+option(TIO_BUILD_SEGMENT_BENCH "Build temporary bitcask segment benchmark" OFF)
+option(TIO_BUILD_FIBER_BENCH "Build stackful vs stackless benchmark" OFF)
+option(TIO_BUILD_HTTP_BENCH "Build HTTP server benchmark targets" OFF)
+# pass -DTIO_DEMO_FILTER="core;http" to build specific subsets of demo.
+option(TIO_BUILD_BENCHMARK "Build codes used to benchmark kio against other libs" OFF)
 option(ENABLE_CLANG_TIDY "Run clang-tidy during compilation" OFF)
 
 # Enable clang-tidy during build if requested
@@ -199,7 +194,7 @@ pkg_check_modules(LibUring REQUIRED IMPORTED_TARGET liburing)
 find_package(gflags REQUIRED)
 
 # gtest
-if (KIO_BUILD_TESTS)
+if (TIO_BUILD_TESTS)
     find_package(GTest REQUIRED)
 endif ()
 
@@ -212,9 +207,6 @@ find_package(Abseil REQUIRED)
 # mimalloc
 find_package(mimalloc REQUIRED)
 
-# Boost.Context (for stackful fibers)
-include(KioBoost)
-kio_find_boost(REQUIRED COMPONENTS context)
 
 # openssl, min 3 required
 find_package(OpenSSL 3 REQUIRED)
@@ -222,7 +214,7 @@ message(STATUS "OpenSSL: ${OPENSSL_VERSION}")
 find_package(Threads REQUIRED)
 
 # for benchmarks
-if (KIO_BUILD_BENCHMARK)
+if (TIO_BUILD_BENCHMARK)
     find_package(PhotonLibOS REQUIRED)
 endif ()
 
@@ -238,8 +230,8 @@ find_program(CLANG_TIDY_EXE NAMES clang-tidy-22)
 
 # Collect all source files for formatting/linting
 file(GLOB_RECURSE ALL_SOURCE_FILES
-        ${CMAKE_SOURCE_DIR}/uring/*.cpp
-        ${CMAKE_SOURCE_DIR}/uring/*.h
+        ${CMAKE_SOURCE_DIR}/tinyio/*.cpp
+        ${CMAKE_SOURCE_DIR}/tinyio/*.h
         ${CMAKE_SOURCE_DIR}/bitcask/src/*.cpp
         ${CMAKE_SOURCE_DIR}/bitcask/include/*.h
         ${CMAKE_SOURCE_DIR}/examples/*.cpp
@@ -292,27 +284,27 @@ endif ()
 # Aio lib, change later to kio
 #----------------------------------------------
 # Library definition
-add_library(uring
-        src/uring/io.cc
-        src/uring/net.cc
-        src/uring/tcp_listener.cc
-        src/uring/buffer_pool.cc
+add_library(tinyio
+        src/tinyio/runtime.cc
+        src/tinyio/buffer_pool.cc
+        src/tinyio/net.cc
+        src/tinyio/stack.cc
+        src/tinyio/tcp_listener.cc
 )
 # Include directories
-target_include_directories(uring PUBLIC
+target_include_directories(tinyio PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
 # Link dependencies
-target_link_libraries(uring PUBLIC
+target_link_libraries(tinyio PUBLIC
         mimalloc-static
         PkgConfig::LibUring
         pthread
         OpenSSL::SSL
         OpenSSL::Crypto
-        Boost::context
 )
-kio_add_sanitizers(uring)
+kio_add_sanitizers(tinyio)
 
 #-----------------------------------------------
 # bitcask lib
@@ -348,16 +340,16 @@ endif ()
 #----------------------------------------------
 include_directories(${CMAKE_SOURCE_DIR})
 
-if (KIO_BUILD_DEMOS)
+if (TIO_BUILD_DEMOS)
     add_subdirectory(examples)
 endif ()
 
 # for benchmarks
-if (KIO_BUILD_BENCHMARK)
+if (TIO_BUILD_BENCHMARK)
     add_subdirectory(benchmarks/cpp)
 endif ()
 
-if (KIO_BUILD_TESTS)
+if (TIO_BUILD_TESTS)
     include(CTest)
     enable_testing()
     add_subdirectory(tests)
@@ -379,19 +371,20 @@ if (KIO_BUILD_TESTS)
     message(STATUS "Added targets: check, check-quick")
 endif ()
 
-if (KIO_BUILD_SEGMENT_BENCH)
+if (TIO_BUILD_SEGMENT_BENCH)
     add_executable(segment_append_bench benchmarks/cpp/segment_append_bench.cpp)
     target_link_libraries(segment_append_bench PRIVATE bitcask)
     kio_target_compile_options(segment_append_bench)
 endif ()
 
-if (KIO_BUILD_FIBER_BENCH)
+if (TIO_BUILD_FIBER_BENCH)
     add_executable(fiber_vs_coro_bench benchmarks/cpp/fiber_vs_coro_bench.cpp)
     target_link_libraries(fiber_vs_coro_bench PRIVATE uring)
     kio_target_compile_options(fiber_vs_coro_bench)
 endif ()
 
-if (KIO_BUILD_HTTP_BENCH)
+# TODO: need cleanup
+if (TIO_BUILD_HTTP_BENCH)
     add_executable(kio_http_bench benchmarks/cpp/kio_http_bench.cpp)
     target_link_libraries(kio_http_bench PRIVATE uring)
     kio_target_compile_options(kio_http_bench)

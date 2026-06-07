@@ -7,9 +7,59 @@
 
 #include <sys/eventfd.h>
 
+#include "tinyio/logger.hpp"
+
 namespace tinyio
 {
-Result<void> Runtime::initialize() noexcept
+IO::IO(const size_t id, const IoOptions& opts, const std::initializer_list<BucketConfig> pool_configs)
+    : id_(id), opts_(opts), buffer_pool_(pool_configs)
+{
+    if (auto res = initialize(); !res.has_value())
+    {
+        auto err = res.error();
+        ALOG_ERROR("failed to initialize io worker: [{}] {}", err.op, err.error_code().message());
+        std::abort();
+    }
+
+    ALOG_INFO("initialized io worker {}", id_);
+}
+
+IO::~IO() noexcept
+{
+    // Free any FiberContexts that were enqueued cross-thread but never drained.
+    // schedule_fiber() calls ctx.release() before enqueue, so raw ownership
+    // lives in the queue until tick() links it into owned fibers.
+    // TODO: implement, I am not sure at all
+
+    if (has_live_fibers())
+    {
+        // TODO: can we have the number of live fibers in O(1) ?
+        ALOG_WARN("Destroying IO with live fiber(s); call run_blocking/request_stop or drain the IO first");
+    }
+
+    if (ring_.ring_fd > 0 && buffer_pool_.is_registered())
+    {
+        if (auto res = unregister_buffers(); !res.has_value())
+        {
+            auto err = res.error();
+            ALOG_ERROR("Failed to unregister buffers: [{}] {}", err.op, err.error_code().message());
+        }
+    }
+
+    if (ring_.ring_fd > 0)
+    {
+        io_uring_queue_exit(&ring_);
+        ring_.ring_fd = -1;
+    }
+
+    if (wake_fd_ >= 0)
+    {
+        ::close(wake_fd_);
+        wake_fd_ = -1;
+    }
+}
+
+Result<void> IO::initialize() noexcept
 {
     io_uring_params params{};
 
@@ -55,7 +105,7 @@ Result<void> Runtime::initialize() noexcept
     return {};
 }
 
-Result<void> Runtime::register_buffers(FixedBufferPool& pool) noexcept
+Result<void> IO::register_buffers(FixedBufferPool& pool) noexcept
 {
     if (pool.is_registered())
     {
@@ -72,10 +122,19 @@ Result<void> Runtime::register_buffers(FixedBufferPool& pool) noexcept
     return {};
 }
 
+Result<void> IO::unregister_buffers() noexcept
+{
+    if (const int ret = io_uring_unregister_buffers(&ring_); ret < 0)
+    {
+        return fail(-ret, "io_uring_unregister_buffers");
+    }
+    return {};
+}
+
 //
 // Fiber management
 //
-void Runtime::push_ready(detail::fiber::Fiber* fiber) noexcept
+void IO::push_ready(detail::fiber::Fiber* fiber) noexcept
 {
     if (fiber == nullptr || fiber->state == detail::fiber::FiberState::done)
     {
@@ -93,7 +152,7 @@ void Runtime::push_ready(detail::fiber::Fiber* fiber) noexcept
     ready_queue_.push_back(fiber);
 }
 
-void Runtime::remove_ready(detail::fiber::Fiber* fiber) noexcept
+void IO::remove_ready(detail::fiber::Fiber* fiber) noexcept
 {
     if (fiber != nullptr)
     {
@@ -104,13 +163,12 @@ void Runtime::remove_ready(detail::fiber::Fiber* fiber) noexcept
     }
 }
 
-[[nodiscard]] detail::fiber::Fiber* Runtime::pop_ready() noexcept
+[[nodiscard]] detail::fiber::Fiber* IO::pop_ready() noexcept
 {
-    // pop_front() automatically resets the hook to an unlinked state!
     return ready_queue_.pop_front();
 }
 
-void Runtime::destroy_fiber(detail::fiber::Fiber* fiber) noexcept
+void IO::destroy_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     if (fiber == nullptr)
     {
@@ -118,42 +176,44 @@ void Runtime::destroy_fiber(detail::fiber::Fiber* fiber) noexcept
     }
 
     ready_queue_.remove(fiber);
-    all_fibers_.remove(fiber);
-    fiber->task = nullptr;  // Clean user memory
+    fiber->task = nullptr;
+
+    detail::tools_destroy_fiber(fiber->tools);
 
     // Enforce the High-Water Mark!
     if (idle_fibers_.size() >= opts_.max_idle_fibers)
     {
+        // only remove from all_fibers_ when we are returning memory to the OS!
         all_fibers_.remove(fiber);
-        // The pool is full, return memory to the OS
+
+        //  unmap the stack memory to prevent leaks
+        detail::stack::release_stack(fiber->stack);
         delete fiber;
     }
     else
     {
-        // Cache it for later
+        // Cache it for later. It remains in all_fibers_!
         idle_fibers_.push_back(fiber);
     }
 
     --live_fibers_;
 }
 
-void Runtime::destroy_all_fibers() noexcept
+void IO::destroy_all_fibers() noexcept
 {
-    // Clean up active fibers
+    // Iterate the master list. We are guaranteed to catch every reused/idle fiber.
     while (detail::fiber::Fiber* fiber = all_fibers_.pop_front())
     {
         ready_queue_.remove(fiber);
-        delete fiber;
-    }
+        idle_fibers_.remove(fiber);
 
-    // Clean up cached/idle fibers
-    while (const detail::fiber::Fiber* fiber = idle_fibers_.pop_front())
-    {
+        detail::tools_destroy_fiber(fiber->tools);
+        detail::stack::release_stack(fiber->stack);
         delete fiber;
     }
 }
 
-Result<FiberId> Runtime::spawn_task(std::move_only_function<void(Runtime&) noexcept> task) noexcept
+Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task) noexcept
 {
     if (!is_owner_thread())
     {
@@ -211,7 +271,7 @@ Result<FiberId> Runtime::spawn_task(std::move_only_function<void(Runtime&) noexc
     return fiber->id;
 }
 
-void Runtime::resume_fiber(detail::fiber::Fiber* fiber) noexcept
+void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     // Mark this fiber as the currently running one
     current_fiber_ = fiber;
@@ -227,7 +287,7 @@ void Runtime::resume_fiber(detail::fiber::Fiber* fiber) noexcept
     current_fiber_ = nullptr;
 }
 
-void Runtime::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
+void IO::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
 
@@ -236,7 +296,7 @@ void Runtime::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
     detail::tools_after_switch(fiber->tools);
 }
 
-[[nodiscard]] Result<void> Runtime::yield() noexcept
+[[nodiscard]] Result<void> IO::yield() noexcept
 {
     // Check 1: Did the user try to cheat and call this from a different OS thread?
     // Check 2: Did the user call this from main() instead of inside a fiber?
@@ -254,83 +314,12 @@ void Runtime::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
     return {};
 }
 
-void Runtime::tick() noexcept
-{
-    if (auto ret = submit_or_wait_for(); !ret)
-    {
-        // Log/handle failure if needed
-    }
-
-    io_uring_cqe* cqe;
-    unsigned head;
-    unsigned count = 0;
-
-    io_uring_for_each_cqe(&ring_, head, cqe)
-    {
-        if (void* ptr = io_uring_cqe_get_data(cqe))
-        {
-            auto* op = static_cast<detail::fiber::Operation*>(ptr);
-            
-            op->cqe_res = cqe->res;
-            op->cqe_flags = cqe->flags;
-
-            if (op->fiber)
-            {
-                push_ready(op->fiber);
-                --inflight_ops_;
-            }
-        }
-        count++;
-    }
-
-    if (count > 0)
-    {
-        io_uring_cq_advance(&ring_, count);
-    }
-
-    size_t processed = 0;
-    const size_t max_batch = 128; // To prevent networking starvation
-    
-    while (processed < max_batch)
-    {
-        auto* fiber = pop_ready();
-        if (!fiber)
-        {
-            break;
-        }
-
-        resume_fiber(fiber);
-
-        if (fiber->state == detail::fiber::FiberState::done)
-        {
-            destroy_fiber(fiber);
-        }
-
-        processed++;
-    }
-}
-
-void Runtime::run() noexcept
-{
-    is_running_ = true;
-    inside_run_ = true;
-    owner_tid_ = std::this_thread::get_id();
-
-    while (inside_run_ && has_live_fibers())
-    {
-        tick();
-    }
-
-    is_running_ = false;
-    inside_run_ = false;
-}
-
-bool Runtime::has_live_fibers() const noexcept
+bool IO::has_live_fibers() const noexcept
 {
     return live_fibers_ > 0;
 }
 
-[[noreturn]] void Runtime::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
+[[noreturn]] void IO::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     fiber->state = detail::fiber::FiberState::done;
 
@@ -359,7 +348,7 @@ extern "C" [[noreturn]] void tinyio_fiber_entry(void* fiber_ptr) noexcept
     rt.finish_current_fiber(fiber);
 }
 
-Result<void> Runtime::submit_or_wait_for() noexcept
+Result<void> IO::submit_or_wait_for() noexcept
 {
     // Only block if we have no local work to do.
     if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.empty())
@@ -399,7 +388,7 @@ Result<void> Runtime::submit_or_wait_for() noexcept
     return {};
 }
 
-Result<io_uring_sqe*> Runtime::get_sqe() noexcept
+Result<io_uring_sqe*> IO::get_sqe() noexcept
 {
     io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (sqe == nullptr)
@@ -417,7 +406,7 @@ Result<io_uring_sqe*> Runtime::get_sqe() noexcept
     return sqe;
 }
 
-void Runtime::wake() const noexcept
+void IO::wake() const noexcept
 {
     // Only write to the eventfd if the thread is actually parked in the kernel
     if (!is_sleeping_.load(std::memory_order_seq_cst))
@@ -442,7 +431,7 @@ void Runtime::wake() const noexcept
     }
 }
 
-Result<void> Runtime::arm_wake_read() noexcept
+Result<void> IO::arm_wake_read() noexcept
 {
     io_uring_sqe* sqe = TRY(get_sqe());
     io_uring_prep_read(sqe, wake_fd_, &wake_value_, sizeof(wake_value_), 0);
@@ -451,7 +440,7 @@ Result<void> Runtime::arm_wake_read() noexcept
     return {};
 }
 
-Result<void> Runtime::activate()
+Result<void> IO::activate()
 {
     if (is_activated_)
     {
@@ -468,10 +457,13 @@ Result<void> Runtime::activate()
     arm_wake_read();
     is_activated_ = true;
 
+    // set thread id
+    thread_id_ = std::this_thread::get_id();
+
     return {};
 }
 
-Result<std::size_t> Runtime::drain_completions() noexcept
+Result<std::size_t> IO::drain_completions() noexcept
 {
     io_uring_cqe* cqe;
     unsigned head;
@@ -479,10 +471,22 @@ Result<std::size_t> Runtime::drain_completions() noexcept
 
     io_uring_for_each_cqe(&ring_, head, cqe)
     {
-        // If user_data was 0, ptr will be nullptr and the if() fails.
-        if (void* ptr = io_uring_cqe_get_data(cqe); ptr != nullptr)
+        // Grab the raw 64-bit value first
+        const uint64_t raw_data = io_uring_cqe_get_data64(cqe);
+
+        if (raw_data == kWakeupSentinel)
         {
-            auto* op = static_cast<detail::fiber::Operation*>(ptr);
+            // It's a cross-thread wakeup!
+            // If you used an eventfd, you might need to actually read() it here to clear it.
+            // If it's just a raw NOP SQE from another thread, we just ignore it
+            // because its arrival already did its job (waking us from submit_or_wait_for).
+            // Todo: use io uring ring msg, if yes update the comment above
+            arm_wake_read();
+        }
+        else if (raw_data != 0)
+        {
+            // It's a valid Fiber pointer! Now it's safe to cast.
+            auto* op = static_cast<detail::fiber::Operation*>(io_uring_cqe_get_data(cqe));
 
             op->cqe_res = cqe->res;
             op->cqe_flags = cqe->flags;
@@ -493,151 +497,236 @@ Result<std::size_t> Runtime::drain_completions() noexcept
                 --inflight_ops_;
             }
         }
+
         count++;
     }
 
-    //
-    // ======================= IO Methods ==========================================
-    //
-
-    Result<uint32_t> Runtime::read(Fd & fd, const std::span<std::byte> buf, const off_t offset) noexcept
+    if (count > 0)
     {
-        return syscall("read",
-                       [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
+        io_uring_cq_advance(&ring_, count);
     }
 
-    Result<uint32_t> Runtime::read_fixed(Fd & fd, FixedBuffer & buf, size_t len, off_t offset) noexcept
+    return count;
+}
+
+Result<void> IO::tick() noexcept
+{
+    // Flush SQEs and/or wait for CQEs.
+    // If ready_queue_ is empty, this safely drops the CPU to 0% and
+    // sleeps the thread until the kernel wakes us via a CQE.
+    if (auto ret = submit_or_wait_for(); !ret)
     {
-        return syscall("read_fixed", [&](io_uring_sqe* sqe)
-                       { io_uring_prep_read_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
+        auto err = ret.error();
+        ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op, err.error_code().message());
     }
 
-    Result<uint32_t> Runtime::read_fixed(Fd & fd, FixedBuffer & buf, off_t offset) noexcept
+    size_t processed = 0;
+    while (processed < opts_.batch_max_size)
     {
-        return read_fixed(fd, buf, buf.size(), offset);
+        auto* fiber = pop_ready();
+        if (!fiber)
+        {
+            break;  // empty queue
+        }
+
+        // Jump into the user's code
+        resume_fiber(fiber);
+
+        // State Machine Cleanup
+        if (fiber->state == detail::fiber::FiberState::done)
+        {
+            destroy_fiber(fiber);
+        }
+
+        processed++;
     }
 
-    Result<uint32_t> Runtime::writev(Fd & fd, std::span<const iovec> iovecs, off_t offset) noexcept
+    return {};
+}
+
+//
+// ======================= Helpers ==========================================
+//
+void IO::pin_to_cpu() const
+{
+    // TODO: use modulo to map when id_ >= opts_.worker_cpu_affinity.size()
+    if (empty(opts_.worker_cpu_affinity) || id_ >= opts_.worker_cpu_affinity.size())
     {
-        return syscall("writev", [&](io_uring_sqe* sqe)
-                       { io_uring_prep_writev(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
+        return;
     }
 
-    Result<void> Runtime::fsync(Fd & fd, bool datasync) noexcept
+    int physical_core_id = opts_.worker_cpu_affinity.begin()[id_];
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(physical_core_id, &cpuset);
+
+    if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset); rc != 0)
     {
-        return syscall<void>(
-            "fsync", [&](io_uring_sqe* sqe) { io_uring_prep_fsync(sqe, fd.fd, datasync ? IORING_FSYNC_DATASYNC : 0); });
+        ALOG_INFO("Warning: Failed to pin to physical CPU {}: {}", physical_core_id,
+                  std::generic_category().message(rc));
+    }
+}
+
+void IO::run(const std::stop_token& st) noexcept
+{
+    is_running_ = true;
+
+    pin_to_cpu();
+
+    activate();
+
+    std::stop_callback wake_on_stop{st, [this] { wake(); }};
+    while (!st.stop_requested())
+    {
+        tick();
     }
 
-    Result<Fd> Runtime::open(const std::filesystem::path& path, int flags, mode_t mode) noexcept
+    is_running_ = false;
+
+    ALOG_INFO("Worker {} quiescing...", id_);
+    // TODO : cleanup like cancel ...
+}
+//
+// ======================= IO Methods ==========================================
+//
+
+Result<uint32_t> IO::read(Fd& fd, const std::span<std::byte> buf, const off_t offset) noexcept
+{
+    return syscall("read", [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
+}
+
+Result<uint32_t> IO::read_fixed(Fd& fd, FixedBuffer& buf, size_t len, off_t offset) noexcept
+{
+    return syscall("read_fixed", [&](io_uring_sqe* sqe)
+                   { io_uring_prep_read_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
+}
+
+Result<uint32_t> IO::read_fixed(Fd& fd, FixedBuffer& buf, off_t offset) noexcept
+{
+    return read_fixed(fd, buf, buf.size(), offset);
+}
+
+Result<uint32_t> IO::writev(Fd& fd, std::span<const iovec> iovecs, off_t offset) noexcept
+{
+    return syscall("writev",
+                   [&](io_uring_sqe* sqe) { io_uring_prep_writev(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
+}
+
+Result<void> IO::fsync(Fd& fd, bool datasync) noexcept
+{
+    return syscall<void>(
+        "fsync", [&](io_uring_sqe* sqe) { io_uring_prep_fsync(sqe, fd.fd, datasync ? IORING_FSYNC_DATASYNC : 0); });
+}
+
+Result<Fd> IO::open(const std::filesystem::path& path, int flags, mode_t mode) noexcept
+{
+    return syscall<Fd>("open",
+                       [&](io_uring_sqe* sqe) { io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode); });
+}
+
+Result<void> IO::close(Fd&& fd) noexcept
+{
+    // Nullify so Fd destructor doesn't close it twice
+    int raw_fd = fd.Release();
+    return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, raw_fd); });
+}
+
+Result<void> IO::fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept
+{
+    return syscall<void>("fallocate",
+                         [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
+}
+
+Result<void> IO::ftruncate(Fd& fd, off_t len) noexcept
+{
+    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
+}
+
+Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
+{
+    return syscall<Fd>("accept",
+                       [&](io_uring_sqe* sqe)
+                       {
+                           client_addr.addrlen = sizeof(sockaddr_storage);
+                           io_uring_prep_accept(sqe, server_fd.fd, client_addr.GetMutable(), &client_addr.addrlen,
+                                                flags);
+                       });
+}
+
+Result<Fd> IO::accept(Fd& server_fd, int flags) noexcept
+{
+    return syscall<Fd>("accept",
+                       [&](io_uring_sqe* sqe) { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
+}
+
+Result<uint32_t> IO::write(Fd& fd, std::span<const std::byte> buf, off_t offset) noexcept
+{
+    return syscall("write",
+                   [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
+}
+
+Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset) noexcept
+{
+    return syscall("write_fixed", [&](io_uring_sqe* sqe)
+                   { io_uring_prep_write_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
+}
+
+Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, off_t offset) noexcept
+{
+    return write_fixed(fd, buf, buf.size(), offset);
+}
+
+Result<uint32_t> IO::readv(Fd& fd, std::span<const iovec> iovecs, off_t offset) noexcept
+{
+    return syscall("readv",
+                   [&](io_uring_sqe* sqe) { io_uring_prep_readv(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
+}
+
+Result<void> IO::remove(const std::filesystem::path& path) noexcept
+{
+    return syscall<void>("remove", [&](io_uring_sqe* sqe) { io_uring_prep_unlinkat(sqe, AT_FDCWD, path.c_str(), 0); });
+}
+
+Result<void> IO::rename(const std::filesystem::path& from, const std::filesystem::path& to) noexcept
+{
+    return syscall<void>("rename", [&](io_uring_sqe* sqe)
+                         { io_uring_prep_renameat(sqe, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), 0); });
+}
+
+Result<uint32_t> IO::poll(Fd& fd, unsigned poll_mask) noexcept
+{
+    return syscall("poll", [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
+}
+
+Result<void> IO::connect(Fd& fd, const SocketAddress& addr) noexcept
+{
+    return syscall<void>("connect",
+                         [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
+}
+
+Result<void> IO::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
+{
+    if (duration.count() <= 0)
     {
-        return syscall<Fd>("open",
-                           [&](io_uring_sqe* sqe) { io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode); });
+        return {};
     }
 
-    Result<void> Runtime::close(Fd && fd) noexcept
-    {
-        // Nullify so Fd destructor doesn't close it twice
-        int raw_fd = fd.Release();
-        return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, raw_fd); });
-    }
-
-    Result<void> Runtime::fallocate(Fd & fd, int mode, off_t offset, off_t len) noexcept
-    {
-        return syscall<void>("fallocate",
-                             [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
-    }
-
-    Result<void> Runtime::ftruncate(Fd & fd, off_t len) noexcept
-    {
-        return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
-    }
-
-    Result<Fd> Runtime::accept(Fd & server_fd, SocketAddress & client_addr, int flags) noexcept
-    {
-        return syscall<Fd>("accept",
+    auto r = syscall<void>("sleep_for",
                            [&](io_uring_sqe* sqe)
                            {
-                               client_addr.addrlen = sizeof(sockaddr_storage);
-                               io_uring_prep_accept(sqe, server_fd.fd, client_addr.GetMutable(), &client_addr.addrlen,
-                                                    flags);
+                               const auto ns = duration.count();
+                               auto& ts = current_fiber_->operation.timeout_ts;
+                               ts.tv_sec = ns / 1'000'000'000LL;
+                               ts.tv_nsec = ns % 1'000'000'000LL;
+                               io_uring_prep_timeout(sqe, &ts, 0U, 0U);
                            });
-    }
 
-    Result<Fd> Runtime::accept(Fd & server_fd, int flags) noexcept
+    if (!r && r.error().code == ETIME)
     {
-        return syscall<Fd>(
-            "accept", [&](io_uring_sqe* sqe) { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
+        return {};  // ETIME is the expected success code for timeout
     }
 
-    Result<uint32_t> Runtime::write(Fd & fd, std::span<const std::byte> buf, off_t offset) noexcept
-    {
-        return syscall("write",
-                       [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
-    }
-
-    Result<uint32_t> Runtime::write_fixed(Fd & fd, const FixedBuffer& buf, size_t len, off_t offset) noexcept
-    {
-        return syscall("write_fixed", [&](io_uring_sqe* sqe)
-                       { io_uring_prep_write_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
-    }
-
-    Result<uint32_t> Runtime::write_fixed(Fd & fd, const FixedBuffer& buf, off_t offset) noexcept
-    {
-        return write_fixed(fd, buf, buf.size(), offset);
-    }
-
-    Result<uint32_t> Runtime::readv(Fd & fd, std::span<const iovec> iovecs, off_t offset) noexcept
-    {
-        return syscall(
-            "readv", [&](io_uring_sqe* sqe) { io_uring_prep_readv(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
-    }
-
-    Result<void> Runtime::remove(const std::filesystem::path& path) noexcept
-    {
-        return syscall<void>("remove",
-                             [&](io_uring_sqe* sqe) { io_uring_prep_unlinkat(sqe, AT_FDCWD, path.c_str(), 0); });
-    }
-
-    Result<void> Runtime::rename(const std::filesystem::path& from, const std::filesystem::path& to) noexcept
-    {
-        return syscall<void>("rename", [&](io_uring_sqe* sqe)
-                             { io_uring_prep_renameat(sqe, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), 0); });
-    }
-
-    Result<uint32_t> Runtime::poll(Fd & fd, unsigned poll_mask) noexcept
-    {
-        return syscall("poll", [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
-    }
-
-    Result<void> Runtime::connect(Fd & fd, const SocketAddress& addr) noexcept
-    {
-        return syscall<void>("connect",
-                             [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
-    }
-
-    Result<void> Runtime::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
-    {
-        if (duration.count() <= 0)
-        {
-            return {};
-        }
-
-        auto r = syscall<void>("sleep_for",
-                               [&](io_uring_sqe* sqe)
-                               {
-                                   const auto ns = duration.count();
-                                   auto& ts = current_fiber_->operation.timeout_ts;
-                                   ts.tv_sec = ns / 1'000'000'000LL;
-                                   ts.tv_nsec = ns % 1'000'000'000LL;
-                                   io_uring_prep_timeout(sqe, &ts, 0U, 0U);
-                               });
-
-        if (!r && r.error().code == ETIME)
-        {
-            return {};  // ETIME is the expected success code for timeout
-        }
-
-        return r;
-    }
+    return r;
+}
 }  // namespace tinyio
