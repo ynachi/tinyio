@@ -26,15 +26,13 @@ IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> p
 
 IO::~IO() noexcept
 {
-    // Free any FiberContexts that were enqueued cross-thread but never drained.
-    // schedule_fiber() calls ctx.release() before enqueue, so raw ownership
-    // lives in the queue until tick() links it into owned fibers.
-    // TODO: implement, I am not sure at all
+    // Note: The previous TODO regarding cross-thread queues is deferred.
+    // Currently, spawn() checks `is_owner_thread()` and rejects remote spawns,
+    // so there is no cross-thread queue to drain here yet.
 
-    if (has_live_fibers())
+    if (live_fibers_ > 0)
     {
-        // TODO: can we have the number of live fibers in O(1) ?
-        ALOG_WARN("Destroying IO with live fiber(s); call run_blocking/request_stop or drain the IO first");
+        ALOG_WARN("Destroying IO with {} live fiber(s); call run_blocking/request_stop or drain the IO first", live_fibers_);
     }
 
     if (ring_.ring_fd > 0 && buffer_pool_.is_registered())
@@ -57,6 +55,9 @@ IO::~IO() noexcept
         ::close(wake_fd_);
         wake_fd_ = -1;
     }
+
+    // Safely free all fibers (both active and idle) and their stacks
+    destroy_all_fibers();
 }
 
 Result<void> IO::initialize() noexcept
