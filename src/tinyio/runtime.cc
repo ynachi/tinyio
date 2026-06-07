@@ -75,6 +75,8 @@ Result<void> IO::initialize() noexcept
 {
     io_uring_params params{};
 
+    owner_tid_ = std::this_thread::get_id();
+
     // disable the ring first
     params.flags |= kUringBaseFlags | opts_.additional_uring_flags | IORING_SETUP_R_DISABLED;
 
@@ -468,9 +470,6 @@ Result<void> IO::activate()
         ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
     }
     is_activated_ = true;
-
-    // set thread id
-    owner_tid_ = std::this_thread::get_id();
 
     return {};
 }
