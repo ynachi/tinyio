@@ -122,6 +122,8 @@ public:
     /// the runtime is waiting for io_uring completions.
     void run(const std::stop_token& st) noexcept;
 
+    std::size_t id() const noexcept {return id_;}
+
     /// Run until all fibers have completed and the cross-thread post queue is empty.
     ///
     /// This includes tasks enqueued via post() before or during the call.

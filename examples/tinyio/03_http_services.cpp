@@ -41,29 +41,34 @@ constexpr std::string_view kHttpResponse =
     "Hello, io_uring!";
 
 // Handle a single client connection
-static Task<void> handle_client(IO& worker, Fd client_fd)
+static Result<void> handle_client(IO& fio, Fd client_fd) noexcept
 {
     std::byte buf[1024];
 
     while (true)
     {
-        auto read_res = co_await worker.read(client_fd, std::span{buf});
-        if (!read_res)
-        {
-            co_return std::unexpected(read_res.error());
-        }
+        auto r_n = TRY_LOG_ERR(fio.read(client_fd, std::span{buf}), "failed to read from client");
 
-        if (*read_res == 0)
+        if (r_n == 0)
         {
             break;
         }
 
         std::span out_buf(reinterpret_cast<const std::byte*>(kHttpResponse.data()), kHttpResponse.size());
 
+        auto w_n = TRY_LOG_ERR(fio.write(client_fd, out_buf), "failed to write to client");
+
+        if (w_n == 0)
+        {
+            break;
+        }
+
     }
+
+    return {};
 }
 
-Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
+static Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
 {
     while (!data.empty())
     {
@@ -78,116 +83,128 @@ Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
     return {};
 }
 // Accept incoming connections on a single worker
-static Task<void> server_loop(IO& worker, uint16_t port, std::stop_token st)
+static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 {
-    auto listener = TcpListener::Bind(port, "0.0.0.0", 4096);
-    if (!listener)
-    {
-        std::cerr << "[Worker " << worker.id() << "] Failed to bind: " << listener.error().message() << "\n";
-        co_return std::unexpected(listener.error());
-    }
+    auto server_fd = TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
 
-    std::cout << "[Worker " << worker.id() << "] Listening on http://0.0.0.0:" << port << "\n";
-
-    Fd server_fd = std::move(*listener);
+    ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(),  port);
 
     while (!st.stop_requested())
     {
-        auto client_res = co_await worker.accept(server_fd);
-        if (!client_res)
-        {
-            co_return std::unexpected(client_res.error());
-        }
+        auto client_fd = TRY_LOG_ERR(fio.accept(server_fd), "failed to accept");
 
         // Schedule the client handler on the same worker
-        worker.schedule(handle_client(worker, std::move(*client_res)));
+        (void)fio.spawn([client_fd = std::move(client_fd)](IO& worker_fio) mutable noexcept {
+            // If handle_client returns a Result, you might want to log it if it fails
+            if (auto res = handle_client(worker_fio, std::move(client_fd)); !res) {
+                ALOG_ERROR("Client handler failed: {}", res.error().error_code().message());
+            }
+        });
     }
-    co_return {};
+
+    return {};
 }
 
-// Accept connections on one worker and dispatch to others
-static Task<void> dispatching_server_loop(IoContext& ctx, IO& dispatcher, uint16_t port, std::stop_token st)
-{
-    auto listener = TcpListener::Bind(port, "0.0.0.0", 4096);
-    if (!listener)
-    {
-        std::cerr << "[Dispatcher] Failed to bind: " << listener.error().message() << "\n";
-        co_return std::unexpected(listener.error());
-    }
-
-    std::cout << "[Dispatcher] Listening on http://0.0.0.0:" << port << " and dispatching to " << ctx.worker_count() - 1
-              << " workers.\n";
-
-    Fd server_fd = std::move(*listener);
-    std::size_t next_worker = 1;
-
-    while (!st.stop_requested())
-    {
-        auto client_res = co_await dispatcher.accept(server_fd);
-        if (!client_res)
-        {
-            co_return std::unexpected(client_res.error());
-        }
-
-        const std::size_t worker_count = ctx.worker_count();
-        // Dispatch to workers 1..N (round-robin)
-        const std::size_t target_idx = worker_count > 1 ? 1 + ((next_worker++ - 1) % (worker_count - 1)) : 0;
-
-        IO& target = ctx.worker(target_idx);
-
-        // Option 1: Direct scheduling on target worker (Thread-safe)
-        target.schedule(handle_client(target, std::move(*client_res)));
-
-        /*
-        // Option 2: Using TransferTo (Demonstration)
-        usage: co_await io.schedule_on(other);
-        */
-    }
-    co_return {};
-}
+// // Accept connections on one worker and dispatch to others
+// static Task<void> dispatching_server_loop(IoContext& ctx, IO& dispatcher, uint16_t port, std::stop_token st)
+// {
+//     auto listener = TcpListener::Bind(port, "0.0.0.0", 4096);
+//     if (!listener)
+//     {
+//         std::cerr << "[Dispatcher] Failed to bind: " << listener.error().message() << "\n";
+//         co_return std::unexpected(listener.error());
+//     }
+//
+//     std::cout << "[Dispatcher] Listening on http://0.0.0.0:" << port << " and dispatching to " << ctx.worker_count() - 1
+//               << " workers.\n";
+//
+//     Fd server_fd = std::move(*listener);
+//     std::size_t next_worker = 1;
+//
+//     while (!st.stop_requested())
+//     {
+//         auto client_res = co_await dispatcher.accept(server_fd);
+//         if (!client_res)
+//         {
+//             co_return std::unexpected(client_res.error());
+//         }
+//
+//         const std::size_t worker_count = ctx.worker_count();
+//         // Dispatch to workers 1..N (round-robin)
+//         const std::size_t target_idx = worker_count > 1 ? 1 + ((next_worker++ - 1) % (worker_count - 1)) : 0;
+//
+//         IO& target = ctx.worker(target_idx);
+//
+//         // Option 1: Direct scheduling on target worker (Thread-safe)
+//         target.schedule(handle_client(target, std::move(*client_res)));
+//
+//         /*
+//         // Option 2: Using TransferTo (Demonstration)
+//         usage: co_await io.schedule_on(other);
+//         */
+//     }
+//     co_return {};
+// }
 
 int main()
 {
-    URing::ALOG::set_level(ALOG::Level::Debug);
+    // Update ALOG namespace based on new logging
+    tinyio::log::set_level(log::Level::Disabled);
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    // Ignore SIGPIPE to prevent the server from crashing when clients abruptly disconnect
+    std::signal(SIGPIPE, SIG_IGN); 
 
     size_t num_threads = 4;
-    if constexpr (kUseRemoteDispatch)
-    {
-        num_threads += 1;  // 1 dispatcher + 4 workers
-    }
-
-    // New decentralized architecture: workers start themselves in the constructor
-    IoOptions opts;
-    IoContext ctx(num_threads, opts);
     constexpr uint16_t port = 8080;
 
-    auto st = ctx.stop_token();
+    std::vector<std::jthread> threads;
+    std::vector<std::stop_source> stop_sources;
 
-    if constexpr (kUseRemoteDispatch)
+    std::cout << "HTTP Server starting. Press Ctrl+C to stop.\n";
+
+    // Parallel accept on all workers (SO_REUSEPORT allows multiple threads to bind to the same port)
+    for (std::size_t i = 0; i < num_threads; ++i)
     {
-        // Start dispatcher on worker 0
-        ctx.worker(0).schedule(dispatching_server_loop(ctx, ctx.worker(0), port, st));
-    }
-    else
-    {
-        // Parallel accept on all workers (SO_REUSEPORT)
-        for (std::size_t i = 0; i < num_threads; ++i)
-        {
-            ctx.worker(i).schedule(server_loop(ctx.worker(i), port, st));
-        }
+        stop_sources.emplace_back();
+        auto st = stop_sources.back().get_token();
+
+        // Launch a new OS thread for each worker
+        threads.emplace_back([i, port, st] {
+            tinyio::IoOptions opts;
+            tinyio::IO worker(i, opts, {});
+
+            // Spawn the initial accept loop fiber onto this worker
+            (void)worker.spawn([port, st](IO& fio) noexcept {
+                if (auto res = server_loop(fio, port, st); !res) {
+                    ALOG_ERROR("Server loop failed: {}", res.error().error_code().message());
+                }
+            });
+
+            // Start the I/O event loop (blocks until the stop token is triggered)
+            worker.run(st);
+        });
     }
 
-    std::cout << "HTTP Server running. Press Ctrl+C to stop.\n";
+    std::cout << "HTTP Server running on http"
+                 "://127.0.0.1:" << port << "\n";
 
+    // Wait for SIGINT / SIGTERM
     while (g_stop_requested == 0)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    ctx.join();
+    std::cout << "Shutting down workers...\n";
+
+    // Trigger the stop token for all workers, cleanly interrupting the loops
+    for (auto& source : stop_sources) {
+        source.request_stop();
+    }
+
+    // std::jthread automatically joins on destruction, but we clear explicitly here
+    threads.clear();
 
     std::cout << "Server shutdown complete. Goodbye!\n";
     return 0;
