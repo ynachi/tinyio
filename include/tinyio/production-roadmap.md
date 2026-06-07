@@ -26,14 +26,52 @@ The priority is correctness and a clear contract first, then performance.
 
 ## Phase 2: lifecycle safety
 
-- Add owner-thread stop semantics with clear drain behavior.
-- Add a cross-thread wake/post path that can wake a runtime blocked in
-  `io_uring_submit_and_wait`.
-- Add cancellation for outstanding operations.
-- Drain or explicitly fail outstanding completions before destruction.
-- Define behavior for blocked `accept`, `read`, `write`, `sleep_for`, and
-  `close` during shutdown.
-- Add tests for destruction and stop while timeout, read, accept, and write are pending.
+### Implemented
+
+- ✅ Owner-thread stop semantics with drain behavior:
+  - `run()` sets `stopping_ = true`, issues `IORING_OP_ASYNC_CANCEL` for every
+    waiting fiber, then drives `tick()` until `inflight_ops_ == 0 &&
+    ready_queue_.empty()`.  Resumed fibers see `ECANCELED` from `syscall()`
+    (checked on entry while `stopping_ == true`) and are destroyed normally.
+- ✅ Safe destructor: if `is_activated_ && !stopping_ && has_live_work`, the
+  destructor issues the same cancel+drain sequence before releasing kernel
+  resources.  Destroying from a non-owner thread with live work calls
+  `std::abort()` — `IORING_SETUP_SINGLE_ISSUER` forbids cross-thread
+  submission.
+- ✅ Cross-thread `post()`:
+  - `IO::post(fn)` enqueues `fn` into a lock-free `moodycamel::ConcurrentQueue`
+    and calls `wake()` to complete the pending kernel eventfd read, waking a
+    sleeping owner thread.
+  - `tick()` drains the queue after `drain_completions()` and spawns each
+    dequeued task via `spawn_task()`.  All fiber creation stays on the owner
+    thread; no ring access from remote threads.
+  - `owner_tid_` is now fixed at construction time (`initialize()`) rather than
+    at first `activate()` call.
+- ✅ Cancellation for outstanding operations: both `run()` quiesce and the
+  destructor quiesce issue `io_uring_prep_cancel` for all waiting fibers.
+- ✅ Defined behavior for blocked ops during shutdown: all new `syscall()` calls
+  return `ECANCELED` immediately when `stopping_ == true`; pending kernel ops
+  are cancelled and their CQEs deliver `-ECANCELED` to the waiting fiber.
+
+### Testing gap (Phase 2 tests not yet written)
+
+The `tests/tinyio/` directory does not exist yet and `TIO_BUILD_TESTS` must
+remain `OFF` until it is populated.  Tests needed before Phase 2 is fully
+closed:
+
+| Test | Scenario |
+|------|----------|
+| `safe_destructor_ready_fiber` | `run_until_done()` completes; new fiber spawned; IO destroyed — fiber sees `ECANCELED` |
+| `safe_destructor_waiting_fiber` | `run()` stopped via token while a fiber blocks on `sleep_for` / `read` — fiber gets `ECANCELED` |
+| `post_before_run` | `post(task)` called before `run_until_done()` — task runs |
+| `post_while_running` | N threads each calling `post()` while `run()` is active — all N tasks execute, TSAN clean |
+| `post_saturation` | 8 threads × 1000 `post()` calls; verify all 8000 tasks execute |
+| `post_after_stop` | `post()` called after stop requested — queue discarded cleanly in destructor |
+
+**TSAN note**: `moodycamel::ConcurrentQueue` uses bare `atomic_thread_fence`
+which GCC's TSAN cannot instrument (`-Wtsan` warning at build time).  TSAN will
+not report false positives for the queue but cannot verify its memory ordering
+either.  The queue's own test suite is the correctness guarantee.
 
 ## Phase 3: core runtime hardening
 
@@ -106,11 +144,11 @@ Do this only after the runtime contract is stable.
 
 ## First implementation sprint
 
-1. Remove the fake liburing backend.
-2. Fix shutdown semantics.
-3. Add cross-thread `post()` with eventfd wakeup.
+1. ✅ Remove the fake liburing backend.
+2. ✅ Fix shutdown semantics (safe destructor quiesce, `stopping_` flag, cancellation).
+3. ✅ Add cross-thread `post()` with eventfd wakeup.
 4. Add a bounded stack pool.
-5. Add TCP integration tests.
+5. Add Phase 2 integration tests (see testing gap above) and TCP integration tests.
 6. Add batched CQE draining.
 7. Re-benchmark against the current baseline.
 

@@ -170,6 +170,7 @@ option(TIO_BUILD_FIBER_BENCH "Build stackful vs stackless benchmark" OFF)
 option(TIO_BUILD_HTTP_BENCH "Build HTTP server benchmark targets" OFF)
 # pass -DTIO_DEMO_FILTER="core;http" to build specific subsets of demo.
 option(TIO_BUILD_BENCHMARK "Build codes used to benchmark kio against other libs" OFF)
+option(TIO_BUILD_TINYIO_BENCH "Build tinyio disk/http bench and cross-thread post smoke test" OFF)
 option(ENABLE_CLANG_TIDY "Run clang-tidy during compilation" OFF)
 
 # Enable clang-tidy during build if requested
@@ -375,6 +376,25 @@ if (TIO_BUILD_TESTS)
     )
 
     message(STATUS "Added targets: check, check-quick")
+endif ()
+
+if (TIO_BUILD_TINYIO_BENCH)
+    add_executable(tinyio_disk_bench benchmarks/cpp/tinyio_disk_bench.cpp)
+    target_link_libraries(tinyio_disk_bench PRIVATE tinyio)
+    tio_target_compile_options(tinyio_disk_bench)
+    tio_add_sanitizers(tinyio_disk_bench)
+
+    add_executable(tinyio_http_bench benchmarks/cpp/tinyio_http_bench.cpp)
+    target_link_libraries(tinyio_http_bench PRIVATE tinyio)
+    tio_target_compile_options(tinyio_http_bench)
+    tio_add_sanitizers(tinyio_http_bench)
+
+    add_executable(tinyio_post_smoke benchmarks/cpp/tinyio_post_smoke.cpp)
+    target_link_libraries(tinyio_post_smoke PRIVATE tinyio)
+    tio_target_compile_options(tinyio_post_smoke)
+    tio_add_sanitizers(tinyio_post_smoke)
+
+    message(STATUS "Enabled tinyio bench targets: tinyio_disk_bench, tinyio_http_bench, tinyio_post_smoke")
 endif ()
 
 if (TIO_BUILD_SEGMENT_BENCH)

@@ -6,6 +6,11 @@
 #include <thread>
 #include <vector>
 
+// Must be included before <liburing.h>: liburing pulls in kernel headers that
+// define BLOCK_SIZE as a numeric macro, which conflicts with moodycamel's
+// static member identifier of the same name.
+#include "libs/concurrentqueue.hpp"
+
 #include <fcntl.h>
 #include <liburing.h>
 
@@ -120,8 +125,36 @@ public:
     /// the runtime is waiting for io_uring completions.
     void run(const std::stop_token& st) noexcept;
 
-    /// Run until there is no more IO
+    /// Run until all fibers have completed and the cross-thread post queue is empty.
+    ///
+    /// This includes tasks enqueued via post() before or during the call.
     void run_until_done() noexcept;
+
+    /// Post a callable to this IO's event loop from any thread.
+    ///
+    /// The callable is enqueued in a lock-free MPSC queue and will be spawned
+    /// as a fiber on the next tick() on the owner thread. The owner thread is
+    /// woken up via the internal eventfd if it is currently sleeping.
+    ///
+    /// @return true if the task was successfully enqueued; false on OOM.
+    template <class Fn>
+        requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
+    [[nodiscard]] bool post(Fn&& fn) noexcept
+    {
+        try
+        {
+            if (!post_queue_.enqueue(std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn))))
+            {
+                return false;
+            }
+        }
+        catch (...)
+        {
+            return false;
+        }
+        wake();
+        return true;
+    }
 
     /// Suspend the current fiber to give bck the control to the runtime
     [[nodiscard]] Result<void> yield() noexcept;
@@ -393,6 +426,10 @@ private:
     FiberId next_fiber_id_ = 1;
     std::size_t live_fibers_ = 0;
     std::size_t inflight_ops_ = 0;
+
+    /// MPSC queue for tasks posted from remote threads via post().
+    /// Drained on the owner thread inside tick().
+    moodycamel::ConcurrentQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
 
     [[noreturn]] void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
     friend void ::tinyio_fiber_entry(void*) noexcept;

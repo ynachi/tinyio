@@ -36,14 +36,84 @@ catch (...)
 
 IO::~IO() noexcept
 {
-    // Note: The previous TODO regarding cross-thread queues is deferred.
-    // Currently, spawn() checks `is_owner_thread()` and rejects remote spawns,
-    // so there is no cross-thread queue to drain here yet.
+    // Discard any tasks that were posted but not yet spawned.
+    // Their destructors release any captured resources before we tear down the ring.
+    {
+        std::move_only_function<void(IO&) noexcept> fn;
+        while (post_queue_.try_dequeue(fn))
+        {
+        }
+    }
+
+    // Quiesce in-flight work before releasing kernel resources.
+    //
+    // If the ring was activated and there is still live work (fibers waiting
+    // on io_uring CQEs, ready fibers not yet resumed), we must cancel and drain
+    // here so the kernel does not reference freed Operation* pointers after
+    // io_uring_queue_exit().
+    //
+    // This MUST run on the owner thread: IORING_SETUP_SINGLE_ISSUER forbids
+    // cross-thread submission.  Destroying the IO from another thread while
+    // the ring has live work is a kernel UAF and causes abort.
+    const bool has_live_work = live_fibers_ > 0 || inflight_ops_ > 0 || !ready_queue_.empty();
+
+    if (is_activated_ && !stopping_ && has_live_work)
+    {
+        if (!is_owner_thread())
+        {
+            ALOG_ERROR(
+                "IO #{} destroyed from a non-owner thread with {} live fiber(s) "
+                "and {} op(s) in-flight — aborting to prevent kernel UAF",
+                id_, live_fibers_, inflight_ops_);
+            std::abort();
+        }
+
+        ALOG_WARN("IO #{} destroyed with {} live fiber(s); issuing cancels and draining", id_, live_fibers_);
+        stopping_ = true;
+
+        // Cancel every fiber that is blocked waiting for a kernel CQE.
+        bool issued_cancels = false;
+        all_fibers_.for_each(
+            [&](detail::fiber::Fiber& fiber) noexcept
+            {
+                if (fiber.state != detail::fiber::FiberState::waiting)
+                {
+                    return;
+                }
+                auto res = get_sqe();
+                if (!res)
+                {
+                    ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
+                    return;
+                }
+                io_uring_prep_cancel(res.value(), &fiber.operation, 0);
+                io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
+                ++inflight_ops_;
+                issued_cancels = true;
+            });
+
+        if (issued_cancels)
+        {
+            io_uring_submit(&ring_);
+        }
+
+        // Drive tick() until the kernel has acknowledged all cancellations and
+        // the ready queue has been fully flushed.  Resumed fibers see ECANCELED
+        // from syscall() (because stopping_ == true), return from their tasks,
+        // and are destroyed via finish_current_fiber() -> destroy_fiber().
+        while (inflight_ops_ > 0 || !ready_queue_.empty())
+        {
+            if (auto res = tick(); !res)
+            {
+                ALOG_ERROR("failed  to process io: [{}] {}", res.error().op, res.error().error_code().message());
+                return;
+            }
+        }
+    }
 
     if (live_fibers_ > 0)
     {
-        ALOG_WARN("Destroying IO with {} live fiber(s); call run_blocking/request_stop or drain the IO first",
-                  live_fibers_);
+        ALOG_WARN("IO #{} teardown: {} fiber(s) still live (stuck in app logic?)", id_, live_fibers_);
     }
 
     if (ring_.ring_fd > 0 && buffer_pool_.is_registered())
@@ -67,7 +137,7 @@ IO::~IO() noexcept
         wake_fd_ = -1;
     }
 
-    // Safely free all fibers (both active and idle) and their stacks
+    // Release all fiber stacks and Fiber objects (both live and idle).
     destroy_all_fibers();
 }
 
@@ -538,6 +608,38 @@ Result<void> IO::tick() noexcept
 
     ALOG_DEBUG("drained {} io completions", count);
 
+    // Drain tasks posted from remote threads and spawn them as fibers.
+    // Done here, after drain_completions(), so newly spawned tasks join the
+    // ready queue alongside any fibers that were just woken by CQEs.
+    // We use try_dequeue_bulk to grab multiple tasks at once efficiently,
+    // and limit the total processed per tick to prevent I/O starvation.
+    {
+        constexpr size_t kMaxBulk = 64;
+        std::move_only_function<void(IO&) noexcept> fns[kMaxBulk];
+        size_t dequeued = 0;
+        size_t total_processed = 0;
+
+        while (total_processed < opts_.batch_max_size)
+        {
+            const size_t to_dequeue = std::min(kMaxBulk, opts_.batch_max_size - total_processed);
+            dequeued = post_queue_.try_dequeue_bulk(fns, to_dequeue);
+            
+            if (dequeued == 0)
+            {
+                break;
+            }
+
+            for (size_t i = 0; i < dequeued; ++i)
+            {
+                if (auto res = spawn_task(std::move(fns[i])); !res)
+                {
+                    ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op, res.error().error_code().message());
+                }
+            }
+            total_processed += dequeued;
+        }
+    }
+
     size_t processed = 0;
     while (processed < opts_.batch_max_size)
     {
@@ -667,7 +769,10 @@ void IO::run_until_done() noexcept
         return;
     }
 
-    while (has_live_fibers() || inflight_ops_ > 0 || !ready_queue_.empty())
+    // Also drain the cross-thread post queue: tasks posted before run_until_done()
+    // is called would be silently dropped if we only checked live_fibers_.
+    while (has_live_fibers() || inflight_ops_ > 0 || !ready_queue_.empty() ||
+           post_queue_.size_approx() > 0)
     {
         if (auto res = tick(); !res)
         {
