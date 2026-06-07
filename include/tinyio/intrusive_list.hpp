@@ -57,6 +57,18 @@ public:
         }
     }
 
+    template <class Fn>
+    void for_each(Fn&& fn) noexcept
+    {
+        auto* hook = dummy_.next;
+        while (hook != &dummy_)
+        {
+            auto* next = hook->next;
+            fn(*get_node(hook));
+            hook = next;
+        }
+    }
+
 private:
     IntrusiveHook<Tag> dummy_;
     std::size_t size_ = 0;

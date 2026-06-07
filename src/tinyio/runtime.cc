@@ -483,6 +483,10 @@ Result<std::size_t> IO::drain_completions() noexcept
             // Todo: use io uring ring msg, if yes update the comment above
             arm_wake_read();
         }
+        else if (raw_data == kFiberCancelSentinel)
+        {
+            --inflight_ops_;
+        }
         else if (raw_data != 0)
         {
             // It's a valid Fiber pointer! Now it's safe to cast.
@@ -553,13 +557,14 @@ Result<void> IO::tick() noexcept
 //
 void IO::pin_to_cpu() const
 {
-    // TODO: use modulo to map when id_ >= opts_.worker_cpu_affinity.size()
-    if (empty(opts_.worker_cpu_affinity) || id_ >= opts_.worker_cpu_affinity.size())
+    const auto size = opts_.worker_cpu_affinity.size();
+
+    if (empty(opts_.worker_cpu_affinity))
     {
         return;
     }
 
-    int physical_core_id = opts_.worker_cpu_affinity.begin()[id_];
+    int physical_core_id = opts_.worker_cpu_affinity[id_ % size];
 
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -586,10 +591,51 @@ void IO::run(const std::stop_token& st) noexcept
         tick();
     }
 
+    stopping_ = true;
+    ALOG_INFO("Worker {} quiescing...", id_);
+
+    // Issue cancels for waiting fibers
+    bool issued_cancels = false;
+    all_fibers_.for_each(
+        [&](detail::fiber::Fiber& fiber) noexcept
+        {
+            if (fiber.state != detail::fiber::FiberState::waiting)
+            {
+                return;
+            }
+
+            auto res = get_sqe();
+            if (!res)
+            {
+                auto err = res.error();
+                ALOG_ERROR("failed to allocate cancel SQE: [{}] {}", err.op, err.error_code().message());
+                return;
+            }
+
+            auto* sqe = res.value();
+            io_uring_prep_cancel(sqe, &fiber.operation, 0);
+            io_uring_sqe_set_data64(sqe, kFiberCancelSentinel);
+            ++inflight_ops_;
+            issued_cancels = true;
+        });
+
+    if (issued_cancels)
+    {
+        io_uring_submit(&ring_);
+    }
+
+    // Drain completions and ready fibers
+    while (inflight_ops_ > 0 || !ready_queue_.empty())
+    {
+        tick();
+    }
+
     is_running_ = false;
 
-    ALOG_INFO("Worker {} quiescing...", id_);
-    // TODO : cleanup like cancel ...
+    if (live_fibers_ > 0)
+    {
+        ALOG_WARN("Worker {} stopped with {} live fibers (stuck in app logic?)", id_, live_fibers_);
+    }
 }
 
 void IO::run_until_done() noexcept

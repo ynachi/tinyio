@@ -312,6 +312,11 @@ private:
     template <typename T = uint32_t, typename Prep>
     Result<T> syscall(const char* op_name, Prep&& prep) noexcept
     {
+        if (stopping_)
+        {
+            return fail(ECANCELED, op_name);
+        }
+
         // - Prevents multi-threaded corruption of io_uring
         // - Prevents calling io.read() from outside a fiber
         if (!is_owner_thread() || current_fiber_ == nullptr)
@@ -365,6 +370,7 @@ private:
     //
     bool is_activated_{false};
     bool is_running_{false};
+    bool stopping_{false};
     // cross-thread needs to check this, this is why it is an atomic
     alignas(64) std::atomic<bool> is_sleeping_{false};
     std::thread::id owner_tid_;
