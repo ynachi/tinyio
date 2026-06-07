@@ -11,7 +11,7 @@
 
 namespace tinyio
 {
-IO::IO(const size_t id, const IoOptions& opts, const std::initializer_list<BucketConfig> pool_configs)
+IO::IO(const size_t id, const IoOptions& opts, const std::vector<BucketConfig> pool_configs)
     : id_(id), opts_(opts), buffer_pool_(pool_configs)
 {
     if (auto res = initialize(); !res.has_value())
@@ -458,7 +458,7 @@ Result<void> IO::activate()
     is_activated_ = true;
 
     // set thread id
-    thread_id_ = std::this_thread::get_id();
+    owner_tid_ = std::this_thread::get_id();
 
     return {};
 }
@@ -519,6 +519,10 @@ Result<void> IO::tick() noexcept
         auto err = ret.error();
         ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op, err.error_code().message());
     }
+
+    auto count = TRY_LOG_ERR(drain_completions(), "current tick run failed to drain completions");
+
+    ALOG_DEBUG("drained {} io completions", count);
 
     size_t processed = 0;
     while (processed < opts_.batch_max_size)
@@ -586,6 +590,33 @@ void IO::run(const std::stop_token& st) noexcept
 
     ALOG_INFO("Worker {} quiescing...", id_);
     // TODO : cleanup like cancel ...
+}
+
+void IO::run_until_done() noexcept
+{
+    is_running_ = true;
+
+    pin_to_cpu();
+
+    if (auto res = activate(); !res)
+    {
+        const auto err = res.error();
+        ALOG_ERROR("failed to activate io worker: [{}] {}", err.op, err.error_code().message());
+        is_running_ = false;
+        return;
+    }
+
+    while (has_live_fibers() || inflight_ops_ > 0 || !ready_queue_.empty())
+    {
+        if (auto res = tick(); !res)
+        {
+            const auto err = res.error();
+            ALOG_ERROR("io tick failed: [{}] {}", err.op, err.error_code().message());
+            break;
+        }
+    }
+
+    is_running_ = false;
 }
 //
 // ======================= IO Methods ==========================================

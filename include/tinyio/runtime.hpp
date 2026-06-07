@@ -4,10 +4,10 @@
 #include <concepts>
 #include <filesystem>
 #include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <liburing.h>
-#include <unistd.h>
 
 #include "buffer_pool.hpp"
 #include "detail/fiber.hpp"
@@ -73,7 +73,7 @@ class IO final
 public:
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
     // TODO: pool_configs should use vector for a stable storage
-    explicit IO(size_t id, const IoOptions& opts, std::initializer_list<BucketConfig> pool_configs);
+    explicit IO(size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs);
 
     /// Destroys the runtime and releases ring resources and all fiber stacks.
     ///
@@ -121,13 +121,7 @@ public:
     void run(const std::stop_token& st) noexcept;
 
     /// Run until there is no more IO
-    void run_until_done() noexcept
-    {
-        pin_to_cpu();
-        activate();
-        // TODO: fix me
-        tick();
-    }
+    void run_until_done() noexcept;
 
     /// Suspend the current fiber to give bck the control to the runtime
     [[nodiscard]] Result<void> yield() noexcept;
@@ -378,11 +372,10 @@ private:
     //
     // Configs
     //
-    std::thread::id thread_id_;
     std::size_t id_;  ///  Id of the worker in a multi-threaded context
     IoOptions opts_;
 
-    FixedBufferPool buffer_pool_{};
+    FixedBufferPool buffer_pool_;
 
     //
     // Fiber management

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "tinyio/logger.hpp"
+
 namespace tinyio
 {
 FixedBuffer::FixedBuffer(FixedBuffer&& other) noexcept
@@ -68,7 +70,7 @@ FixedBufferPool::Bucket::Bucket(const size_t size, const size_t count, const uin
     return idx;
 }
 
-FixedBufferPool::FixedBufferPool(std::initializer_list<BucketConfig> configs)
+FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs)
 {
     if (configs.size() == 0)
     {

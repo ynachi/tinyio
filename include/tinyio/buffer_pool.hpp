@@ -1,7 +1,9 @@
 #pragma once
 
 #include <initializer_list>
+#include <memory>
 #include <span>
+#include <vector>
 
 #include <liburing.h>
 
@@ -90,7 +92,7 @@ class FixedBufferPool
 public:
     /// Construct pool from bucket configurations
     /// @param configs List of {slot_size, count} pairs (will be sorted internally)
-    explicit FixedBufferPool(std::initializer_list<BucketConfig> configs);
+    explicit FixedBufferPool(std::vector<BucketConfig> configs);
 
     /// Acquire the smallest buffer >= requested size
     /// @param size Minimum buffer size needed
