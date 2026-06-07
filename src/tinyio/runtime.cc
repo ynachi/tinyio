@@ -307,14 +307,9 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
 
     if (fiber == nullptr)
     {
-        fiber = new (std::nothrow) detail::fiber::Fiber();
-
-        // if fiber is null again
-        if (fiber == nullptr)
-        {
-            return fail(ENOMEM, "spawn");
-        }
-
+        fiber = new detail::fiber::Fiber();
+        fiber->id = ++next_fiber_id_;
+        fiber->runtime = this;
         const auto stack = TRY(detail::stack::allocate_stack(opts_.stack_size, opts_.guard_size));
 
         fiber->stack = stack;

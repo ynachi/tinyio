@@ -48,10 +48,7 @@ public:
     /// Enqueue an item. Can be called from any thread.
     /// Returns true on success, false on allocation failure.
     bool enqueue(T&& data) noexcept {
-        Node* node = new (std::nothrow) Node(std::move(data));
-        if (!node) {
-            return false;
-        }
+        Node* node = new Node(std::move(data));
 
         Node* prev = head_.exchange(node, std::memory_order_acq_rel);
         prev->next.store(node, std::memory_order_release);
