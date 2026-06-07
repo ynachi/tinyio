@@ -32,7 +32,8 @@ IO::~IO() noexcept
 
     if (live_fibers_ > 0)
     {
-        ALOG_WARN("Destroying IO with {} live fiber(s); call run_blocking/request_stop or drain the IO first", live_fibers_);
+        ALOG_WARN("Destroying IO with {} live fiber(s); call run_blocking/request_stop or drain the IO first",
+                  live_fibers_);
     }
 
     if (ring_.ring_fd > 0 && buffer_pool_.is_registered())
@@ -477,11 +478,6 @@ Result<std::size_t> IO::drain_completions() noexcept
 
         if (raw_data == kWakeupSentinel)
         {
-            // It's a cross-thread wakeup!
-            // If you used an eventfd, you might need to actually read() it here to clear it.
-            // If it's just a raw NOP SQE from another thread, we just ignore it
-            // because its arrival already did its job (waking us from submit_or_wait_for).
-            // Todo: use io uring ring msg, if yes update the comment above
             arm_wake_read();
         }
         else if (raw_data == kFiberCancelSentinel)
@@ -584,7 +580,12 @@ void IO::run(const std::stop_token& st) noexcept
 
     pin_to_cpu();
 
-    activate();
+    if (auto res = activate(); !res.has_value())
+    {
+        auto err = res.error();
+        ALOG_ERROR("failed to activate io uring: [{}] {}", err.op, err.error_code().message());
+        return;
+    }
 
     std::stop_callback wake_on_stop{st, [this] { wake(); }};
     while (!st.stop_requested())
