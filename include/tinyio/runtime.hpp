@@ -371,8 +371,6 @@ private:
     bool is_activated_{false};
     bool is_running_{false};
     bool stopping_{false};
-    // cross-thread needs to check this, this is why it is an atomic
-    alignas(64) std::atomic<bool> is_sleeping_{false};
     std::thread::id owner_tid_;
 
     //

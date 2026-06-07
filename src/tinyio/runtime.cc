@@ -372,19 +372,10 @@ Result<void> IO::submit_or_wait_for() noexcept
     }
     else
     {
-        // Thundering herd mitigation
-        is_sleeping_.store(true, std::memory_order_seq_cst);
-
-        // Double check all sources of work before sleeping
-        if (io_uring_cq_ready(&ring_) == 0 && ready_queue_.empty())
+        if (const auto ret = io_uring_submit_and_wait(&ring_, 1); ret < 0 && ret != -EINTR)
         {
-            if (const auto ret = io_uring_submit_and_wait(&ring_, 1); ret < 0 && ret != -EINTR)
-            {
-                return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait");
-            }
+            return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait");
         }
-
-        is_sleeping_.store(false, std::memory_order_relaxed);
     }
 
     return {};
@@ -410,12 +401,12 @@ Result<io_uring_sqe*> IO::get_sqe() noexcept
 
 void IO::wake() const noexcept
 {
-    // Only write to the eventfd if the thread is actually parked in the kernel
-    if (!is_sleeping_.load(std::memory_order_seq_cst))
-    {
-        return;
-    }
-
+    // Always write to the eventfd. There is always one pending eventfd read
+    // SQE in the kernel (armed by arm_wake_read() and re-armed after each
+    // wakeup CQE). Writing here completes that read unconditionally, so
+    // submit_and_wait returns regardless of whether is_sleeping_ is set yet.
+    // This closes the race where request_stop() fires between the last
+    // stop_requested() check and the thread entering submit_and_wait.
     constexpr uint64_t one = 1;
     for (;;)
     {
@@ -478,7 +469,11 @@ Result<std::size_t> IO::drain_completions() noexcept
 
         if (raw_data == kWakeupSentinel)
         {
-            arm_wake_read();
+            if (auto res = arm_wake_read(); !res)
+            {
+                const auto err = res.error();
+                ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
+            }
         }
         else if (raw_data == kFiberCancelSentinel)
         {
