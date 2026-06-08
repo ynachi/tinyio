@@ -430,7 +430,7 @@ private:
     /// Drained on the owner thread inside tick().
     detail::MpscQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
 
-    [[noreturn]] TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
+    [[noreturn]] TIO_NO_SANITIZE_ADDRESS void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
     friend void ::tinyio_fiber_entry(void*) noexcept;
 
     void push_ready(detail::fiber::Fiber* fiber) noexcept;
@@ -438,8 +438,8 @@ private:
     [[nodiscard]] detail::fiber::Fiber* pop_ready() noexcept;
     void destroy_fiber(detail::fiber::Fiber* fiber) noexcept;
     void destroy_all_fibers() noexcept;
-    TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void suspend_fiber(detail::fiber::Fiber* fiber) noexcept;
-    TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void resume_fiber(detail::fiber::Fiber* fiber) noexcept;
+    TIO_NO_SANITIZE_ADDRESS void suspend_fiber(detail::fiber::Fiber* fiber) noexcept;
+    TIO_NO_SANITIZE_ADDRESS void resume_fiber(detail::fiber::Fiber* fiber) noexcept;
 
     //
     // Other private helper methods

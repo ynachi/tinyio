@@ -297,25 +297,46 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     fiber->state = detail::fiber::FiberState::ready;
     detail::tools_create_fiber(fiber->tools);
 
-// Reset CPU registers — single layout for both compilers under preserve_none.
-// Under preserve_none only rsp/rbp (x86-64) or sp/x29 (aarch64) are callee-saved,
-// so the initial stack only needs frame pointer + fiber pointer slots.
+// Under standard C ABI:
+// x86-64:
+//   Callee-saved registers: rbp, rbx, r12, r13, r14, r15 (48 bytes)
+//   Return address (rip) is implicitly popped by `ret`.
+//   Arguments: `from` is %rdi, `to` is %rsi.
+//   We pass `fiber` pointer via %r12 so `tinyio_fiber_start` can move it to %rdi.
+//
+// aarch64:
+//   Callee-saved registers: x19-x30 (96 bytes) and d8-d15 (64 bytes). Total 160 bytes.
+//   Return address is popped from the stack (stored in x30 slot).
+//   We pass `fiber` pointer via x19 so `tinyio_fiber_start` can move it to x0.
 #if defined(__x86_64__)
     auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
-    *--sp = 0U;                                          // padding
-    *--sp = 0U;                                          // padding
-    *--sp = reinterpret_cast<std::uintptr_t>(fiber);     // popped as %rdi by tinyio_fiber_start
-    *--sp = 0U;                                          // dummy rbp, popped by tinyio_ctx_switch
-    fiber->context.rsp = reinterpret_cast<std::uint64_t>(sp);
-    fiber->context.rip = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
+    // sp is currently 16-byte aligned.
+    // The ABI requires RSP % 16 == 8 BEFORE a call (or entering a function).
+    // `tinyio_ctx_switch` ends with `ret` which pops 8 bytes (the return address).
+    // Therefore, if RSP % 16 == 0 BEFORE `ret`, then AFTER `ret` it will be 8, which is correct.
+
+    *--sp = reinterpret_cast<std::uintptr_t>(&tinyio_fiber_start); // return address
+    
+    *--sp = 0U; // rbp
+    *--sp = 0U; // rbx
+    *--sp = reinterpret_cast<std::uintptr_t>(fiber); // r12
+    *--sp = 0U; // r13
+    *--sp = 0U; // r14
+    *--sp = 0U; // r15
+    
+    fiber->context.sp = reinterpret_cast<std::uintptr_t>(sp);
 #elif defined(__aarch64__)
     auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
-    *--sp = 0U;                                          // padding (keeps 16-byte alignment for fiber*)
-    *--sp = reinterpret_cast<std::uintptr_t>(fiber);     // loaded as x0 by tinyio_fiber_start
-    *--sp = 0U;                                          // dummy x29 (frame pointer)
-    *--sp = 0U;                                          // padding to keep 16-byte SP alignment
-    fiber->context.sp = reinterpret_cast<std::uint64_t>(sp);
-    fiber->context.pc = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
+    // 160 bytes for callee-saved registers (20 * 8 bytes)
+    sp -= 20;
+
+    // sp[8] corresponds to x19 in our assembly layout
+    sp[8] = reinterpret_cast<std::uintptr_t>(fiber);
+
+    // sp[19] corresponds to x30 (LR) in our assembly layout
+    sp[19] = reinterpret_cast<std::uintptr_t>(&tinyio_fiber_start);
+
+    fiber->context.sp = reinterpret_cast<std::uintptr_t>(sp);
 #else
     #error "unsupported architecture"
 #endif
@@ -326,7 +347,7 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     return fiber->id;
 }
 
-TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
+TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     // Mark this fiber as the currently running one
     current_fiber_ = fiber;
@@ -341,7 +362,7 @@ TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::F
     current_fiber_ = nullptr;
 }
 
-TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
+TIO_NO_SANITIZE_ADDRESS void IO::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
 
@@ -373,7 +394,7 @@ bool IO::has_live_fibers() const noexcept
     return live_fibers_ > 0;
 }
 
-[[noreturn]] TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
+[[noreturn]] TIO_NO_SANITIZE_ADDRESS void IO::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     fiber->state = detail::fiber::FiberState::done;
 

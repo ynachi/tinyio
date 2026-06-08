@@ -13,7 +13,8 @@
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_C_COMPILER": "clang-22",
-        "CMAKE_CXX_COMPILER": "clang++-22"
+        "CMAKE_CXX_COMPILER": "clang++-22",
+        "CMAKE_ASM_COMPILER": "clang-22"
       }
     },
     {
@@ -23,10 +24,10 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "KIO_BUILD_TESTS": "ON",
-        "KIO_BUILD_DEMOS": "ON",
-        "KIO_BUILD_BITCASK": "OFF",
-        "KIO_BUILD_BENCHMARK": "ON"
+        "TIO_BUILD_TESTS": "ON",
+        "TIO_BUILD_DEMOS": "ON",
+        "TIO_BUILD_BITCASK": "OFF",
+        "TIO_BUILD_BENCHMARK": "ON"
       }
     },
     {
@@ -45,10 +46,10 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "KIO_BUILD_TESTS": "OFF",
-        "KIO_BUILD_DEMOS": "OFF",
-        "KIO_BUILD_BITCASK": "ON",
-        "KIO_BUILD_BENCHMARK": "OFF"
+        "TIO_BUILD_TESTS": "OFF",
+        "TIO_BUILD_DEMOS": "OFF",
+        "TIO_BUILD_BITCASK": "OFF",
+        "TIO_BUILD_BENCHMARK": "OFF"
       }
     },
     {
@@ -58,10 +59,10 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "KIO_BUILD_TESTS": "ON",
-        "KIO_BUILD_DEMOS": "OFF",
-        "KIO_BUILD_BITCASK": "OFF",
-        "KIO_BUILD_BENCHMARK": "OFF",
+        "TIO_BUILD_TESTS": "ON",
+        "TIO_BUILD_DEMOS": "OFF",
+        "TIO_BUILD_BITCASK": "OFF",
+        "TIO_BUILD_BENCHMARK": "OFF",
         "ENABLE_CLANG_TIDY": "ON"
       }
     }

@@ -1,0 +1,40 @@
+services:
+
+  # ── Native arm64 (Apple Silicon) ──────────────────────────────────────────
+  test-arm64:
+    build:
+      context: ..
+      dockerfile: dev-tools/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/workspace:ro       # source tree, read-only
+      - build-arm64:/workspace/build   # shadows source/build; named volume for caching
+    environment:
+      TIO_SANITIZER: ${TIO_SANITIZER:-none}
+      TEST_LABEL:    ${TEST_LABEL:-unit}
+    command: bash /workspace/dev-tools/run-tests.sh
+    # SYS_PTRACE lets sanitizer stack-unwinders work inside the container.
+    cap_add:
+      - SYS_PTRACE
+
+  # ── amd64 via Rosetta ─────────────────────────────────────────────────────
+  # Docker Desktop on Apple Silicon runs amd64 images through Rosetta 2.
+  # io_uring works because both services share the same Linux VM kernel.
+  test-amd64:
+    build:
+      context: ..
+      dockerfile: dev-tools/Dockerfile
+    platform: linux/amd64
+    volumes:
+      - ..:/workspace:ro
+      - build-amd64:/workspace/build   # shadows source/build; named volume for caching
+    environment:
+      TIO_SANITIZER: ${TIO_SANITIZER:-none}
+      TEST_LABEL:    ${TEST_LABEL:-unit}
+    command: bash /workspace/dev-tools/run-tests.sh
+    cap_add:
+      - SYS_PTRACE
+
+volumes:
+  build-arm64:
+  build-amd64:

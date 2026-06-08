@@ -1,5 +1,16 @@
 # tinyio tests
 
+#========= tinyio unit tests (no io_uring required)
+tio_add_test(intrusive_list_tests tinyio/intrusive_list_test.cc
+        TAGS tinyio unit
+        LIBS tinyio GTest::gtest GTest::gtest_main
+)
+
+tio_add_test(buffer_pool_tests tinyio/buffer_pool_test.cc
+        TAGS tinyio unit
+        LIBS tinyio GTest::gtest GTest::gtest_main
+)
+
 #========= uring
 #tio_add_test(op_pool_tests uring/op_pool_test.cpp
 #        TAGS uring unit

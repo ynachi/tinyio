@@ -136,8 +136,8 @@ function(tio_add_test target_name source_file)
     # always enable sanitizer on debug builds
     tio_add_sanitizers(${target_name})
 
-    add_test(NAME ${target_name} COMMAND ${target_name})
-    gtest_discover_tests(${target_name})
+    string(REPLACE ";" "\\;" ESCAPED_TAGS "${ARG_TAGS}")
+    gtest_discover_tests(${target_name} PROPERTIES LABELS "${ESCAPED_TAGS}")
 
     message(STATUS "Enabled Test: ${target_name} [${ARG_TAGS}]")
 endfunction()

@@ -271,6 +271,78 @@ target_link_libraries(my_app PRIVATE tinyio::tinyio)
 
 ---
 
+## Testing in containers
+
+Tests require a real Linux kernel with io_uring. The `dev-tools/` directory provides a Docker-based environment that works on both Apple Silicon (arm64) and Intel/Rosetta (amd64) without any Linux VM setup on your part.
+
+### Prerequisites
+
+- Docker Desktop with the containerd image store enabled
+- Rosetta enabled in Docker Desktop settings (for amd64 on Apple Silicon)
+
+### Image
+
+Ubuntu 26.04 with clang-22, GCC 15, and liburing 2.14 (the version Ubuntu 26.04 ships natively). All C++ library dependencies (GTest, Abseil, mimalloc, …) are fetched by CMake FetchContent on first run and cached in an arch-specific named volume, so subsequent runs are fast.
+
+The container uses the same `dev` CMake preset as local builds. The build volume is mounted at `/workspace/build` (the preset's `binaryDir`), so the workflow inside the container is identical to working locally:
+
+```bash
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev -L unit
+```
+
+### Running tests
+
+```bash
+# arm64 — native on Apple Silicon
+docker compose -f dev-tools/compose.yaml run --rm test-arm64
+
+# amd64 — via Rosetta on Apple Silicon
+docker compose -f dev-tools/compose.yaml run --rm test-amd64
+```
+
+By default this runs `ctest --preset dev -L unit` (the fast unit suite). Override with env vars:
+
+```bash
+# Run the full test suite (all labels)
+TEST_LABEL="" docker compose -f dev-tools/compose.yaml run --rm test-arm64
+
+# Run with AddressSanitizer
+TIO_SANITIZER=address docker compose -f dev-tools/compose.yaml run --rm test-arm64
+
+# Run with ThreadSanitizer
+TIO_SANITIZER=thread docker compose -f dev-tools/compose.yaml run --rm test-arm64
+```
+
+| `TIO_SANITIZER` value | Effect |
+|-----------------------|--------|
+| `none` (default) | No instrumentation |
+| `address` | ASAN — memory errors, leaks |
+| `thread` | TSAN — data races on `post()` path |
+| `undefined` | UBSAN — UB in arithmetic and casts |
+
+### Interactive shell
+
+```bash
+docker compose -f dev-tools/compose.yaml run --rm test-arm64 bash
+# inside the container — identical to local dev:
+cd /workspace
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev -L unit
+```
+
+### Rebuilding the image
+
+The image is built automatically on first `run`. To force a rebuild after changes to `dev-tools/Dockerfile`:
+
+```bash
+docker compose -f dev-tools/compose.yaml build
+```
+
+---
+
 ## Running under sanitizers
 
 The CMake presets do not ship dedicated sanitizer configurations — add flags at configure time:
