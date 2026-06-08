@@ -14,8 +14,9 @@ The priority is correctness and a clear contract first, then performance.
 | 3 — Core hardening | 🟡 Partial | Fiber pool with HWM ✅, batched CQE drain ✅. Stack pool not done. |
 | 4 — Network surface | ✅ Done | accept, read, write, close, connect, poll, writev, readv, fallocate, ftruncate, TcpListener. |
 | 5 — Testing | ❌ Not started | No tinyio tests at all. Only bitcask has tests. |
-| 6 — Performance | 🟡 Partial | Fixed buffers ✅, preserve_none ✅, DEFER_TASKRUN ✅. Multishot not done. |
-| 7 — API freeze | ❌ Not started | — |
+| 6 — Fiber sync primitives | ❌ Not started | FiberLatch, FiberSemaphore, FiberMutex, TaskGroup. |
+| 7 — Performance | 🟡 Partial | Fixed buffers ✅, preserve_none ✅, DEFER_TASKRUN ✅. Multishot not done. |
+| 8 — API freeze | ❌ Not started | — |
 
 ### Context switch
 
@@ -183,7 +184,182 @@ Every test above must pass under all sanitizer modes. Each catches a different c
 
 ---
 
-## Phase 6: performance work
+## Phase 6: fiber synchronization primitives
+
+Build after the Phase 5 test suite is green. These primitives are all single-owner-thread structures — no atomics needed, because the fiber scheduler is the only thread that touches them. The wait list and ready queue are owned by the `IO` instance.
+
+### Shared building block: wait list
+
+Every primitive needs a way to park a fiber and wake it later. The pattern is the same across all of them:
+
+```cpp
+// Suspending side (inside a fiber):
+//   1. Push current fiber* onto the primitive's wait list.
+//   2. Call io.suspend_current_fiber() — this yields to the scheduler.
+//   3. When resumed, the condition is already satisfied.
+
+// Waking side (also on the owner thread):
+//   1. Pop a fiber* from the wait list.
+//   2. Call io.push_ready(fiber*) — scheduler will resume it on the next tick.
+```
+
+The internal `suspend_fiber` and `push_ready` hooks already exist in `runtime.cc`; the primitives just need access to them. The cleanest way is to expose a narrow `Scheduler` handle (or friend the primitives to `IO`).
+
+---
+
+### FiberLatch
+
+Mirrors `std::latch`. A one-shot countdown: N fibers do work, one waiter proceeds when all are done.
+
+```cpp
+struct FiberLatch {
+    explicit FiberLatch(IO& io, std::ptrdiff_t count);
+
+    // Called by worker fibers. When count reaches 0, all waiters are pushed ready.
+    void count_down(std::ptrdiff_t n = 1);
+
+    // Suspends the calling fiber until count == 0. Returns immediately if already 0.
+    void wait();
+};
+```
+
+**Use case — parallel write then fsync:**
+```cpp
+FiberLatch latch(io, chunks.size());
+for (auto& chunk : chunks)
+    io.spawn([&] { io.write(fd, chunk); latch.count_down(); });
+latch.wait();
+io.fsync(fd);
+```
+
+**Implementation sketch:**
+- `count_`: `std::ptrdiff_t`, decremented in `count_down`.
+- `waiters_`: intrusive list of `Fiber*`.
+- `count_down`: atomically decrement (or plain decrement since owner-thread only); if reaches 0, drain `waiters_` into the ready queue.
+- `wait`: if `count_ > 0`, push self onto `waiters_`, call `suspend_current_fiber`.
+
+---
+
+### FiberSemaphore
+
+A counting gate. Limits how many fibers may be in a critical section concurrently.
+
+```cpp
+struct FiberSemaphore {
+    explicit FiberSemaphore(IO& io, std::ptrdiff_t initial);
+
+    // Decrements count. Suspends if count == 0.
+    void acquire();
+
+    // Increments count. Wakes one waiter if any.
+    void release();
+
+    // Non-blocking attempt. Returns false instead of suspending.
+    bool try_acquire();
+};
+```
+
+**Use case — cap concurrent DB connections:**
+```cpp
+FiberSemaphore slots(io, 16);  // at most 16 concurrent queries
+io.spawn([&] {
+    slots.acquire();
+    auto _ = defer([&] { slots.release(); });
+    db.query(...);
+});
+```
+
+**Implementation sketch:**
+- `count_`: `std::ptrdiff_t`.
+- `waiters_`: intrusive list of `Fiber*`.
+- `acquire`: if `count_ > 0`, `--count_`; else push self to `waiters_`, suspend.
+- `release`: if `waiters_` non-empty, pop front and push to ready queue (count stays 0); else `++count_`.
+
+---
+
+### FiberMutex
+
+Mutual exclusion for shared state across fibers (not threads — use a real mutex for cross-thread protection).
+
+```cpp
+struct FiberMutex {
+    explicit FiberMutex(IO& io);
+
+    void lock();     // Suspends if already held.
+    void unlock();   // Wakes next waiter, or marks free.
+    bool try_lock(); // Non-blocking.
+
+    // RAII guard
+    auto scoped_lock() -> std::unique_ptr<Guard>;
+};
+```
+
+**Use case — shared write buffer across handler fibers:**
+```cpp
+FiberMutex mu(io);
+// in each handler fiber:
+auto guard = mu.scoped_lock();
+buffer.append(data);
+// guard releases on scope exit → next waiter unblocked
+```
+
+**Implementation sketch:**
+- `held_`: `bool`.
+- `waiters_`: intrusive list of `Fiber*`.
+- `lock`: if `!held_`, set `held_ = true`; else push self to `waiters_`, suspend.
+- `unlock`: if `waiters_` non-empty, pop front and push to ready queue (do not clear `held_`); else `held_ = false`.
+- Non-recursive. A fiber that double-locks will deadlock — document this explicitly.
+
+---
+
+### TaskGroup (structured concurrency)
+
+Ties fiber lifetime to a lexical scope. Built directly on top of `FiberLatch`. Ensures that spawned child fibers cannot outlive the group.
+
+```cpp
+struct TaskGroup {
+    explicit TaskGroup(IO& io);
+
+    // Spawns a child fiber tracked by this group.
+    void spawn(std::move_only_function<void()> task);
+
+    // Suspends calling fiber until all spawned children have finished.
+    // Must be called before the TaskGroup is destroyed.
+    void wait();
+
+    // ~TaskGroup asserts wait() was called (debug) or calls it (release).
+};
+```
+
+**Use case — fan-out and collect:**
+```cpp
+io.spawn([&](IO& io) {
+    TaskGroup group(io);
+    group.spawn([&] { fetch(url_a); });
+    group.spawn([&] { fetch(url_b); });
+    group.wait();
+    // both fetches done here, group is safe to destroy
+});
+```
+
+**Implementation sketch:**
+- Internally holds a `FiberLatch` initialised to 0 and incremented on each `spawn` (or use a counter + latch reset on `wait`).
+- Each child task wraps the user function: run it, then call `latch.count_down()`.
+- `wait()` calls `latch.wait()`.
+- Error propagation: first child exception (or `std::expected` error) is stored atomically; `wait()` rethrows / returns it. All other children are let run to completion (cancel-on-first-error is a future extension).
+
+---
+
+### Build order
+
+1. `FiberLatch` — simplest, self-contained, needed by TaskGroup.
+2. `FiberSemaphore` — same pattern, independent.
+3. `FiberMutex` — slightly more complex (ownership semantics).
+4. `TaskGroup` — composed from `FiberLatch` + `spawn`.
+
+---
+
+## Phase 7: performance work
 
 Do this only after the runtime contract is stable and the test suite is green.
 
@@ -196,7 +372,7 @@ Do this only after the runtime contract is stable and the test suite is green.
 - Add a multi-runtime `SO_REUSEPORT` example.
 - Track scheduler cost per operation, not only end-to-end HTTP RPS.
 
-## Phase 7: API freeze
+## Phase 8: API freeze
 
 - Freeze the public API shape.
 - Write final invariants, shutdown, and cancellation docs.
@@ -216,7 +392,8 @@ Do this only after the runtime contract is stable and the test suite is green.
 5. ✅ Batched CQE draining with `io_uring_for_each_cqe`.
 6. ✅ Fiber recycling pool with high-water mark.
 7. **Next: Write the Phase 5 test suite (Groups A–D above).**
-8. Re-benchmark against the current baseline.
+8. Implement Phase 6 fiber sync primitives (FiberLatch → FiberSemaphore → FiberMutex → TaskGroup).
+9. Re-benchmark against the current baseline.
 
 ## How to use tinyio error messages in logs
 

@@ -13,7 +13,6 @@ namespace tinyio::detail {
 /// Pre-allocates all memory to eliminate `new`/`delete` overhead on the hot path.
 template <typename T>
 class MpscQueue {
-private:
     struct Slot {
         std::atomic<size_t> turn;
         T data;
@@ -31,7 +30,7 @@ private:
 
 public:
     /// Capacity MUST be a power of 2 (e.g., 1024, 4096).
-    explicit MpscQueue(size_t capacity = 4096) 
+    explicit MpscQueue(const size_t capacity = 4096)
         : capacity_mask_(capacity - 1),
           slots_(new Slot[capacity]) 
     {
@@ -97,12 +96,13 @@ public:
             tail_ = tail + 1;
             return true;
         }
-        
-        return false; // Queue empty or producer hasn't finished writing
+
+        // Queue empty or producer hasn't finished writing
+        return false;
     }
 
     /// Dequeue up to max_count items. Must ONLY be called from the single consumer thread.
-    size_t try_dequeue_bulk(T* out_items, size_t max_count) noexcept {
+    size_t try_dequeue_bulk(T* out_items, const size_t max_count) noexcept {
         size_t count = 0;
         while (count < max_count) {
             if (try_dequeue(out_items[count])) {
@@ -116,7 +116,7 @@ public:
 
     /// Check if the queue is empty. Must ONLY be called from the single consumer thread.
     bool empty() const noexcept {
-        size_t tail = tail_;
+        const size_t tail = tail_;
         Slot& slot = slots_[tail & capacity_mask_];
         return slot.turn.load(std::memory_order_relaxed) != tail + 1;
     }
