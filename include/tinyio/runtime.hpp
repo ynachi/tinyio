@@ -341,7 +341,7 @@ private:
     // Internal executor for I/O operations. Factorizes the SQE acquisition,
     // fiber suspension, and error mapping logic.
     template <typename T = uint32_t, typename Prep>
-    Result<T> syscall(const char* op_name, Prep&& prep) noexcept
+    TIO_NO_SANITIZE_ADDRESS Result<T> syscall(const char* op_name, Prep&& prep) noexcept
     {
         if (stopping_)
         {
@@ -430,7 +430,7 @@ private:
     /// Drained on the owner thread inside tick().
     detail::MpscQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
 
-    [[noreturn]] void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
+    [[noreturn]] TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
     friend void ::tinyio_fiber_entry(void*) noexcept;
 
     void push_ready(detail::fiber::Fiber* fiber) noexcept;
@@ -438,8 +438,8 @@ private:
     [[nodiscard]] detail::fiber::Fiber* pop_ready() noexcept;
     void destroy_fiber(detail::fiber::Fiber* fiber) noexcept;
     void destroy_all_fibers() noexcept;
-    void suspend_fiber(detail::fiber::Fiber* fiber) noexcept;
-    void resume_fiber(detail::fiber::Fiber* fiber) noexcept;
+    TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void suspend_fiber(detail::fiber::Fiber* fiber) noexcept;
+    TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void resume_fiber(detail::fiber::Fiber* fiber) noexcept;
 
     //
     // Other private helper methods

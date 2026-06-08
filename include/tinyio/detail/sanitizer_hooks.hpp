@@ -24,6 +24,15 @@
     #define TINYIO_TSAN_ENABLED 0
 #endif
 
+// Prevents ASAN from creating fake-stack frames for a function.
+// Required on every function that calls tinyio_ctx_switch, because ASAN's
+// fake-stack mechanism conflicts with hand-rolled stack switches.
+#if defined(__clang__) || defined(__GNUC__)
+    #define TIO_NO_SANITIZE_ADDRESS __attribute__((no_sanitize("address")))
+#else
+    #define TIO_NO_SANITIZE_ADDRESS
+#endif
+
 #if TINYIO_ASAN_ENABLED
 extern "C" void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom, std::size_t size);
 extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_old, std::size_t* size_old);
@@ -58,6 +67,9 @@ inline void tools_capture_current_thread(ToolFiberState& state) noexcept
 
 inline void tools_create_fiber(ToolFiberState& state) noexcept
 {
+#if TINYIO_ASAN_ENABLED
+    state.asan_fake_stack = nullptr;
+#endif
 #if TINYIO_TSAN_ENABLED
     state.tsan_fiber = __tsan_create_fiber(0);
     state.owns_tsan_fiber = true;

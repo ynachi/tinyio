@@ -300,14 +300,20 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
 // Reset CPU registers
 #if defined(__x86_64__)
     auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
-    *--sp = 0U;
+    *--sp = 0U;                                          // padding
+    *--sp = 0U;                                          // padding
+    *--sp = reinterpret_cast<std::uintptr_t>(fiber);     // popped as %rdi by tinyio_fiber_start
+    *--sp = 0U;                                          // dummy rbp, popped by tinyio_ctx_switch
     fiber->context.rsp = reinterpret_cast<std::uint64_t>(sp);
     fiber->context.rip = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
-    fiber->context.r12 = reinterpret_cast<std::uint64_t>(fiber);
 #elif defined(__aarch64__)
-    fiber->context.sp = reinterpret_cast<std::uint64_t>(fiber->stack.high);
+    auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
+    *--sp = 0U;
+    *--sp = reinterpret_cast<std::uintptr_t>(fiber);
+    *--sp = 0U; // dummy x29
+    *--sp = 0U; // padding to keep 16-byte alignment
+    fiber->context.sp = reinterpret_cast<std::uint64_t>(sp);
     fiber->context.pc = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
-    fiber->context.x19 = reinterpret_cast<std::uint64_t>(fiber);
 #else
     #error "unsupported architecture"
 #endif
@@ -318,7 +324,7 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     return fiber->id;
 }
 
-void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
+TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     // Mark this fiber as the currently running one
     current_fiber_ = fiber;
@@ -326,7 +332,6 @@ void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
     fiber->state = detail::fiber::FiberState::running;
 
     detail::tools_before_switch(scheduler_tools_, &fiber->tools, &fiber->stack);
-    // Jump into the fiber's execution!
     tinyio_ctx_switch(&scheduler_context_, &fiber->context);
     detail::tools_after_switch(scheduler_tools_);
 
@@ -334,7 +339,7 @@ void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
     current_fiber_ = nullptr;
 }
 
-void IO::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
+TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
 
@@ -366,7 +371,7 @@ bool IO::has_live_fibers() const noexcept
     return live_fibers_ > 0;
 }
 
-[[noreturn]] void IO::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
+[[noreturn]] TIO_PRESERVE_NONE TIO_NO_SANITIZE_ADDRESS void IO::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
 {
     fiber->state = detail::fiber::FiberState::done;
 
