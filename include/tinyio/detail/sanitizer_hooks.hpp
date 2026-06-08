@@ -17,6 +17,10 @@
     #define TINYIO_ASAN_ENABLED 1
 #endif
 
+#if defined(__SANITIZE_THREAD__)
+    #define TINYIO_TSAN_ENABLED 1
+#endif
+
 #ifndef TINYIO_ASAN_ENABLED
     #define TINYIO_ASAN_ENABLED 0
 #endif

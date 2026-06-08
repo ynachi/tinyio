@@ -297,31 +297,23 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     fiber->state = detail::fiber::FiberState::ready;
     detail::tools_create_fiber(fiber->tools);
 
-// Reset CPU registers
+// Reset CPU registers — single layout for both compilers under preserve_none.
+// Under preserve_none only rsp/rbp (x86-64) or sp/x29 (aarch64) are callee-saved,
+// so the initial stack only needs frame pointer + fiber pointer slots.
 #if defined(__x86_64__)
     auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
     *--sp = 0U;                                          // padding
     *--sp = 0U;                                          // padding
     *--sp = reinterpret_cast<std::uintptr_t>(fiber);     // popped as %rdi by tinyio_fiber_start
     *--sp = 0U;                                          // dummy rbp, popped by tinyio_ctx_switch
-#if !defined(__clang__)
-    *--sp = 0U; // r15
-    *--sp = 0U; // r14
-    *--sp = 0U; // r13
-    *--sp = 0U; // r12
-    *--sp = 0U; // rbx
-#endif
     fiber->context.rsp = reinterpret_cast<std::uint64_t>(sp);
     fiber->context.rip = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
 #elif defined(__aarch64__)
     auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
-    *--sp = 0U;
-    *--sp = reinterpret_cast<std::uintptr_t>(fiber);
-    *--sp = 0U; // dummy x29
-    *--sp = 0U; // padding to keep 16-byte alignment
-#if !defined(__clang__)
-    sp -= 18; // space for x19..x28, d8..d15 (18 * 8 = 144 bytes)
-#endif
+    *--sp = 0U;                                          // padding (keeps 16-byte alignment for fiber*)
+    *--sp = reinterpret_cast<std::uintptr_t>(fiber);     // loaded as x0 by tinyio_fiber_start
+    *--sp = 0U;                                          // dummy x29 (frame pointer)
+    *--sp = 0U;                                          // padding to keep 16-byte SP alignment
     fiber->context.sp = reinterpret_cast<std::uint64_t>(sp);
     fiber->context.pc = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
 #else
@@ -445,6 +437,11 @@ extern "C" [[noreturn]] void tinyio_fiber_entry(void* fiber_ptr) noexcept
 
     auto& rt = *fiber->runtime;
 
+    // Complete the ASAN fiber switch.  We pass scheduler_tools_ (not
+    // fiber->tools) because resume_fiber() stored the fake-stack handle
+    // into scheduler_tools_.asan_fake_stack via tools_before_switch(), and
+    // __sanitizer_finish_switch_fiber() needs that same handle to finalise
+    // the transition from the scheduler's stack to ours.
     tinyio::detail::tools_after_switch(rt.scheduler_tools_);
     fiber->task(rt);
     rt.finish_current_fiber(fiber);

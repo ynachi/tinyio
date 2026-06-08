@@ -3,6 +3,29 @@
 This roadmap is about turning the current small runtime into a production runtime without losing the clean core design.
 The priority is correctness and a clear contract first, then performance.
 
+---
+
+## Status overview
+
+| Phase | Status | Summary |
+|-------|--------|---------|
+| 1 — Contract cleanup | 🟡 ~70% | Invariants enforced in code, not yet documented. Shutdown states not an enum. |
+| 2 — Lifecycle safety | ✅ Implemented, ❌ Untested | Stop/drain/cancel/post all work. Zero tests exist. |
+| 3 — Core hardening | 🟡 Partial | Fiber pool with HWM ✅, batched CQE drain ✅. Stack pool not done. |
+| 4 — Network surface | ✅ Done | accept, read, write, close, connect, poll, writev, readv, fallocate, ftruncate, TcpListener. |
+| 5 — Testing | ❌ Not started | No tinyio tests at all. Only bitcask has tests. |
+| 6 — Performance | 🟡 Partial | Fixed buffers ✅, preserve_none ✅, DEFER_TASKRUN ✅. Multishot not done. |
+| 7 — API freeze | ❌ Not started | — |
+
+### Context switch
+
+- ✅ Unified assembly for both GCC and Clang via `preserve_none`.
+- ✅ CET (`endbr64`) and BTI (`bti c`) landing pads for hardware CFI.
+- ✅ ASAN and TSAN sanitizer hooks work with both compilers.
+- Minimum compiler: Clang ≥ 18 / GCC ≥ 15 (x86-64), Clang ≥ 19 / GCC ≥ 16 (aarch64).
+
+---
+
 ## Phase 1: contract cleanup
 
 - Remove the fake liburing backend and make the contract explicit: Linux with real liburing only.
@@ -39,7 +62,7 @@ The priority is correctness and a clear contract first, then performance.
   `std::abort()` — `IORING_SETUP_SINGLE_ISSUER` forbids cross-thread
   submission.
 - ✅ Cross-thread `post()`:
-  - `IO::post(fn)` enqueues `fn` into a lock-free `moodycamel::ConcurrentQueue`
+  - `IO::post(fn)` enqueues `fn` into a lock-free MPSC queue
     and calls `wake()` to complete the pending kernel eventfd read, waking a
     sleeping owner thread.
   - `tick()` drains the queue after `drain_completions()` and spawns each
@@ -53,84 +76,123 @@ The priority is correctness and a clear contract first, then performance.
   return `ECANCELED` immediately when `stopping_ == true`; pending kernel ops
   are cancelled and their CQEs deliver `-ECANCELED` to the waiting fiber.
 
-### Testing gap (Phase 2 tests not yet written)
-
-The `tests/tinyio/` directory does not exist yet and `TIO_BUILD_TESTS` must
-remain `OFF` until it is populated.  Tests needed before Phase 2 is fully
-closed:
-
-| Test | Scenario |
-|------|----------|
-| `safe_destructor_ready_fiber` | `run_until_done()` completes; new fiber spawned; IO destroyed — fiber sees `ECANCELED` |
-| `safe_destructor_waiting_fiber` | `run()` stopped via token while a fiber blocks on `sleep_for` / `read` — fiber gets `ECANCELED` |
-| `post_before_run` | `post(task)` called before `run_until_done()` — task runs |
-| `post_while_running` | N threads each calling `post()` while `run()` is active — all N tasks execute, TSAN clean |
-| `post_saturation` | 8 threads × 1000 `post()` calls; verify all 8000 tasks execute |
-| `post_after_stop` | `post()` called after stop requested — queue discarded cleanly in destructor |
-
-**TSAN note**: `moodycamel::ConcurrentQueue` uses bare `atomic_thread_fence`
-which GCC's TSAN cannot instrument (`-Wtsan` warning at build time).  TSAN will
-not report false positives for the queue but cannot verify its memory ordering
-either.  The queue's own test suite is the correctness guarantee.
-
 ## Phase 3: core runtime hardening
 
 - Add checked arithmetic for stack size and guard size alignment.
-- Add a bounded stack pool to avoid `mmap`/`mprotect`/`munmap` churn on fiber creation and destruction.
-- Drain completion queue entries in batches instead of one `peek_cqe` /
-  `cqe_seen` pair at a time.
+- ✅ Bounded fiber pool with high-water mark (`max_idle_fibers`) to reuse stacks.
+- ✅ Batched CQE draining with `io_uring_for_each_cqe` + `io_uring_cq_advance`.
 - Add owner-thread checks for every owner-only API.
 - Stabilize the error policy and operation names.
 - Add an optional internal log hook for fatal runtime errors.
 
 ## Phase 4: real network surface
 
-- Keep the public API small, but add the minimum socket surface needed for real servers:
-    - `accept`
-    - `read`
-    - `write`
-    - `close`
-    - optionally `recv` and `send` for socket-specific flags
-- Add examples for socket setup, keep-alive handling, and graceful shutdown.
+- ✅ Done. The public API covers:
+    - `accept` (with and without client address)
+    - `read`, `write`, `readv`, `writev`
+    - `read_fixed`, `write_fixed` (registered buffers)
+    - `open`, `close`, `remove`, `rename`
+    - `connect`, `poll`
+    - `fsync`, `fallocate`, `ftruncate`
+    - `sleep_for_ns`
+    - `TcpListener::Bind` (convenience for socket setup)
 - Keep protocol/framework code out of the runtime.
 
-## Phase 5: production testing
+---
 
-- Run the core suite against real liburing.
-- Add CI jobs for:
-    - Debug
-    - Release
-    - ASAN
-    - TSAN
-    - UBSAN
-    - Valgrind
-    - real io_uring integration tests
-    - TCP stress tests
-- Add integration tests for:
-    - TCP accept/read/write round trip
-    - keep-alive request loop
-    - client disconnect
-    - server-side fd close
-    - many concurrent clients
-    - partial writes and backpressure
-    - shutdown while accept/read/write are pending
-    - low SQ/CQ depth
-    - low stack size
-- Keep longer stress runs outside the fast CI path:
-    - 10-30 minute HTTP keep-alive run
-    - high connection churn
-    - forced client disconnects
-    - repeated stop/start lifecycle tests
+## Phase 5: testing
+
+This is the highest-priority gap. No tinyio tests exist. The `tests/tinyio/` directory needs to be created.
+
+Tests are organised into four groups. Each test has a rationale explaining
+*what invariant it protects* and *what real failure it would catch*.
+
+### Group A — Fiber lifecycle
+
+These tests verify that the core fiber state machine (ready → running → waiting → ready → done) works correctly, and that fibers are created, recycled, and destroyed without leaks or corruption.
+
+| Test | What to do | Why |
+|------|-----------|-----|
+| `spawn_and_complete` | Spawn a single fiber that sets a flag, call `run_until_done()`, check the flag. | Proves the minimal end-to-end path works: stack allocation, context switch to fiber, task execution, `finish_current_fiber`, context switch back, fiber destruction. If this fails, nothing else can work. |
+| `spawn_many_sequential` | Spawn 1000 fibers one at a time via `run_until_done()` loops. | Exercises fiber recycling via `idle_fibers_` pool. Catches use-after-free on recycled `Fiber` objects, stale `context` state from a previous incarnation, and `live_fibers_` counter drift. |
+| `spawn_many_concurrent` | Spawn 500 fibers before calling `run_until_done()`. Each fiber increments an atomic counter. Verify counter == 500. | Tests the ready queue under load. Catches corruption in the intrusive list (e.g., a fiber appearing in both `ready_queue_` and `idle_fibers_`), and verifies that `tick()` resumes all fibers, not just `batch_max_size` of them. |
+| `yield_round_robin` | Spawn 3 fibers. Each appends its ID to a shared vector, then yields, repeating 3 times. Verify the interleaving is round-robin (`[1,2,3,1,2,3,1,2,3]`). | Proves `yield()` actually suspends the current fiber and puts it at the back of the ready queue (FIFO). Catches bugs where `push_ready` puts the fiber at the front, or where `suspend_fiber` doesn't correctly save/restore context. |
+| `fiber_pool_hwm` | Set `max_idle_fibers = 4`. Spawn 10 fibers, let them finish. Check that `idle_fibers_.size() <= 4` and that `all_fibers_` reflects the correct count. | Verifies that `destroy_fiber` respects the high-water mark and actually calls `release_stack` + `delete` for excess fibers. Catches unbounded memory growth if the HWM check is broken. |
+| `nested_spawn` | Inside a running fiber, call `io.spawn(inner_task)`. Let both complete via `run_until_done()`. | Proves that `spawn_task` works from within a fiber (not just from `main`). This is a common pattern (e.g., accept loop spawning handler fibers). Catches reentrancy issues in the scheduler. |
+
+### Group B — Shutdown and cancellation
+
+These tests verify that the runtime shuts down cleanly under every scenario, without leaking kernel resources, hanging, or crashing. This is the most common source of production bugs in async runtimes.
+
+| Test | What to do | Why |
+|------|-----------|-----|
+| `stop_token_cancels_waiting` | Spawn a fiber that calls `sleep_for_ns(10s)`. From the main thread, fire the stop token after 50ms. Verify `run()` returns within 200ms and the fiber received `ECANCELED`. | Proves that `cancel_and_drain()` actually issues `IORING_OP_ASYNC_CANCEL` for waiting fibers and that the cancelled CQE wakes them with the right error. Catches deadlocks where the cancel SQE is never submitted, or where `drain_completions` doesn't process cancel CQEs. |
+| `stop_token_cancels_ready` | Spawn a fiber that yields in a loop forever. Fire stop token. Verify the fiber is drained. | Tests cancellation of fibers that are ready (not waiting on io_uring). The `syscall()` early-return on `stopping_` only helps waiting fibers; ready fibers need to be drained by `cancel_and_drain`'s `tick()` loop. |
+| `destructor_cancels_live_work` | Spawn a fiber that blocks on `sleep_for_ns(10s)`. Let the `IO` object go out of scope without calling `run()` to completion. | Proves the destructor's quiesce path works. Without it, `io_uring_queue_exit` would free the ring while the kernel still references `Operation*` pointers → kernel UAF → crash or silent corruption. |
+| `destructor_aborts_wrong_thread` | Construct `IO` on thread A. From thread B (with live fibers), let the `IO` go out of scope. Catch the abort signal. | `IORING_SETUP_SINGLE_ISSUER` forbids cross-thread submission. The destructor must abort rather than silently submitting cancel SQEs from the wrong thread. Catches missing `is_owner_thread()` check. |
+| `syscall_returns_ecanceled` | Set `stopping_ = true` (via stop token), then from a still-running fiber call `io.read()`. Verify it returns `ECANCELED` without submitting an SQE. | Proves the early-exit guard in `syscall()`. Without it, new I/O operations would be submitted to the ring during shutdown, extending the drain indefinitely. |
+| `double_run` | Call `run_until_done()` twice on the same `IO` instance (second call with new fibers). | Proves the runtime can be reused. Catches stale state from the first run (`stopping_`, `is_running_`, `inflight_ops_`) leaking into the second. |
+
+### Group C — Cross-thread `post()`
+
+These tests verify the MPSC queue + eventfd wakeup path. This is the only thread-safe API surface, so it must be exercised under real concurrency.
+
+| Test | What to do | Why |
+|------|-----------|-----|
+| `post_before_run` | Call `io.post(task)` before `run_until_done()`. Verify the task executes. | Tasks posted before the event loop starts must not be silently dropped. Catches a bug where `tick()` only drains the post queue after receiving a CQE (which would never arrive if the queue is the only work). |
+| `post_wakes_sleeping_thread` | Start `run()` on a thread with no fibers (so it sleeps in `submit_and_wait`). From another thread, `post(task)`. Verify the task runs within 100ms. | Proves the `wake()` → eventfd write → kernel completes the armed read SQE → `submit_and_wait` returns path. Catches bugs where `wake()` is not called, or where the eventfd read is not re-armed after a wakeup. |
+| `post_concurrent_correctness` | 8 threads × 1000 `post()` calls. Each posted task increments an atomic counter. Verify counter == 8000. | Stress-tests the MPSC queue under contention. Catches ABA problems, lost enqueues under CAS retries, and `try_dequeue_bulk` leaving items behind. Run under TSAN. |
+| `post_while_fibers_active` | Spawn 10 fibers that each yield 100 times. While they run, 4 threads each post 100 tasks. Verify all 10 + 400 tasks complete. | Tests the interaction between the CQE drain path and the post-queue drain path in `tick()`. Catches a bug where `batch_max_size` throttling causes posted tasks to starve. |
+| `post_after_stop` | Fire stop token, then call `io.post(task)`. Let the `IO` object destruct. Verify no crash and no leak (task's destructor runs). | The destructor drains the post queue and discards un-spawned tasks. This test catches a UAF where the task captures a reference to something that is already destroyed. |
+| `post_queue_full` | Set MPSC capacity to 16. Post 17 tasks. Verify `post()` returns `false` for the 17th. | Proves the bounded queue actually rejects when full, and that the caller gets a clean failure signal. |
+
+### Group D — I/O correctness
+
+These tests verify that the io_uring SQE submission → fiber suspend → CQE completion → fiber resume path works for real kernel I/O. They require a real kernel (no mocking).
+
+| Test | What to do | Why |
+|------|-----------|-----|
+| `file_write_read_roundtrip` | Open a temp file, write 4KB, fsync, read it back, compare. | Proves the minimal I/O path: `open`, `write`, `fsync`, `read`, `close`. Catches wrong SQE prep, mangled `Operation` pointer in CQE `user_data`, or wrong `cqe_res` propagation. |
+| `fixed_buffer_write_read` | Register a buffer pool. Take a fixed buffer, write through it, read back via a fixed buffer, compare. | Exercises the `IORING_OP_WRITE_FIXED` / `READ_FIXED` path. Catches wrong buffer index in `io_uring_prep_*_fixed`, or buffer pool registration failures. |
+| `tcp_accept_echo` | Bind a TCP listener, spawn an accept loop that echoes. Connect from a client fiber, send data, read it back, compare. | End-to-end network test. Proves `TcpListener::Bind`, `accept`, `read`, `write`, `close` all work together. Catches wrong `sockaddr` handling, missing `SOCK_NONBLOCK`, or accept returning the wrong fd. |
+| `tcp_many_clients` | Same as above but with 100 concurrent client fibers. | Stress-tests the scheduler + io_uring under concurrent I/O. Catches SQ exhaustion (the `get_sqe` → submit → retry path), CQ overflow, and intrusive-list corruption under load. |
+| `partial_write` | Write a 1MB buffer in a loop, checking return value and advancing. | Proves the caller can handle short writes. Catches assumptions that `write` always writes the full buffer. (This tests the user pattern, not a runtime bug, but it validates the API contract.) |
+| `sleep_for_accuracy` | Call `sleep_for_ns(50ms)`, measure wall time. Verify it's between 40ms and 200ms. | Proves the timeout SQE path works and that `ETIME` is correctly mapped to success. Catches a bug where `sleep_for_ns` returns an error instead of `Ok` on normal timeout expiry. |
+| `connect_to_listener` | Bind a listener, spawn a fiber that calls `connect()`, accept on the other side. | Proves async connect works. Catches wrong `io_uring_prep_connect` args or missing error mapping. |
+| `remove_and_rename` | Create two temp files, rename one, remove the other. Verify filesystem state. | Exercises `IORING_OP_UNLINKAT` and `IORING_OP_RENAMEAT`. These are less common paths that are easy to get wrong (e.g., wrong `AT_FDCWD` usage). |
+
+### Sanitizer matrix
+
+Every test above must pass under all sanitizer modes. Each catches a different class of bug:
+
+| Mode | What it catches | Notes |
+|------|----------------|-------|
+| **Debug** (no sanitizers) | Logic errors, assertion failures | Fast, run on every commit |
+| **ASAN** | Heap/stack buffer overflows, use-after-free, double-free, stack-use-after-scope | The fiber stack switch uses `__sanitizer_start/finish_switch_fiber` hooks. If these are wrong, ASAN will either false-positive or miss real bugs. |
+| **TSAN** | Data races between threads | Critical for `post()` tests. The MPSC queue is the main cross-thread surface. TSAN must see the `__tsan_switch_to_fiber` hooks to understand that fiber switches are not data races. |
+| **UBSAN** | Signed overflow, null deref, alignment, shift UB | Catches subtle issues in stack alignment arithmetic and pointer casts. |
+| **Valgrind** | Memory leaks, use of uninitialised values | Slower but catches leaks that sanitizers miss (e.g., leaked `mmap` regions from `allocate_stack`). Requires `VALGRIND_STACK_REGISTER`. |
+
+### Test infrastructure notes
+
+- Tests need a real Linux kernel with io_uring (≥ 5.11, ideally 6.1+). They cannot run in a container without `/dev/io_uring` access or `CAP_SYS_ADMIN`.
+- Use `tmpfile()` or a temporary directory for file I/O tests to avoid leaving debris.
+- TCP tests should bind to `127.0.0.1:0` (port 0 = kernel picks a free port) to avoid port conflicts in CI.
+- Timeout-based tests (`sleep_for_accuracy`, `stop_token_cancels_waiting`) need generous margins. CI machines are slow and overloaded. Use 5× the expected wall time as the upper bound.
+- Keep the fast test suite under 10 seconds total. Move stress tests (many-client, saturation, long-running) into a separate `check-stress` target.
+
+---
 
 ## Phase 6: performance work
 
-Do this only after the runtime contract is stable.
+Do this only after the runtime contract is stable and the test suite is green.
 
-- Batch CQE draining with liburing's completion queue iteration helpers.
 - Tune stack pool size and stack size defaults.
-- Add multishot accept.
+- Add multishot accept (`IORING_ACCEPT_MULTISHOT`).
 - Consider multishot recv after the basic socket contract is solid.
-- Consider fixed buffers for APIs that can own or register buffers safely.
+- ✅ Fixed buffers for registered I/O.
+- ✅ `preserve_none` context switch (both GCC and Clang).
+- ✅ `IORING_SETUP_DEFER_TASKRUN` for reduced kernel overhead.
 - Add a multi-runtime `SO_REUSEPORT` example.
 - Track scheduler cost per operation, not only end-to-end HTTP RPS.
 
@@ -141,35 +203,39 @@ Do this only after the runtime contract is stable.
 - Decide whether `post()` is the only cross-thread API.
 - Decide whether cancellation is explicit per operation or runtime-owned.
 - Keep examples aligned with the final contract.
+- Update the README (currently references the old "URing" name, `co_await`, and `Task<T>` which no longer exist).
+
+---
 
 ## First implementation sprint
 
 1. ✅ Remove the fake liburing backend.
 2. ✅ Fix shutdown semantics (safe destructor quiesce, `stopping_` flag, cancellation).
 3. ✅ Add cross-thread `post()` with eventfd wakeup.
-4. Add a bounded stack pool.
-5. Add Phase 2 integration tests (see testing gap above) and TCP integration tests.
-6. Add batched CQE draining.
-7. Re-benchmark against the current baseline.
+4. ✅ Unified `preserve_none` context switch for GCC and Clang.
+5. ✅ Batched CQE draining with `io_uring_for_each_cqe`.
+6. ✅ Fiber recycling pool with high-water mark.
+7. **Next: Write the Phase 5 test suite (Groups A–D above).**
+8. Re-benchmark against the current baseline.
 
 ## How to use tinyio error messages in logs
 
 ```c++
-        // register pool if not empty                                                                                                                                                                       
-        if (buffer_pool_.bucket_count() != 0)                                                                                                                                                               
-        {                                                                                                                                                                                                   
-            if (auto res = register_buffers(buffer_pool_); !res.has_value())                                                                                                                                
-            {                                                                                                                                                                                               
-                auto err = res.error();                                                                                                                                                                     
-                // We log the context (err.op) and the human-readable system error                                                                                                                          
-                ALOG_ERROR("failed to register buffers: [{}] {}", err.op, err.error_code().message());                                                                                                      
-            }                                                                                                                                                                                               
-            else                                                                                                                                                                                            
-            {                                                                                                                                                                                               
-                ALOG_INFO("the buffer pool has been registered to io_uring");                                                                                                                               
-            }                                                                                                                                                                                               
-        }                                                                                                                                                                                                   
-                                                                                                                                                                                                            
-        ALOG_INFO("Initialized IO context with {} entries (SQPOLL: {})", opts_.entries,                                                                                                                     
-                  (opts_.flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");        
+        // register pool if not empty
+        if (buffer_pool_.bucket_count() != 0)
+        {
+            if (auto res = register_buffers(buffer_pool_); !res.has_value())
+            {
+                auto err = res.error();
+                // We log the context (err.op) and the human-readable system error
+                ALOG_ERROR("failed to register buffers: [{}] {}", err.op, err.error_code().message());
+            }
+            else
+            {
+                ALOG_INFO("the buffer pool has been registered to io_uring");
+            }
+        }
+
+        ALOG_INFO("Initialized IO context with {} entries (SQPOLL: {})", opts_.entries,
+                  (opts_.flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
 ```

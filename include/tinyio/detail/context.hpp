@@ -29,12 +29,24 @@ static_assert(offsetof(Context, pc) == 8);
 
 }  // namespace tinyio::detail::context
 
-// preserve_none is a Clang-only calling convention attribute (as of 2025).
-// With it, the compiler saves only live registers at each context-switch call site.
+// preserve_none: the compiler saves only live registers at each call site.
+// Supported by Clang (all versions with this feature) and GCC >=15 (x86-64) / GCC >=16 (aarch64).
+// Both compilers pass the first two integer args in:
+//   x86-64:  %r12, %r13
+//   aarch64: x20, x21
+// and treat all other GPRs (except rsp/rbp or sp/x29/x30) as caller-saved.
 #if defined(__clang__)
-#define TIO_PRESERVE_NONE __attribute__((preserve_none))
+    // Clang has supported preserve_none since Clang 18 (x86-64) and Clang 19 (aarch64)
+    #define TIO_PRESERVE_NONE __attribute__((preserve_none))
+#elif defined(__GNUC__)
+    #if defined(__x86_64__) && (__GNUC__ < 15)
+        #error "tinyio requires GCC >= 15 for preserve_none on x86-64"
+    #elif defined(__aarch64__) && (__GNUC__ < 16)
+        #error "tinyio requires GCC >= 16 for preserve_none on aarch64"
+    #endif
+    #define TIO_PRESERVE_NONE __attribute__((preserve_none))
 #else
-#define TIO_PRESERVE_NONE
+    #error "tinyio requires Clang or GCC with preserve_none support"
 #endif
 
 extern "C" TIO_PRESERVE_NONE void tinyio_ctx_switch(tinyio::detail::context::Context* from,
