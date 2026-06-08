@@ -304,6 +304,13 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     *--sp = 0U;                                          // padding
     *--sp = reinterpret_cast<std::uintptr_t>(fiber);     // popped as %rdi by tinyio_fiber_start
     *--sp = 0U;                                          // dummy rbp, popped by tinyio_ctx_switch
+#if !defined(__clang__)
+    *--sp = 0U; // r15
+    *--sp = 0U; // r14
+    *--sp = 0U; // r13
+    *--sp = 0U; // r12
+    *--sp = 0U; // rbx
+#endif
     fiber->context.rsp = reinterpret_cast<std::uint64_t>(sp);
     fiber->context.rip = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
 #elif defined(__aarch64__)
@@ -312,6 +319,9 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     *--sp = reinterpret_cast<std::uintptr_t>(fiber);
     *--sp = 0U; // dummy x29
     *--sp = 0U; // padding to keep 16-byte alignment
+#if !defined(__clang__)
+    sp -= 18; // space for x19..x28, d8..d15 (18 * 8 = 144 bytes)
+#endif
     fiber->context.sp = reinterpret_cast<std::uint64_t>(sp);
     fiber->context.pc = reinterpret_cast<std::uint64_t>(&tinyio_fiber_start);
 #else

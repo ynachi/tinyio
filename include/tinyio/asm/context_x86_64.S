@@ -1,15 +1,40 @@
+#if defined(__clang__)
+#define ARG0 %r12
+#define ARG1 %r13
+#else
+#define ARG0 %rdi
+#define ARG1 %rsi
+#endif
+
 .text
 .globl tinyio_ctx_switch
 .type tinyio_ctx_switch,@function
 tinyio_ctx_switch:
-    pushq %rbp
-    movq %rsp, 0(%rdi)
-    leaq .Ltinyio_resume(%rip), %rax
-    movq %rax, 8(%rdi)
+#if !defined(__clang__)
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+#endif
 
-    movq 0(%rsi), %rsp
+    pushq %rbp
+    movq %rsp, 0(ARG0)
+    leaq .Ltinyio_resume(%rip), %rax
+    movq %rax, 8(ARG0)
+
+    movq 0(ARG1), %rsp
     popq %rbp
-    jmp *8(%rsi)
+
+#if !defined(__clang__)
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+#endif
+
+    jmp *8(ARG1)
 
 .Ltinyio_resume:
     ret
