@@ -61,6 +61,8 @@ find_package(Abseil REQUIRED)
 # mimalloc
 find_package(mimalloc REQUIRED)
 
+include(KioBoost)
+kio_find_boost(REQUIRED COMPONENTS context)
 
 # openssl, min 3 required
 find_package(OpenSSL 3 REQUIRED)
@@ -87,11 +89,7 @@ add_library(tinyio
         src/tinyio/tcp_listener.cc
 )
 
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")
-    target_sources(tinyio PRIVATE include/tinyio/asm/context_x86_64.S)
-elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64)")
-    target_sources(tinyio PRIVATE include/tinyio/asm/context_aarch64.S)
-endif()
+# No architecture-specific assembly required when using Boost.Context
 # Include directories
 target_include_directories(tinyio PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -104,6 +102,7 @@ target_link_libraries(tinyio PUBLIC
         pthread
         OpenSSL::SSL
         OpenSSL::Crypto
+        Boost::context
 )
 tio_add_sanitizers(tinyio)
 

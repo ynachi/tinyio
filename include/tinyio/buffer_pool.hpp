@@ -1,6 +1,7 @@
 #pragma once
 
-#include <initializer_list>
+#include "tinyio/logger.hpp"
+
 #include <memory>
 #include <span>
 #include <vector>
@@ -8,8 +9,6 @@
 #include <liburing.h>
 
 #include "error.hpp"
-#include "tinyio/error.hpp"
-#include "tinyio/logger.hpp"
 
 namespace tinyio
 {

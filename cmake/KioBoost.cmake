@@ -1,4 +1,4 @@
-# tinyio/cmake/KioBoost.cmake
+# tinyio/cmake/FindBoost.cmake
 #
 # Do not provide a project-local FindBoost.cmake.
 #

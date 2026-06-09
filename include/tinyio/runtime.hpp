@@ -74,7 +74,6 @@ class IO final
 {
 public:
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
-    // TODO: pool_configs should use vector for a stable storage
     explicit IO(size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs);
 
     /// Destroys the runtime and releases ring resources and all fiber stacks.
@@ -431,7 +430,7 @@ private:
     detail::MpscQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
 
     [[noreturn]] TIO_NO_SANITIZE_ADDRESS void finish_current_fiber(detail::fiber::Fiber* fiber) noexcept;
-    friend void ::tinyio_fiber_entry(void*) noexcept;
+    friend void ::tinyio_fiber_entry(boost::context::detail::transfer_t) noexcept;
 
     void push_ready(detail::fiber::Fiber* fiber) noexcept;
     void remove_ready(detail::fiber::Fiber* fiber) noexcept;

@@ -298,49 +298,11 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     fiber->state = detail::fiber::FiberState::ready;
     detail::tools_create_fiber(fiber->tools);
 
-// Under standard C ABI:
-// x86-64:
-//   Callee-saved registers: rbp, rbx, r12, r13, r14, r15 (48 bytes)
-//   Return address (rip) is implicitly popped by `ret`.
-//   Arguments: `from` is %rdi, `to` is %rsi.
-//   We pass `fiber` pointer via %r12 so `tinyio_fiber_start` can move it to %rdi.
-//
-// aarch64:
-//   Callee-saved registers: x19-x30 (96 bytes) and d8-d15 (64 bytes). Total 160 bytes.
-//   Return address is popped from the stack (stored in x30 slot).
-//   We pass `fiber` pointer via x19 so `tinyio_fiber_start` can move it to x0.
-#if defined(__x86_64__)
-    auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
-    // sp is currently 16-byte aligned.
-    // The ABI requires RSP % 16 == 8 BEFORE a call (or entering a function).
-    // `tinyio_ctx_switch` ends with `ret` which pops 8 bytes (the return address).
-    // Therefore, if RSP % 16 == 0 BEFORE `ret`, then AFTER `ret` it will be 8, which is correct.
-
-    *--sp = reinterpret_cast<std::uintptr_t>(&tinyio_fiber_start); // return address
-    
-    *--sp = 0U; // rbp
-    *--sp = 0U; // rbx
-    *--sp = reinterpret_cast<std::uintptr_t>(fiber); // r12
-    *--sp = 0U; // r13
-    *--sp = 0U; // r14
-    *--sp = 0U; // r15
-    
-    fiber->context.sp = reinterpret_cast<std::uintptr_t>(sp);
-#elif defined(__aarch64__)
-    auto* sp = reinterpret_cast<std::uintptr_t*>(fiber->stack.high);
-    // 160 bytes for callee-saved registers (20 * 8 bytes)
-    sp -= 20;
-
-    // sp[8] corresponds to x19 in our assembly layout
-    sp[8] = reinterpret_cast<std::uintptr_t>(fiber);
-
-    // sp[19] corresponds to x30 (LR) in our assembly layout
-    sp[19] = reinterpret_cast<std::uintptr_t>(&tinyio_fiber_start);
-
-    fiber->context.sp = reinterpret_cast<std::uintptr_t>(sp);
-#else
-    #error "unsupported architecture"
-#endif
+    fiber->context.fctx = boost::context::detail::make_fcontext(
+        fiber->stack.high, 
+        fiber->stack.usable_size, 
+        &tinyio_fiber_entry
+    );
 
     // push to active list
     push_ready(fiber);
@@ -356,7 +318,8 @@ TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexc
     fiber->state = detail::fiber::FiberState::running;
 
     detail::tools_before_switch(scheduler_tools_, &fiber->tools, &fiber->stack);
-    tinyio_ctx_switch(&scheduler_context_, &fiber->context);
+    boost::context::detail::transfer_t t = boost::context::detail::jump_fcontext(fiber->context.fctx, fiber);
+    fiber->context.fctx = t.fctx;
     detail::tools_after_switch(scheduler_tools_);
 
     // Clear it when we jump back to the scheduler
@@ -367,7 +330,8 @@ TIO_NO_SANITIZE_ADDRESS void IO::suspend_fiber(detail::fiber::Fiber* fiber) noex
 {
     detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
 
-    tinyio_ctx_switch(&fiber->context, &scheduler_context_);
+    boost::context::detail::transfer_t t = boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
+    scheduler_context_.fctx = t.fctx;
 
     detail::tools_after_switch(fiber->tools);
 }
@@ -400,7 +364,7 @@ bool IO::has_live_fibers() const noexcept
     fiber->state = detail::fiber::FiberState::done;
 
     detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
-    tinyio_ctx_switch(&fiber->context, &scheduler_context_);
+    boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
 
     std::terminate();
 }
@@ -449,15 +413,16 @@ void IO::cancel_and_drain() noexcept
 
 }  // namespace tinyio
 
-extern "C" [[noreturn]] void tinyio_fiber_entry(void* fiber_ptr) noexcept
+extern "C" [[noreturn]] void tinyio_fiber_entry(boost::context::detail::transfer_t t) noexcept
 {
-    auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(fiber_ptr);
+    auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(t.data);
     if (fiber == nullptr || fiber->runtime == nullptr)
     {
         std::terminate();
     }
 
     auto& rt = *fiber->runtime;
+    rt.scheduler_context_.fctx = t.fctx;
 
     // Complete the ASAN fiber switch.  We pass scheduler_tools_ (not
     // fiber->tools) because resume_fiber() stored the fake-stack handle

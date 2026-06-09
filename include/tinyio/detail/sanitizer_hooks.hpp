@@ -29,7 +29,7 @@
 #endif
 
 // Prevents ASAN from creating fake-stack frames for a function.
-// Required on every function that calls tinyio_ctx_switch, because ASAN's
+// Required on every function that calls jump_fcontext, because ASAN's
 // fake-stack mechanism conflicts with hand-rolled stack switches.
 #if defined(__clang__) || defined(__GNUC__)
     #define TIO_NO_SANITIZE_ADDRESS __attribute__((no_sanitize("address")))

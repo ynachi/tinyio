@@ -1,21 +1,16 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
+#include <boost/context/detail/fcontext.hpp>
 
 namespace tinyio::detail::context
 {
 
 struct Context
 {
-    std::uintptr_t sp = 0;
+    boost::context::detail::fcontext_t fctx{nullptr};
 };
-static_assert(offsetof(Context, sp) == 0);
 
 }  // namespace tinyio::detail::context
 
-extern "C" void tinyio_ctx_switch(tinyio::detail::context::Context* from,
-                                  tinyio::detail::context::Context* to) noexcept;
-
-extern "C" void tinyio_fiber_start() noexcept;
-extern "C" [[noreturn]] void tinyio_fiber_entry(void* fiber) noexcept;
+extern "C" [[noreturn]] void tinyio_fiber_entry(boost::context::detail::transfer_t t) noexcept;
