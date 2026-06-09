@@ -429,7 +429,7 @@ extern "C" [[noreturn]] void tinyio_fiber_entry(boost::context::detail::transfer
     // into scheduler_tools_.asan_fake_stack via tools_before_switch(), and
     // __sanitizer_finish_switch_fiber() needs that same handle to finalise
     // the transition from the scheduler's stack to ours.
-    tinyio::detail::tools_after_switch(rt.scheduler_tools_);
+    tinyio::detail::tools_after_switch(fiber->tools);
     fiber->task(rt);
     rt.finish_current_fiber(fiber);
 

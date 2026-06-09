@@ -124,7 +124,7 @@ if (TIO_BUILD_BITCASK)
     # Link dependencies
     target_link_libraries(bitcask
             PUBLIC
-            uring
+            PkgConfig::LibUring
             absl::flat_hash_map
             absl::flat_hash_set
             absl::inlined_vector
