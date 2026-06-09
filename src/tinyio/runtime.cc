@@ -292,7 +292,8 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     fiber->runtime = this;
 
     //  Reset state  for all fibers
-    fiber->id = next_fiber_id_++;  // give every execution a unique ID for logging!
+    // give every execution a unique ID for logging!
+    fiber->id = next_fiber_id_++;
     fiber->task = std::move(task);
     fiber->state = detail::fiber::FiberState::ready;
     detail::tools_create_fiber(fiber->tools);
@@ -477,7 +478,7 @@ Result<void> IO::submit_or_wait_for() noexcept
     // Only block if we have no local work to do.
     if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.empty() || !post_queue_.empty())
     {
-        int ret;
+        int ret = 0;
         if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN)
         {
             ret = io_uring_submit_and_get_events(&ring_);
@@ -581,8 +582,8 @@ Result<void> IO::activate() noexcept
 
 Result<std::size_t> IO::drain_completions() noexcept
 {
-    io_uring_cqe* cqe;
-    unsigned head;
+    io_uring_cqe* cqe = nullptr;
+    unsigned head = 0;
     unsigned count = 0;
     bool needs_rearm = false;
 

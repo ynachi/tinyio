@@ -1,3 +1,5 @@
+add_executable(fiber_vs_coro_bench fiber_vs_coro_bench.cpp)
+target_link_libraries(fiber_vs_coro_bench PRIVATE tinyio gflags::gflags)
 #add_executable(net_perf net_perf.cpp)
 #target_link_libraries(net_perf PRIVATE kio_lib gflags::gflags)
 
@@ -30,3 +32,6 @@ add_sanitizers(tinyio_post_smoke)
 add_executable(tinyio_dispatch_bench tinyio_dispatch_bench.cpp)
 target_link_libraries(tinyio_dispatch_bench PRIVATE tinyio gflags::gflags)
 add_sanitizers(tinyio_dispatch_bench)
+
+add_executable(context_switch_bench context_switch_bench.cpp)
+target_link_libraries(context_switch_bench PRIVATE tinyio)

@@ -1,0 +1,6 @@
+@@ -32,2 +32,5 @@
+ add_sanitizers(tinyio_dispatch_bench)
++
++add_executable(context_switch_bench context_switch_bench.cpp)
++target_link_libraries(context_switch_bench PRIVATE tinyio)
+ 
