@@ -348,6 +348,11 @@ TIO_NO_SANITIZE_ADDRESS void IO::suspend_fiber(detail::fiber::Fiber* fiber) noex
     assert(current_fiber_->runtime == this);
     assert(current_fiber_->state == detail::fiber::FiberState::running);
 
+    if (stopping_)
+    {
+        return fail(ECANCELED, "yield");
+    }
+
     push_ready(current_fiber_);
     suspend_fiber(current_fiber_);
 

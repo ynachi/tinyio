@@ -21,6 +21,11 @@ tio_add_test(fiber_sync_tests tinyio/fiber_sync_test.cc
         LIBS tinyio GTest::gtest GTest::gtest_main
 )
 
+tio_add_test(shutdown_cancellation_tests tinyio/shutdown_cancellation_test.cc
+        TAGS tinyio unit cancellation
+        LIBS tinyio GTest::gtest GTest::gtest_main
+)
+
 #========= uring
 #tio_add_test(op_pool_tests uring/op_pool_test.cpp
 #        TAGS uring unit
