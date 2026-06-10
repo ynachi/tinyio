@@ -16,6 +16,10 @@ services:
     # SYS_PTRACE lets sanitizer stack-unwinders work inside the container.
     cap_add:
       - SYS_PTRACE
+      - SYS_NICE
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
 
   # ── amd64 via Rosetta ─────────────────────────────────────────────────────
   # Docker Desktop on Apple Silicon runs amd64 images through Rosetta 2.

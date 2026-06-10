@@ -45,6 +45,8 @@ if is_debian_like; then
         sudo \
         libssl-dev \
         git \
+        libaio-dev \
+        libcurl4-openssl-dev \
         lld
 
     echo "Installation complete on Debian/Ubuntu-like system."
@@ -63,6 +65,8 @@ elif is_fedora_like; then
         boost-devel \
         openssl-devel \
         git \
+        libaio-devel \
+        libcurl-devel \
         lld
         
     echo "Installation complete on Fedora/RHEL-like system."

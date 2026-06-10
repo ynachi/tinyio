@@ -14,7 +14,7 @@ cd /workspace
 echo "==> Configuring (sanitizer=${SANITIZER})"
 cmake --preset dev --fresh \
   -G Ninja \
-  -DCMAKE_ASM_COMPILER=clang-22 \
+  -DCMAKE_ASM_COMPILER=clang \
   -DTIO_SANITIZER="$SANITIZER" \
   -DTIO_BUILD_DEMOS=OFF \
   -DTIO_BUILD_BITCASK=OFF \

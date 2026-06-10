@@ -113,5 +113,8 @@ struct AllFibersTag
 struct ReadyQueueTag
 {
 };
+struct WaitQueueTag
+{
+};
 
 }  // namespace tinyio

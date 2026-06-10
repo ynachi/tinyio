@@ -61,7 +61,7 @@ struct Operation
 
 /// \brief Represents a single cooperative thread of execution (coroutine).
 /// Intrusive doubly-linked list
-struct Fiber : IntrusiveHook<AllFibersTag>, IntrusiveHook<ReadyQueueTag> // NOLINT on multiple inheritance of non pure virtual classes. This as not classes per say
+struct Fiber : IntrusiveHook<AllFibersTag>, IntrusiveHook<ReadyQueueTag>, IntrusiveHook<WaitQueueTag> // NOLINT on multiple inheritance of non pure virtual classes. This as not classes per say
 {
     /// Pointer to the main event loop / scheduler that owns this fiber.
     IO* runtime = nullptr;

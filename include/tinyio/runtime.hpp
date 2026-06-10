@@ -72,6 +72,11 @@ struct IoOptions
 
 class IO final
 {
+    friend struct FiberLatch;
+    friend struct FiberSemaphore;
+    friend struct FiberMutex;
+    friend struct TaskGroup;
+    
 public:
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
     explicit IO(size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs);

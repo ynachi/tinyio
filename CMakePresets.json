@@ -12,9 +12,9 @@
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_C_COMPILER": "clang-22",
-        "CMAKE_CXX_COMPILER": "clang++-22",
-        "CMAKE_ASM_COMPILER": "clang-22"
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_ASM_COMPILER": "clang"
       }
     },
     {
@@ -27,7 +27,7 @@
         "TIO_BUILD_TESTS": "ON",
         "TIO_BUILD_DEMOS": "ON",
         "TIO_BUILD_BITCASK": "OFF",
-        "TIO_BUILD_BENCHMARK": "ON"
+        "TIO_BUILD_BENCHMARK": "OFF"
       }
     },
     {
