@@ -3,6 +3,8 @@
 #include "tinyio/runtime.hpp"
 #include <cassert>
 #include <cstddef>
+#include <vector>
+#include <optional>
 
 namespace tinyio
 {
@@ -171,7 +173,7 @@ struct TaskGroup {
     explicit TaskGroup(IO& io) : io_(io) {}
 
     // Spawns a child fiber tracked by this group.
-    void spawn(std::move_only_function<void(IO&) noexcept> task) noexcept
+    [[nodiscard]] Result<void> spawn(std::move_only_function<void(IO&) noexcept> task) noexcept
     {
         auto res = io_.spawn([this, t = std::move(task)](IO& io) mutable noexcept {
             t(io);
@@ -180,7 +182,9 @@ struct TaskGroup {
         if (res.has_value())
         {
             ++active_tasks_;
+            return {};
         }
+        return std::unexpected(res.error());
     }
 
     // Suspends calling fiber until all spawned children have finished.
@@ -216,6 +220,51 @@ private:
     IO& io_;
     std::ptrdiff_t active_tasks_ = 0;
     FiberWaitQueue waiters_;
+};
+
+/// @brief An extension of TaskGroup that collects a Result<T> per task into a pre-sized vector.
+///
+/// Tasks are assigned slots in spawn order (slot 0, 1, 2, ...). Unspawned slots
+/// remain std::nullopt. A spawn failure pre-populates the slot with the error so
+/// that results() is the single source of truth after wait().
+///
+/// Requires: T is nothrow-move-constructible (enforced at instantiation time).
+template <typename T>
+struct ResultGroup {
+    static_assert(std::is_nothrow_move_constructible_v<T>,
+                  "ResultGroup<T>: T must be nothrow-move-constructible");
+
+    explicit ResultGroup(IO& io, std::size_t capacity) : tg_(io), results_(capacity) {}
+
+    // Spawns the next child fiber; its result lands in the next available slot.
+    // If the runtime cannot allocate a fiber, the slot is pre-populated with the
+    // error and the error is also returned (for early-abort if desired).
+    Result<void> spawn(std::move_only_function<Result<T>(IO&) noexcept> task) noexcept
+    {
+        assert(next_ < results_.size() && "ResultGroup: more spawns than capacity");
+        std::size_t index = next_++;
+        auto res = tg_.spawn([this, index, t = std::move(task)](IO& io) mutable noexcept {
+            results_[index] = t(io);
+        });
+        if (!res)
+        {
+            results_[index] = std::unexpected(res.error());
+        }
+        return res;
+    }
+
+    // Suspends the calling fiber until all spawned children have finished.
+    void wait() noexcept { tg_.wait(); }
+
+    // Returns all result slots. Check each entry: nullopt = never spawned,
+    // has_value() = task succeeded, !has_value() = task returned an error.
+    std::vector<std::optional<Result<T>>>& results() noexcept { return results_; }
+    const std::vector<std::optional<Result<T>>>& results() const noexcept { return results_; }
+
+private:
+    TaskGroup tg_;
+    std::vector<std::optional<Result<T>>> results_;
+    std::size_t next_ = 0;
 };
 
 } // namespace tinyio

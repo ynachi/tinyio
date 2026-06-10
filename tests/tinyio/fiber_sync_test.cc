@@ -1,5 +1,7 @@
 #include "tinyio/fiber_sync.hpp"
+#include "tinyio/error.hpp"
 #include <gtest/gtest.h>
+#include <chrono>
 #include <vector>
 
 using namespace tinyio;
@@ -313,6 +315,73 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo)
     EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
 }
 
+// ── ResultGroup ─────────────────────────────────────────────────────────────
+
+// All tasks run and their return values are accessible via results() after wait().
+TEST_F(FiberSyncTest, ResultGroupBasic)
+{
+    (void)io.spawn([](IO& rt) noexcept {
+        ResultGroup<int> group(rt, 3);
+
+        group.spawn([](IO&) noexcept -> Result<int> { return 10; });
+        group.spawn([](IO&) noexcept -> Result<int> { return 20; });
+        group.spawn([](IO&) noexcept -> Result<int> { return 30; });
+
+        group.wait();
+
+        auto& r = group.results();
+        ASSERT_TRUE(r[0].has_value() && r[0]->has_value()); EXPECT_EQ(r[0]->value(), 10);
+        ASSERT_TRUE(r[1].has_value() && r[1]->has_value()); EXPECT_EQ(r[1]->value(), 20);
+        ASSERT_TRUE(r[2].has_value() && r[2]->has_value()); EXPECT_EQ(r[2]->value(), 30);
+    });
+
+    io.run_until_done();
+}
+
+// A task that returns an error populates its slot with that error.
+TEST_F(FiberSyncTest, ResultGroupTaskError)
+{
+    (void)io.spawn([](IO& rt) noexcept {
+        ResultGroup<int> group(rt, 2);
+
+        group.spawn([](IO&) noexcept -> Result<int> { return 42; });
+        group.spawn([](IO&) noexcept -> Result<int> {
+            return std::unexpected(Error{EINVAL, "test-op"});
+        });
+
+        group.wait();
+
+        auto& r = group.results();
+        ASSERT_TRUE(r[0].has_value() && r[0]->has_value());
+        EXPECT_EQ(r[0]->value(), 42);
+
+        ASSERT_TRUE(r[1].has_value() && !r[1]->has_value());
+        EXPECT_EQ(r[1]->error().code, EINVAL);
+    });
+
+    io.run_until_done();
+}
+
+// Slots that were never spawned remain std::nullopt.
+TEST_F(FiberSyncTest, ResultGroupUnspawnedSlotIsNullopt)
+{
+    (void)io.spawn([](IO& rt) noexcept {
+        ResultGroup<int> group(rt, 3);
+
+        group.spawn([](IO&) noexcept -> Result<int> { return 1; });
+        // slots 1 and 2 are never spawned
+
+        group.wait();
+
+        auto& r = group.results();
+        EXPECT_TRUE(r[0].has_value());
+        EXPECT_FALSE(r[1].has_value());  // nullopt
+        EXPECT_FALSE(r[2].has_value());  // nullopt
+    });
+
+    io.run_until_done();
+}
+
 // ── TaskGroup ───────────────────────────────────────────────────────────────
 
 // wait() unblocks only after all spawned children have completed.
@@ -323,8 +392,8 @@ TEST_F(FiberSyncTest, TaskGroupBasic)
     (void)io.spawn([&count](IO& rt) noexcept {
         TaskGroup group(rt);
 
-        group.spawn([&count](IO&) noexcept { count += 1; });
-        group.spawn([&count](IO&) noexcept { count += 2; });
+        ASSERT_TRUE(group.spawn([&count](IO&) noexcept { count += 1; }).has_value());
+        ASSERT_TRUE(group.spawn([&count](IO&) noexcept { count += 2; }).has_value());
 
         group.wait();
         EXPECT_EQ(count, 3);
@@ -332,6 +401,47 @@ TEST_F(FiberSyncTest, TaskGroupBasic)
 
     io.run_until_done();
     EXPECT_EQ(count, 3);
+}
+
+// 3 sleeps done one-after-another (sequential) vs. 3 sleeps issued simultaneously
+// via TaskGroup (concurrent). The concurrent case should finish in ~1× the sleep
+// duration while the sequential case takes ~3×, demonstrating that TaskGroup
+// overlaps I/O wait time across fibers.
+TEST_F(FiberSyncTest, TaskGroupConcurrentSleepsFasterThanSequential)
+{
+    using namespace std::chrono;
+    constexpr nanoseconds sleep_dur = milliseconds(20);
+
+    nanoseconds sequential_elapsed{};
+    nanoseconds concurrent_elapsed{};
+
+    // Sequential: each sleep must complete before the next one starts.
+    (void)io.spawn([&, sleep_dur](IO& rt) noexcept {
+        auto t0 = steady_clock::now();
+        for (int i = 0; i < 3; ++i)
+            (void)rt.sleep_for_ns(sleep_dur);
+        sequential_elapsed = steady_clock::now() - t0;
+    });
+    io.run_until_done();
+
+    // Concurrent: all 3 sleeps are in flight simultaneously.
+    (void)io.spawn([&, sleep_dur](IO& rt) noexcept {
+        TaskGroup group(rt);
+            const auto t0 = steady_clock::now();
+        for (int i = 0; i < 3; ++i)
+            (void)group.spawn([sleep_dur](IO& inner) noexcept {
+                (void)inner.sleep_for_ns(sleep_dur);
+            });
+        group.wait();
+        concurrent_elapsed = steady_clock::now() - t0;
+    });
+    io.run_until_done();
+
+    // Sequential ≈ 3 × sleep_dur, concurrent ≈ 1 × sleep_dur.
+    // Require concurrent < sequential / 2 to tolerate scheduler jitter.
+    EXPECT_LT(concurrent_elapsed, sequential_elapsed / 2)
+        << "sequential=" << duration_cast<milliseconds>(sequential_elapsed).count() << "ms"
+        << "  concurrent=" << duration_cast<milliseconds>(concurrent_elapsed).count() << "ms";
 }
 
 // wait() with no tasks spawned must return immediately without suspending.
