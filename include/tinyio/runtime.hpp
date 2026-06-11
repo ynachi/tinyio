@@ -84,6 +84,7 @@ public:
     {
         assert(current_fiber_ != nullptr && is_owner_thread());
         current_fiber_->state = detail::fiber::FiberState::waiting;
+        current_fiber_->wait_kind = detail::fiber::WaitKind::sync;
         suspend_fiber(current_fiber_);
     }
 
@@ -181,6 +182,9 @@ public:
 
     /// Checks if we are running an operation on the thread which created this IO instance
     [[nodiscard]] bool is_owner_thread() const noexcept { return std::this_thread::get_id() == owner_tid_; }
+
+    /// Returns true if the runtime is currently stopping
+    [[nodiscard]] bool stopping() const noexcept { return stopping_; }
 
     /// Register a fixed buffer pool
     Result<void> register_buffers(FixedBufferPool& pool) noexcept;
@@ -390,6 +394,7 @@ private:
         io_uring_sqe_set_data64(sqe, reinterpret_cast<__u64>(&op));
 
         current_fiber_->state = detail::fiber::FiberState::waiting;
+        current_fiber_->wait_kind = detail::fiber::WaitKind::io;
         ++inflight_ops_;
 
         // suspend now

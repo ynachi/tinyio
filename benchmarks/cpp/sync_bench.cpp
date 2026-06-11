@@ -7,7 +7,7 @@ void bench_mutex(tinyio::IO& io, size_t iterations) {
     tinyio::Mutex mutex(io);
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < iterations; ++i) {
-        mutex.lock();
+        (void)mutex.lock();
         mutex.unlock();
     }
     auto end = std::chrono::steady_clock::now();
@@ -19,7 +19,7 @@ void bench_semaphore(tinyio::IO& io, size_t iterations) {
     tinyio::Semaphore sem(io, 1);
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < iterations; ++i) {
-        sem.acquire();
+        (void)sem.acquire();
         sem.release();
     }
     auto end = std::chrono::steady_clock::now();
@@ -43,7 +43,7 @@ void bench_taskgroup(tinyio::IO& io, size_t iterations) {
     for (size_t i = 0; i < iterations; ++i) {
         tinyio::TaskGroup tg(io);
         (void)tg.spawn([](tinyio::IO&) noexcept {});
-        tg.wait();
+        (void)tg.wait();
     }
     auto end = std::chrono::steady_clock::now();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -57,18 +57,18 @@ void bench_mutex_contended(tinyio::IO& io, size_t iterations) {
     
     (void)tg.spawn([&](tinyio::IO& rt) noexcept {
         for (size_t i = 0; i < iterations; ++i) {
-            mutex.lock();
+            (void)mutex.lock();
             mutex.unlock();
             (void)rt.yield(); // yield to increase contention chance
         }
     });
     
     for (size_t i = 0; i < iterations; ++i) {
-        mutex.lock();
+        (void)mutex.lock();
         mutex.unlock();
         (void)io.yield();
     }
-    tg.wait();
+    (void)tg.wait();
     
     auto end = std::chrono::steady_clock::now();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();

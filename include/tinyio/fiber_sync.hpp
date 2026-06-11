@@ -46,7 +46,7 @@ struct Latch {
     }
 
     /// Suspends the calling fiber until count == 0. Returns immediately if already 0.
-    void wait() noexcept
+    [[nodiscard]] Result<void> wait() noexcept
     {
         auto* self = io_.running_fiber();
         assert(self != nullptr && "wait() called outside a fiber");
@@ -54,7 +54,12 @@ struct Latch {
         {
             waiters_.push_back(self);
             io_.park_running();
+            if (io_.stopping())
+            {
+                return fail(ECANCELED, "latch.wait");
+            }
         }
+        return {};
     }
 
 private:
@@ -90,7 +95,7 @@ struct Semaphore {
         : io_(io), count_(initial) {}
 
     // Decrements count. Suspends if count == 0.
-    void acquire() noexcept
+    [[nodiscard]] Result<void> acquire() noexcept
     {
         auto* self = io_.running_fiber();
         assert(self != nullptr && "acquire() called outside a fiber");
@@ -102,7 +107,12 @@ struct Semaphore {
         {
             waiters_.push_back(self);
             io_.park_running();
+            if (io_.stopping())
+            {
+                return fail(ECANCELED, "semaphore.acquire");
+            }
         }
+        return {};
     }
 
     // Increments count. Wakes one waiter if any.
@@ -153,13 +163,18 @@ private:
 struct Mutex {
     explicit Mutex(IO& io) : io_(io) {}
 
-    void lock() noexcept
+    [[nodiscard]] Result<void> lock() noexcept
     {
         auto* self = io_.running_fiber();
         assert(self != nullptr && "lock() called outside a fiber");
-        if (!held_) { held_ = true; return; }
+        if (!held_) { held_ = true; return {}; }
         waiters_.push_back(self);
         io_.park_running();
+        if (io_.stopping())
+        {
+            return fail(ECANCELED, "mutex.lock");
+        }
+        return {};
     }
 
     void unlock() noexcept
@@ -188,18 +203,30 @@ struct Mutex {
 
     // RAII guard
     struct Guard {
-        explicit Guard(Mutex& m) : m_(m) {}
-        ~Guard() { m_.unlock(); }
+        explicit Guard(Mutex* m) : m_(m) {}
+        ~Guard() { if (m_) m_->unlock(); }
         Guard(const Guard&) = delete;
         Guard& operator=(const Guard&) = delete;
+        Guard(Guard&& other) noexcept : m_(other.m_) { other.m_ = nullptr; }
+        Guard& operator=(Guard&& other) noexcept {
+            if (this != &other) {
+                if (m_) m_->unlock();
+                m_ = other.m_;
+                other.m_ = nullptr;
+            }
+            return *this;
+        }
     private:
-        Mutex& m_;
+        Mutex* m_;
     };
 
-    [[nodiscard]] Guard scoped_lock() noexcept
+    [[nodiscard]] Result<Guard> scoped_lock() noexcept
     {
-        lock();
-        return Guard{*this};
+        if (auto res = lock(); !res)
+        {
+            return std::unexpected(res.error());
+        }
+        return Guard{this};
     }
 
 private:
@@ -248,7 +275,7 @@ struct TaskGroup {
     }
 
     // Suspends calling fiber until all spawned children have finished.
-    void wait() noexcept
+    [[nodiscard]] Result<void> wait() noexcept
     {
         auto* self = io_.running_fiber();
         assert(self != nullptr && "wait() called outside a fiber");
@@ -256,7 +283,12 @@ struct TaskGroup {
         {
             waiters_.push_back(self);
             io_.park_running();
+            if (io_.stopping())
+            {
+                return fail(ECANCELED, "taskgroup.wait");
+            }
         }
+        return {};
     }
 
     ~TaskGroup()
@@ -340,7 +372,7 @@ struct ResultGroup {
     }
 
     // Suspends the calling fiber until all spawned children have finished.
-    void wait() noexcept { tg_.wait(); }
+    [[nodiscard]] Result<void> wait() noexcept { return tg_.wait(); }
 
     // Returns all result slots. Check each entry: nullopt = never spawned,
     // has_value() = task succeeded, !has_value() = task returned an error.

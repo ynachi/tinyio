@@ -34,6 +34,14 @@ enum class FiberState : std::uint8_t
     done,
 };
 
+/// \brief Indicates why a fiber is suspended.
+enum class WaitKind : std::uint8_t
+{
+    none,
+    io,
+    sync
+};
+
 struct Fiber;
 
 /// \brief State for a single asynchronous I/O operation.
@@ -99,5 +107,8 @@ struct Fiber  // NOLINT on multiple inheritance of non pure virtual classes. Thi
 
     /// The current lifecycle status of the fiber.
     FiberState state = FiberState::ready;
+
+    /// Why the fiber is suspended.
+    WaitKind wait_kind = WaitKind::none;
 };
 }  // namespace tinyio::detail::fiber

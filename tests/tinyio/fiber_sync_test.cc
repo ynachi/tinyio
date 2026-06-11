@@ -31,7 +31,7 @@ TEST_F(FiberSyncTest, LatchBasic)
             });
         }
 
-        latch.wait();
+        (void)latch.wait();
         EXPECT_EQ(count, 3);
     });
 
@@ -46,7 +46,7 @@ TEST_F(FiberSyncTest, LatchWaitReturnsImmediatelyWhenCountIsZero)
 
     (void)io.spawn([&](IO& rt) noexcept {
         Latch latch(rt, 0);
-        latch.wait();
+        (void)latch.wait();
         reached_after_wait = true;
     });
 
@@ -66,7 +66,7 @@ TEST_F(FiberSyncTest, LatchCountDownByN)
             latch.count_down(3);
         });
 
-        latch.wait();
+        (void)latch.wait();
         reached = true;
     });
 
@@ -85,7 +85,7 @@ TEST_F(FiberSyncTest, LatchMultipleWaiters)
 
         for (int i = 0; i < 3; ++i) {
             (void)rt.spawn([&](IO&) noexcept {
-                gate.wait();
+                (void)gate.wait();
                 waiters_done++;
                 done.count_down();
             });
@@ -98,7 +98,7 @@ TEST_F(FiberSyncTest, LatchMultipleWaiters)
         (void)rt.yield();
 
         gate.count_down();  // wakes all 3 simultaneously
-        done.wait();
+        (void)done.wait();
         EXPECT_EQ(waiters_done, 3);
     });
 
@@ -120,7 +120,7 @@ TEST_F(FiberSyncTest, SemaphoreBasic)
 
         for (int i = 0; i < 5; ++i) {
             (void)rt.spawn([&](IO& inner) noexcept {
-                sem.acquire();
+                (void)sem.acquire();
 
                 active++;
                 if (active > max_active)
@@ -134,7 +134,7 @@ TEST_F(FiberSyncTest, SemaphoreBasic)
             });
         }
 
-        done.wait();
+        (void)done.wait();
         EXPECT_LE(max_active, 2);
     });
 
@@ -181,7 +181,7 @@ TEST_F(FiberSyncTest, SemaphoreWaitersWokenFifo)
 
         for (int i = 1; i <= 3; ++i) {
             (void)rt.spawn([&, i](IO&) noexcept {
-                sem.acquire();
+                (void)sem.acquire();
                 order.push_back(i);
                 done.count_down();
             });
@@ -195,7 +195,7 @@ TEST_F(FiberSyncTest, SemaphoreWaitersWokenFifo)
         sem.release();
         sem.release();
         sem.release();
-        done.wait();
+        (void)done.wait();
     });
 
     io.run_until_done();
@@ -215,7 +215,7 @@ TEST_F(FiberSyncTest, MutexBasic)
 
         for (int i = 0; i < 5; ++i) {
             (void)rt.spawn([&](IO& inner) noexcept {
-                auto guard = m.scoped_lock();
+                auto guard = m.scoped_lock().value();
                 int local = shared;
                 (void)inner.yield();  // try to induce a race
                 shared = local + 1;
@@ -223,7 +223,7 @@ TEST_F(FiberSyncTest, MutexBasic)
             });
         }
 
-        done.wait();
+        (void)done.wait();
         EXPECT_EQ(shared, 5);
     });
 
@@ -270,7 +270,7 @@ TEST_F(FiberSyncTest, MutexScopedLockReleasesOnDestruct)
     (void)io.spawn([&](IO& rt) noexcept {
         Mutex m(rt);
         {
-            auto g = m.scoped_lock();
+            auto g = m.scoped_lock().value();
             EXPECT_FALSE(m.try_lock());  // held by g
         }  // g destructs → unlock()
         relocked = m.try_lock();         // now free again
@@ -291,11 +291,11 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo)
         Mutex m(rt);
         Latch done(rt, 3);
 
-        m.lock();  // outer fiber holds the lock
+        (void)m.lock();  // outer fiber holds the lock
 
         for (int i = 1; i <= 3; ++i) {
             (void)rt.spawn([&, i](IO&) noexcept {
-                m.lock();  // blocks — mutex is held by outer
+                (void)m.lock();  // blocks — mutex is held by outer
                 order.push_back(i);
                 m.unlock();
                 done.count_down();
@@ -308,7 +308,7 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo)
         (void)rt.yield();
 
         m.unlock();  // transfers ownership to fiber 1
-        done.wait();
+        (void)done.wait();
     });
 
     io.run_until_done();
@@ -327,7 +327,7 @@ TEST_F(FiberSyncTest, ResultGroupBasic)
         group.spawn([](IO&) noexcept -> Result<int> { return 20; });
         group.spawn([](IO&) noexcept -> Result<int> { return 30; });
 
-        group.wait();
+        (void)group.wait();
 
         auto& r = group.results();
         ASSERT_TRUE(r[0].has_value() && r[0]->has_value()); EXPECT_EQ(r[0]->value(), 10);
@@ -349,7 +349,7 @@ TEST_F(FiberSyncTest, ResultGroupTaskError)
             return std::unexpected(Error{EINVAL, "test-op"});
         });
 
-        group.wait();
+        (void)group.wait();
 
         auto& r = group.results();
         ASSERT_TRUE(r[0].has_value() && r[0]->has_value());
@@ -371,7 +371,7 @@ TEST_F(FiberSyncTest, ResultGroupUnspawnedSlotIsNullopt)
         group.spawn([](IO&) noexcept -> Result<int> { return 1; });
         // slots 1 and 2 are never spawned
 
-        group.wait();
+        (void)group.wait();
 
         auto& r = group.results();
         EXPECT_TRUE(r[0].has_value());
@@ -395,7 +395,7 @@ TEST_F(FiberSyncTest, TaskGroupBasic)
         ASSERT_TRUE(group.spawn([&count](IO&) noexcept { count += 1; }).has_value());
         ASSERT_TRUE(group.spawn([&count](IO&) noexcept { count += 2; }).has_value());
 
-        group.wait();
+        (void)group.wait();
         EXPECT_EQ(count, 3);
     });
 
@@ -432,7 +432,7 @@ TEST_F(FiberSyncTest, TaskGroupConcurrentSleepsFasterThanSequential)
             (void)group.spawn([sleep_dur](IO& inner) noexcept {
                 (void)inner.sleep_for_ns(sleep_dur);
             });
-        group.wait();
+        (void)group.wait();
         concurrent_elapsed = steady_clock::now() - t0;
     });
     io.run_until_done();
@@ -451,7 +451,7 @@ TEST_F(FiberSyncTest, TaskGroupWaitWithNoTasksReturnsImmediately)
 
     (void)io.spawn([&](IO& rt) noexcept {
         TaskGroup group(rt);
-        group.wait();
+        (void)group.wait();
         reached = true;
     });
 

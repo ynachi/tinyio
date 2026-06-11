@@ -313,6 +313,7 @@ TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexc
     current_fiber_ = fiber;
 
     fiber->state = detail::fiber::FiberState::running;
+    fiber->wait_kind = detail::fiber::WaitKind::none;
 
     detail::tools_before_switch(scheduler_tools_, &fiber->tools, &fiber->stack);
     boost::context::detail::transfer_t t = boost::context::detail::jump_fcontext(fiber->context.fctx, fiber);
@@ -379,10 +380,17 @@ void IO::cancel_and_drain() noexcept
 {
     bool issued_cancels = false;
     all_fibers_.for_each(
-        [&](const detail::fiber::Fiber& fiber) noexcept
+        [&](detail::fiber::Fiber& fiber) noexcept
         {
             if (fiber.state != detail::fiber::FiberState::waiting)
             {
+                return;
+            }
+            if (fiber.wait_kind == detail::fiber::WaitKind::sync)
+            {
+                // Sync primitives aren't waiting on the kernel, so just forcefully resume them with an error
+                fiber.operation.cqe_res = -ECANCELED;
+                push_ready(&fiber);
                 return;
             }
             auto res = get_sqe();
