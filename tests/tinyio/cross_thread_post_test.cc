@@ -1,0 +1,224 @@
+#include "tinyio/runtime.hpp"
+#include <gtest/gtest.h>
+#include <thread>
+#include <atomic>
+#include <vector>
+#include <chrono>
+
+using namespace tinyio;
+
+// Group C — Cross-thread post() tests
+
+// 1. post_before_run
+TEST(CrossThreadPostTest, PostBeforeRun)
+{
+    IoOptions opts;
+    IO io(0, opts, {});
+    
+    bool task_ran = false;
+    
+    bool posted = io.post([&](IO&) noexcept {
+        task_ran = true;
+    });
+    
+    ASSERT_TRUE(posted);
+    io.run_until_done();
+    
+    EXPECT_TRUE(task_ran);
+}
+
+// 2. post_wakes_sleeping_thread
+TEST(CrossThreadPostTest, PostWakesSleepingThread)
+{
+    IoOptions opts;
+    // We want the thread to sleep quickly so tick_timeout doesn't cause us to poll for too long.
+    opts.tick_timeout_ms = 1000;
+    IO io(0, opts, {});
+    
+    std::atomic<bool> thread_started{false};
+    std::atomic<bool> task_ran{false};
+    
+    std::stop_source ss;
+    
+    std::thread t([&]() {
+        thread_started = true;
+        // Since there are no fibers, run() will just wait for eventfd wakeup.
+        io.run(ss.get_token());
+    });
+    
+    while (!thread_started) {
+        std::this_thread::yield();
+    }
+    
+    // Give it a tiny bit to enter io_uring_submit_and_wait
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    
+    auto start = std::chrono::steady_clock::now();
+    bool posted = io.post([&](IO&) noexcept {
+        task_ran = true;
+        ss.request_stop(); // Task wakes up and stops the loop
+    });
+    ASSERT_TRUE(posted);
+    
+    t.join();
+    
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
+    EXPECT_TRUE(task_ran);
+    EXPECT_LT(elapsed.count(), 100);
+}
+
+// 3. post_concurrent_correctness
+TEST(CrossThreadPostTest, PostConcurrentCorrectness)
+{
+    IoOptions opts;
+    IO io(0, opts, {});
+    
+    std::atomic<int> counter{0};
+    constexpr int num_threads = 8;
+    constexpr int tasks_per_thread = 1000;
+    
+    std::vector<std::thread> threads;
+    
+    std::atomic<bool> start_signal{false};
+    
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&]() {
+            while (!start_signal) {
+                std::this_thread::yield();
+            }
+            for (int j = 0; j < tasks_per_thread; ++j) {
+                while (!io.post([&](IO&) noexcept {
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                })) {
+                    // spin if queue is full
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    
+    // Start producer threads
+    start_signal = true;
+    
+    // Also post a task that waits for completion, so the event loop doesn't exit early
+    // before the threads are done enqueuing.
+    io.spawn([&](IO& rt) noexcept {
+        while (counter.load(std::memory_order_relaxed) < num_threads * tasks_per_thread) {
+            (void)rt.sleep_for_ns(std::chrono::nanoseconds(1'000'000ULL)); // 1ms
+        }
+    });
+    
+    io.run_until_done();
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    EXPECT_EQ(counter.load(), num_threads * tasks_per_thread);
+}
+
+// 4. post_while_fibers_active
+TEST(CrossThreadPostTest, PostWhileFibersActive)
+{
+    IoOptions opts;
+    // Lower batch_max_size to ensure we interleave post drains with fiber resumes
+    opts.batch_max_size = 10;
+    IO io(0, opts, {});
+    
+    std::atomic<int> fiber_yields{0};
+    std::atomic<int> tasks_ran{0};
+    
+    for (int i = 0; i < 10; ++i) {
+        io.spawn([&](IO& rt) noexcept {
+            for (int j = 0; j < 100; ++j) {
+                (void)rt.yield();
+                fiber_yields++;
+            }
+        });
+    }
+    
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&]() {
+            for (int j = 0; j < 100; ++j) {
+                while (!io.post([&](IO&) noexcept {
+                    tasks_ran++;
+                })) {
+                    std::this_thread::yield();
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        });
+    }
+    
+    std::stop_source ss;
+    
+    // Create a watchdog fiber to stop the loop when everything is done
+    io.spawn([&](IO& rt) noexcept {
+        while (tasks_ran.load() < 400 || fiber_yields.load() < 1000) {
+            (void)rt.sleep_for_ns(std::chrono::milliseconds(1));
+        }
+        ss.request_stop();
+    });
+    
+    io.run(ss.get_token());
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    EXPECT_EQ(fiber_yields.load(), 1000);
+    EXPECT_EQ(tasks_ran.load(), 400);
+}
+
+// 5. post_after_stop
+TEST(CrossThreadPostTest, PostAfterStop)
+{
+    IoOptions opts;
+    bool destructed = false;
+    
+    {
+        IO io(0, opts, {});
+        std::stop_source ss;
+        ss.request_stop();
+        io.run(ss.get_token());
+        
+        bool posted = io.post([&](IO&) noexcept {
+            // Task logic doesn't run, but its captured state should be destructed
+        });
+        EXPECT_TRUE(posted);
+        
+        // We capture a shared_ptr with a custom deleter to track destruction
+        auto tracker = std::shared_ptr<int>(new int(42), [&](int* p) {
+            destructed = true;
+            delete p;
+        });
+        
+        posted = io.post([tracker](IO&) noexcept {
+        });
+        EXPECT_TRUE(posted);
+        // Let IO destruct
+    }
+    
+    // Destructor of IO should have drained the post queue and destroyed the tasks
+    EXPECT_TRUE(destructed);
+}
+
+// 6. post_queue_full
+TEST(CrossThreadPostTest, PostQueueFull)
+{
+    IoOptions opts;
+    opts.post_queue_capacity = 16;
+    IO io(0, opts, {});
+    
+    int success_count = 0;
+    for (int i = 0; i < 17; ++i) {
+        bool posted = io.post([](IO&) noexcept {});
+        if (posted) success_count++;
+    }
+    
+    // The capacity is 16. MpscQueue allows 16 items.
+    EXPECT_EQ(success_count, 16);
+}

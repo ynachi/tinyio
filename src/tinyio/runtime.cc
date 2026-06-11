@@ -13,7 +13,7 @@
 namespace tinyio
 {
 IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs)
-try : id_(id), opts_(opts), buffer_pool_(std::move(pool_configs))
+try : id_(id), opts_(opts), buffer_pool_(std::move(pool_configs)), post_queue_(opts.post_queue_capacity)
 {
     if (auto res = initialize(); !res.has_value())
     {
@@ -40,6 +40,7 @@ IO::~IO() noexcept
     // Discard any tasks that were posted but not yet spawned.
     // Their destructors release any captured resources before we tear down the ring.
     {
+        ALOG_INFO("discarding ready tasks, worker {}", id_);
         std::move_only_function<void(IO&) noexcept> fn;
         while (post_queue_.try_dequeue(fn))
         {
@@ -86,12 +87,14 @@ IO::~IO() noexcept
             auto err = res.error();
             ALOG_ERROR("Failed to unregister buffers: [{}] {}", err.op, err.error_code().message());
         }
+        ALOG_INFO("unregistered buffers, worker: {}", id_);
     }
 
     if (ring_.ring_fd > 0)
     {
         io_uring_queue_exit(&ring_);
         ring_.ring_fd = -1;
+        ALOG_INFO("exited io-uring ring, worker {}", id_);
     }
 
     if (wake_fd_ >= 0)
@@ -382,7 +385,7 @@ void IO::cancel_and_drain() noexcept
 {
     bool issued_cancels = false;
     all_fibers_.for_each(
-        [&](detail::fiber::Fiber& fiber) noexcept
+        [&](const detail::fiber::Fiber& fiber) noexcept
         {
             if (fiber.state != detail::fiber::FiberState::waiting)
             {
@@ -822,7 +825,7 @@ Result<void> IO::fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept
 
 Result<void> IO::ftruncate(Fd& fd, off_t len) noexcept
 {
-    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
+    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_nop(sqe); });
 }
 
 Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noexcept

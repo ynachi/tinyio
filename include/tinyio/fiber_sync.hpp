@@ -13,11 +13,29 @@ namespace tinyio
 using FiberWaitQueue = IntrusiveList<detail::fiber::Fiber, WaitQueueTag>;
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds when all are done.
-struct FiberLatch {
-    explicit FiberLatch(IO& io, std::ptrdiff_t count)
+///
+/// A Latch is a synchronization primitive that allows one or more fibers to wait until
+/// a set of operations being performed by other fibers completes.
+///
+/// @note Not thread-safe. Must be used within a single io runtime instance.
+///
+/// @code
+/// tinyio::Latch latch(io, 2);
+/// io.spawn([&](tinyio::IO& io) {
+///     // do work
+///     latch.count_down();
+/// });
+/// io.spawn([&](tinyio::IO& io) {
+///     // do work
+///     latch.count_down();
+/// });
+/// latch.wait(); // suspends until both fibers call count_down
+/// @endcode
+struct Latch {
+    explicit Latch(IO& io, const std::ptrdiff_t count)
         : io_(io), count_(count) {}
 
-    // Called by worker fibers. When count reaches 0, all waiters are pushed ready.
+    /// Called by worker fibers. When count reaches 0, all waiters are pushed ready.
     void count_down(std::ptrdiff_t n = 1) noexcept
     {
         count_ -= n;
@@ -27,7 +45,7 @@ struct FiberLatch {
         }
     }
 
-    // Suspends the calling fiber until count == 0. Returns immediately if already 0.
+    /// Suspends the calling fiber until count == 0. Returns immediately if already 0.
     void wait() noexcept
     {
         assert(io_.current_fiber_ != nullptr && "wait() called outside a fiber");
@@ -54,8 +72,21 @@ private:
 };
 
 /// @brief A counting gate. Limits how many fibers may be in a critical section concurrently.
-struct FiberSemaphore {
-    explicit FiberSemaphore(IO& io, const std::ptrdiff_t initial)
+///
+/// Semaphores are often used to restrict the number of concurrent accesses to a shared
+/// resource, or to throttle the execution of fibers.
+///
+/// @code
+/// tinyio::Semaphore sem(io, 2); // At most 2 fibers can acquire concurrently
+///
+/// io.spawn([&sem](tinyio::IO& io) {
+///     sem.acquire();
+///     // critical section limited to 2 concurrent fibers
+///     sem.release();
+/// });
+/// @endcode
+struct Semaphore {
+    explicit Semaphore(IO& io, const std::ptrdiff_t initial)
         : io_(io), count_(initial) {}
 
     // Decrements count. Suspends if count == 0.
@@ -105,8 +136,22 @@ private:
 };
 
 /// @brief Mutual exclusion for shared state across fibers
-struct FiberMutex {
-    explicit FiberMutex(IO& io) : io_(io), held_(false) {}
+///
+/// A Mutex ensures that only one fiber at a time can access a critical section of code
+/// or shared data. The `scoped_lock` method provides a convenient RAII mechanism to
+/// automatically release the lock.
+///
+/// @code
+/// tinyio::Mutex mutex(io);
+/// int shared_counter = 0;
+///
+/// io.spawn([&](tinyio::IO& io) {
+///     auto guard = mutex.scoped_lock();
+///     shared_counter++; // safely incremented
+/// });
+/// @endcode
+struct Mutex {
+    explicit Mutex(IO& io) : io_(io) {}
 
     void lock() noexcept
     {
@@ -148,12 +193,12 @@ struct FiberMutex {
 
     // RAII guard
     struct Guard {
-        explicit Guard(FiberMutex& m) : m_(m) {}
+        explicit Guard(Mutex& m) : m_(m) {}
         ~Guard() { m_.unlock(); }
         Guard(const Guard&) = delete;
         Guard& operator=(const Guard&) = delete;
     private:
-        FiberMutex& m_;
+        Mutex& m_;
     };
 
     [[nodiscard]] Guard scoped_lock() noexcept
@@ -164,11 +209,29 @@ struct FiberMutex {
 
 private:
     IO& io_;
-    bool held_;
+    bool held_{false};
     FiberWaitQueue waiters_;
 };
 
 /// @brief Ties fiber lifetime to a lexical scope. Ensures that spawned child fibers cannot outlive the group.
+///
+/// A TaskGroup allows you to spawn multiple fibers and wait for all of them to complete.
+/// This prevents "runaway" fibers that outlive the scope where they were created.
+/// The destructor asserts that no tasks are still active, enforcing that `wait()` is called
+/// before the group is destroyed.
+///
+/// @code
+/// {
+///     tinyio::TaskGroup group(io);
+///     group.spawn([](tinyio::IO& io) {
+///         // Task 1
+///     });
+///     group.spawn([](tinyio::IO& io) {
+///         // Task 2
+///     });
+///     group.wait(); // Suspends until Task 1 and Task 2 are finished
+/// }
+/// @endcode
 struct TaskGroup {
     explicit TaskGroup(IO& io) : io_(io) {}
 
@@ -229,6 +292,23 @@ private:
 /// that results() is the single source of truth after wait().
 ///
 /// Requires: T is nothrow-move-constructible (enforced at instantiation time).
+///
+/// @code
+/// tinyio::ResultGroup<int> group(io, 2);
+/// group.spawn([](tinyio::IO& io) -> tinyio::Result<int> {
+///     return 42;
+/// });
+/// group.spawn([](tinyio::IO& io) -> tinyio::Result<int> {
+///     return 100;
+/// });
+/// group.wait();
+///
+/// for (const auto& res : group.results()) {
+///     if (res && res->has_value()) {
+///         // res->value() contains 42, then 100
+///     }
+/// }
+/// @endcode
 template <typename T>
 struct ResultGroup {
     static_assert(std::is_nothrow_move_constructible_v<T>,

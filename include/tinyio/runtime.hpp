@@ -57,6 +57,9 @@ struct IoOptions
     /// max resume per tick
     std::size_t batch_max_size = 128;
 
+    /// Capacity for the cross-thread post queue (must be power of 2)
+    std::size_t post_queue_capacity = 4096;
+
     // Liburing auto wakeup the kernel thread so no need to manually do it
     /// IORING_SETUP_DEFER_TASKRUN is not compatible to SQ_POLL
     /// Also, when SQ_POLL is enabled, make sure to pin work threads and kernel threads
@@ -72,9 +75,9 @@ struct IoOptions
 
 class IO final
 {
-    friend struct FiberLatch;
-    friend struct FiberSemaphore;
-    friend struct FiberMutex;
+    friend struct Latch;
+    friend struct Semaphore;
+    friend struct Mutex;
     friend struct TaskGroup;
     
 public:
@@ -249,6 +252,7 @@ public:
 
     /// Flush pending writes on @p fd to the storage device.
     ///
+    /// @param fd
     /// @param datasync  If true, flushes data only (fdatasync semantics —
     ///                  metadata such as mtime may lag).  If false, flushes
     ///                  both data and metadata (fsync semantics).
@@ -307,6 +311,7 @@ public:
 
     /// Allocate or deallocate disk space for @p fd in the range [@p offset, @p offset + @p len).
     ///
+    /// @param fd
     /// @param mode  fallocate(2) mode flags (0 for a simple pre-allocation,
     ///              FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to punch a hole, etc.).
     /// @return {} on success, or an error code.

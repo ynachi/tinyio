@@ -1,10 +1,8 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
 #include <memory>
 #include <utility>
-#include <cstdlib>
 
 namespace tinyio::detail {
 

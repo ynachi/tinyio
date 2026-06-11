@@ -22,7 +22,7 @@ TEST_F(FiberSyncTest, LatchBasic)
     int count = 0;
 
     (void)io.spawn([&count](IO& rt) noexcept {
-        FiberLatch latch(rt, 3);
+        Latch latch(rt, 3);
 
         for (int i = 0; i < 3; ++i) {
             (void)rt.spawn([&latch, &count](IO&) noexcept {
@@ -45,7 +45,7 @@ TEST_F(FiberSyncTest, LatchWaitReturnsImmediatelyWhenCountIsZero)
     bool reached_after_wait = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberLatch latch(rt, 0);
+        Latch latch(rt, 0);
         latch.wait();
         reached_after_wait = true;
     });
@@ -60,7 +60,7 @@ TEST_F(FiberSyncTest, LatchCountDownByN)
     bool reached = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberLatch latch(rt, 3);
+        Latch latch(rt, 3);
 
         (void)rt.spawn([&](IO&) noexcept {
             latch.count_down(3);
@@ -80,8 +80,8 @@ TEST_F(FiberSyncTest, LatchMultipleWaiters)
     int waiters_done = 0;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberLatch gate(rt, 1);
-        FiberLatch done(rt, 3);
+        Latch gate(rt, 1);
+        Latch done(rt, 3);
 
         for (int i = 0; i < 3; ++i) {
             (void)rt.spawn([&](IO&) noexcept {
@@ -115,8 +115,8 @@ TEST_F(FiberSyncTest, SemaphoreBasic)
     int max_active = 0;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberSemaphore sem(rt, 2);
-        FiberLatch done(rt, 5);
+        Semaphore sem(rt, 2);
+        Latch done(rt, 5);
 
         for (int i = 0; i < 5; ++i) {
             (void)rt.spawn([&](IO& inner) noexcept {
@@ -147,7 +147,7 @@ TEST_F(FiberSyncTest, SemaphoreTryAcquireSucceedsWhenAvailable)
     bool acquired = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberSemaphore sem(rt, 1);
+        Semaphore sem(rt, 1);
         acquired = sem.try_acquire();
     });
 
@@ -161,7 +161,7 @@ TEST_F(FiberSyncTest, SemaphoreTryAcquireFailsWhenExhausted)
     bool second = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberSemaphore sem(rt, 1);
+        Semaphore sem(rt, 1);
         EXPECT_TRUE(sem.try_acquire());  // drains the slot
         second = sem.try_acquire();      // nothing left
     });
@@ -176,8 +176,8 @@ TEST_F(FiberSyncTest, SemaphoreWaitersWokenFifo)
     std::vector<int> order;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberSemaphore sem(rt, 0);  // start exhausted so every acquire blocks
-        FiberLatch done(rt, 3);
+        Semaphore sem(rt, 0);  // start exhausted so every acquire blocks
+        Latch done(rt, 3);
 
         for (int i = 1; i <= 3; ++i) {
             (void)rt.spawn([&, i](IO&) noexcept {
@@ -210,8 +210,8 @@ TEST_F(FiberSyncTest, MutexBasic)
     int shared = 0;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberMutex m(rt);
-        FiberLatch done(rt, 5);
+        Mutex m(rt);
+        Latch done(rt, 5);
 
         for (int i = 0; i < 5; ++i) {
             (void)rt.spawn([&](IO& inner) noexcept {
@@ -236,7 +236,7 @@ TEST_F(FiberSyncTest, MutexTryLockSucceedsWhenFree)
     bool locked = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberMutex m(rt);
+        Mutex m(rt);
         locked = m.try_lock();
         if (locked)
             m.unlock();
@@ -252,7 +252,7 @@ TEST_F(FiberSyncTest, MutexTryLockFailsWhenHeld)
     bool second = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberMutex m(rt);
+        Mutex m(rt);
         EXPECT_TRUE(m.try_lock());
         second = m.try_lock();  // already held
         m.unlock();
@@ -268,7 +268,7 @@ TEST_F(FiberSyncTest, MutexScopedLockReleasesOnDestruct)
     bool relocked = false;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberMutex m(rt);
+        Mutex m(rt);
         {
             auto g = m.scoped_lock();
             EXPECT_FALSE(m.try_lock());  // held by g
@@ -288,8 +288,8 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo)
     std::vector<int> order;
 
     (void)io.spawn([&](IO& rt) noexcept {
-        FiberMutex m(rt);
-        FiberLatch done(rt, 3);
+        Mutex m(rt);
+        Latch done(rt, 3);
 
         m.lock();  // outer fiber holds the lock
 

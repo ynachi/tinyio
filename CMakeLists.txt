@@ -71,7 +71,7 @@ find_package(Threads REQUIRED)
 
 # for benchmarks
 if (TIO_BUILD_BENCHMARK)
-    find_package(PhotonLibOS REQUIRED)
+    # find_package(PhotonLibOS REQUIRED)
 endif ()
 
 include(DevTargets)

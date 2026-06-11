@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <boost/context/detail/fcontext.hpp>
 
 namespace tinyio::detail::context
