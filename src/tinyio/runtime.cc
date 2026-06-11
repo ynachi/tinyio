@@ -468,10 +468,38 @@ Result<void> IO::submit_or_wait_for() noexcept
     }
     else
     {
+        // Mark as sleeping to allow cross-thread post() to wake us via eventfd
+        is_sleeping_.store(true, std::memory_order_seq_cst);
+        
+        // Double check queues to prevent a race condition where work was posted
+        // right before we set the sleeping flag.
+        if (!ready_queue_.empty() || !post_queue_.empty() || io_uring_cq_ready(&ring_) > 0)
+        {
+            is_sleeping_.store(false, std::memory_order_seq_cst);
+            int ret = 0;
+            if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN)
+            {
+                ret = io_uring_submit_and_get_events(&ring_);
+            }
+            else
+            {
+                ret = io_uring_submit(&ring_);
+            }
+            
+            if (ret < 0 && ret != -EINTR)
+            {
+                return fail(-ret, "submit_or_wait_for.io_uring_submit");
+            }
+            return {};
+        }
+
         if (const auto ret = io_uring_submit_and_wait(&ring_, 1); ret < 0 && ret != -EINTR)
         {
+            is_sleeping_.store(false, std::memory_order_relaxed);
             return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait");
         }
+        
+        is_sleeping_.store(false, std::memory_order_relaxed);
     }
 
     return {};
@@ -497,6 +525,12 @@ Result<io_uring_sqe*> IO::get_sqe() noexcept
 
 void IO::wake() const noexcept
 {
+    // Fast path: if the event loop is actively processing, don't write to eventfd
+    if (!is_sleeping_.load(std::memory_order_seq_cst))
+    {
+        return;
+    }
+
     // Always write to the eventfd. There is always one pending eventfd read
     // SQE in the kernel (armed by arm_wake_read() and re-armed after each
     // wakeup CQE). Writing here completes that read unconditionally, so
@@ -823,9 +857,9 @@ Result<void> IO::fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept
                          [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
 }
 
-Result<void> IO::ftruncate(Fd& fd, off_t len) noexcept
+Result<void> IO::ftruncate(Fd& fd, const off_t len) noexcept
 {
-    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_nop(sqe); });
+    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
 }
 
 Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
@@ -839,7 +873,7 @@ Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noex
                        });
 }
 
-Result<Fd> IO::accept(Fd& server_fd, int flags) noexcept
+Result<Fd> IO::accept(Fd& server_fd, const int flags) noexcept
 {
     return syscall<Fd>("accept",
                        [&](io_uring_sqe* sqe) { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
@@ -851,7 +885,7 @@ Result<uint32_t> IO::write(Fd& fd, std::span<const std::byte> buf, off_t offset)
                    [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset) noexcept
+Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, const size_t len, const off_t offset) noexcept
 {
     return syscall("write_fixed", [&](io_uring_sqe* sqe)
                    { io_uring_prep_write_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });

@@ -33,14 +33,16 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread)
     IoOptions opts;
     // We want the thread to sleep quickly so tick_timeout doesn't cause us to poll for too long.
     opts.tick_timeout_ms = 1000;
-    IO io(0, opts, {});
     
     std::atomic<bool> thread_started{false};
     std::atomic<bool> task_ran{false};
     
     std::stop_source ss;
+    IO* io_ptr = nullptr;
     
     std::thread t([&]() {
+        IO io(0, opts, {});
+        io_ptr = &io;
         thread_started = true;
         // Since there are no fibers, run() will just wait for eventfd wakeup.
         io.run(ss.get_token());
@@ -54,7 +56,7 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     
     auto start = std::chrono::steady_clock::now();
-    bool posted = io.post([&](IO&) noexcept {
+    bool posted = io_ptr->post([&](IO&) noexcept {
         task_ran = true;
         ss.request_stop(); // Task wakes up and stops the loop
     });

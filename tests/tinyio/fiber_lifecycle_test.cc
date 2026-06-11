@@ -18,10 +18,10 @@ template struct Accessor<IdleFibersTag, &IO::idle_fibers_>;
 IntrusiveList<detail::fiber::Fiber, ReadyQueueTag> IO::* get(IdleFibersTag);
 
 struct AllFibersTagAccess {
-    using type = IntrusiveList<detail::fiber::Fiber, AllFibersTag> IO::*;
+    using type = IntrusiveList<detail::fiber::Fiber, AllFibersTag, false> IO::*;
 };
 template struct Accessor<AllFibersTagAccess, &IO::all_fibers_>;
-IntrusiveList<detail::fiber::Fiber, AllFibersTag> IO::* get(AllFibersTagAccess);
+IntrusiveList<detail::fiber::Fiber, AllFibersTag, false> IO::* get(AllFibersTagAccess);
 
 // Group A — Fiber lifecycle tests
 // These tests verify that the core fiber state machine works correctly, and that 
@@ -129,7 +129,10 @@ TEST(FiberLifecycleTest, FiberPoolHwm)
     auto all_fibers_ptr = get(AllFibersTagAccess{});
     
     EXPECT_LE((io.*idle_fibers_ptr).size(), 4);
-    EXPECT_EQ((io.*all_fibers_ptr).size(), (io.*idle_fibers_ptr).size());
+    
+    std::size_t all_fibers_count = 0;
+    (io.*all_fibers_ptr).for_each([&](auto&) { all_fibers_count++; });
+    EXPECT_EQ(all_fibers_count, (io.*idle_fibers_ptr).size());
 }
 
 // 6. nested_spawn

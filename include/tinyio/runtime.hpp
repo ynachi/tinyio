@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <concepts>
 #include <filesystem>
@@ -408,6 +409,7 @@ private:
     //
     // Lifecycle
     //
+    std::atomic<bool> is_sleeping_{false};
     bool is_activated_{false};
     bool is_running_{false};
     bool stopping_{false};

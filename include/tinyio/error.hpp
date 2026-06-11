@@ -16,9 +16,9 @@ struct Error
     /// \brief Construct an \c Error from a positive errno value.
     /// \param e POSIX errno (positive).
     /// \param ctx Static context string (must outlive the Error; use a literal).
-    [[nodiscard]] static constexpr Error from_errno(const int e, std::string_view ctx = {}) noexcept
+    [[nodiscard]] static constexpr Error from_errno(const int e, const char* ctx = "") noexcept
     {
-        return Error{e, ctx.data()};
+        return Error{e, ctx != nullptr ? ctx : ""};
     }
 
     /// Returns true when this object contains a non-zero errno value.
@@ -37,7 +37,7 @@ using Result = std::expected<T, Error>;
 /// \brief Convenience: build an error-state \c Result payload.
 /// \param code Positive errno-style code.
 /// \param ctx  Static context string.
-[[nodiscard]] inline std::unexpected<Error> fail(const int code, std::string_view ctx = {}) noexcept
+[[nodiscard]] inline std::unexpected<Error> fail(const int code, const char* ctx = "") noexcept
 {
     return std::unexpected(Error::from_errno(code, ctx));
 }
@@ -49,13 +49,9 @@ namespace tinyio::detail
 template <class T, class E>
 decltype(auto) unwrap_expected(std::expected<T, E>& result) noexcept
 {
-    if constexpr (std::is_void_v<T>)
+    if constexpr (!std::is_void_v<T>)
     {
-        return *result;
-    }
-    else
-    {
-        return std::move(*result);
+        return T(std::move(*result));;
     }
 }
 
