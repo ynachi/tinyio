@@ -76,12 +76,27 @@ struct IoOptions
 
 class IO final
 {
-    friend struct Latch;
-    friend struct Semaphore;
-    friend struct Mutex;
-    friend struct TaskGroup;
-    
 public:
+    /// @name Internal scheduler hooks for synchronization primitives.
+    /// @note Not for application code. Owner-thread only.
+    ///@{
+    [[nodiscard]] detail::fiber::Fiber* running_fiber() const noexcept { return current_fiber_; }
+
+    /// Park the running fiber. Caller must have enqueued it on a wait list first.
+    /// @note Not for application code. Owner-thread only.
+    void park_running() noexcept
+    {
+        assert(current_fiber_ != nullptr && is_owner_thread());
+        current_fiber_->state = detail::fiber::FiberState::waiting;
+        suspend_fiber(current_fiber_);
+    }
+
+    /// Make a previously parked fiber runnable again.
+    /// @note Not for application code. Owner-thread only.
+    void unpark(detail::fiber::Fiber* f) noexcept { push_ready(f); }
+    ///@}
+
+
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
     explicit IO(size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs);
 

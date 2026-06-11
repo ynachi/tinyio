@@ -28,7 +28,7 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return dummy_.next == &dummy_; }
 
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t size() const noexcept requires TrackSize { return size_; }
 
     /// \brief Pushes a node to the front of the list (O(1), branchless)
     void push_front(T* node) noexcept { insert_between(get_hook(node), &dummy_, dummy_.next); }

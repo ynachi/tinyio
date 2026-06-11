@@ -148,7 +148,7 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 int main()
 {
     // Update ALOG namespace based on new logging
-    tinyio::log::set_level(log::Level::Disabled);
+    tinyio::log::set_level(log::Level::Debug);
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);

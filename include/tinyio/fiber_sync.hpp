@@ -48,11 +48,12 @@ struct Latch {
     /// Suspends the calling fiber until count == 0. Returns immediately if already 0.
     void wait() noexcept
     {
-        assert(io_.current_fiber_ != nullptr && "wait() called outside a fiber");
+        auto* self = io_.running_fiber();
+        assert(self != nullptr && "wait() called outside a fiber");
         if (count_ > 0)
         {
-            waiters_.push_back(io_.current_fiber_);
-            io_.suspend_fiber(io_.current_fiber_);
+            waiters_.push_back(self);
+            io_.park_running();
         }
     }
 
@@ -61,8 +62,7 @@ private:
     {
         while (!waiters_.empty())
         {
-            auto* waiting_fiber = waiters_.pop_front();
-            io_.push_ready(waiting_fiber);
+            io_.unpark(waiters_.pop_front());
         }
     }
 
@@ -92,15 +92,16 @@ struct Semaphore {
     // Decrements count. Suspends if count == 0.
     void acquire() noexcept
     {
-        assert(io_.current_fiber_ != nullptr && "acquire() called outside a fiber");
+        auto* self = io_.running_fiber();
+        assert(self != nullptr && "acquire() called outside a fiber");
         if (count_ > 0)
         {
             --count_;
         }
         else
         {
-            waiters_.push_back(io_.current_fiber_);
-            io_.suspend_fiber(io_.current_fiber_);
+            waiters_.push_back(self);
+            io_.park_running();
         }
     }
 
@@ -109,8 +110,7 @@ struct Semaphore {
     {
         if (!waiters_.empty())
         {
-            auto* waiting_fiber = waiters_.pop_front();
-            io_.push_ready(waiting_fiber);
+            io_.unpark(waiters_.pop_front());
         }
         else
         {
@@ -155,25 +155,20 @@ struct Mutex {
 
     void lock() noexcept
     {
-        assert(io_.current_fiber_ != nullptr && "lock() called outside a fiber");
-        if (!held_)
-        {
-            held_ = true;
-        }
-        else
-        {
-            waiters_.push_back(io_.current_fiber_);
-            io_.suspend_fiber(io_.current_fiber_);
-        }
+        auto* self = io_.running_fiber();
+        assert(self != nullptr && "lock() called outside a fiber");
+        if (!held_) { held_ = true; return; }
+        waiters_.push_back(self);
+        io_.park_running();
     }
 
     void unlock() noexcept
     {
         if (!waiters_.empty())
         {
-            auto* waiting_fiber = waiters_.pop_front();
-            io_.push_ready(waiting_fiber);
-            // We do not set held_ = false, because ownership transfers directly to the waiting fiber.
+            // Ownership transfers directly to the woken fiber, so held_
+            // intentionally stays true.
+            io_.unpark(waiters_.pop_front());
         }
         else
         {
@@ -255,17 +250,25 @@ struct TaskGroup {
     // Suspends calling fiber until all spawned children have finished.
     void wait() noexcept
     {
-        assert(io_.current_fiber_ != nullptr && "wait() called outside a fiber");
+        auto* self = io_.running_fiber();
+        assert(self != nullptr && "wait() called outside a fiber");
         if (active_tasks_ > 0)
         {
-            waiters_.push_back(io_.current_fiber_);
-            io_.suspend_fiber(io_.current_fiber_);
+            waiters_.push_back(self);
+            io_.park_running();
         }
     }
 
     ~TaskGroup()
     {
-        assert(active_tasks_ == 0 && "TaskGroup destroyed with live tasks; call wait() first");
+        // Hard check, a live task would
+        // later invoke on_task_done() through a dangling `this` — a UAF inside
+        // a fiber callback is strictly worse than aborting here.
+        if (active_tasks_ != 0)
+        {
+            ALOG_FATAL("TaskGroup destroyed with {} live task(s); call wait() first", active_tasks_);
+            std::abort();
+        }
     }
 
 private:
@@ -276,8 +279,7 @@ private:
         {
             while (!waiters_.empty())
             {
-                auto* waiting_fiber = waiters_.pop_front();
-                io_.push_ready(waiting_fiber);
+                io_.unpark(waiters_.pop_front());
             }
         }
     }

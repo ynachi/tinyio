@@ -112,11 +112,13 @@ public:
         return count;
     }
 
-    /// Check if the queue is empty. Must ONLY be called from the single consumer thread.
-    bool empty() const noexcept {
-        const size_t tail = tail_;
-        Slot& slot = slots_[tail & capacity_mask_];
-        return slot.turn.load(std::memory_order_relaxed) != tail + 1;
+    /// Consumer-only. Conservative: returns false if any slot has been
+    /// *claimed*, even if its payload isn't published yet. This is exactly
+    /// what shutdown loops need — a claimed slot will be published shortly
+    /// (the producer is between CAS and the release store).
+    bool empty() const noexcept
+    {
+        return head_.load(std::memory_order_acquire) == tail_;
     }
 };
 
