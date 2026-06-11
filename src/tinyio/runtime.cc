@@ -1,5 +1,7 @@
 #include "tinyio/runtime.hpp"
 
+#include "tinyio/logger.hpp"
+
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -8,19 +10,15 @@
 
 #include <sys/eventfd.h>
 
-#include "tinyio/logger.hpp"
-
 namespace tinyio
 {
 IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs)
-    : id_(id), opts_(opts), buffer_pool_(std::move(pool_configs)),
-      post_queue_(opts.post_queue_capacity)
+    : id_(id), opts_(opts), buffer_pool_(std::move(pool_configs)), post_queue_(opts.post_queue_capacity)
 {
     if (auto res = initialize(); !res)
     {
         const auto err = res.error();
-        throw std::system_error(err.error_code(),
-                                std::format("tinyio::IO init failed in {}", err.op));
+        throw std::system_error(err.error_code(), std::format("tinyio::IO init failed in {}", err.op));
     }
 }
 
@@ -118,6 +116,13 @@ Result<void> IO::initialize() noexcept
         }
     }
 
+    if ((params.flags & IORING_SETUP_SQPOLL) && (params.flags & IORING_SETUP_DEFER_TASKRUN))
+    {
+        return fail(EINVAL,
+                    "IORING_SETUP_SQPOLL is incompatible with DEFER_TASKRUN; "
+                    "clear kUringDefaultAdditionalFlag bits when enabling SQPOLL");
+    }
+
     if (const int rc = io_uring_queue_init_params(opts_.sq_entries, &ring_, &params); rc < 0)
     {
         return fail(-rc, "io_uring_queue_init_params");
@@ -178,6 +183,9 @@ void IO::push_ready(detail::fiber::Fiber* fiber) noexcept
     {
         return;
     }
+
+    assert(!static_cast<IntrusiveHook<IdleQueueTag>*>(fiber)->is_linked() &&
+           "push_ready on a recycled fiber — stale pointer?");
 
     // Ask the specific hook if it is already in a list
     auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
@@ -290,11 +298,8 @@ Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task)
     fiber->state = detail::fiber::FiberState::ready;
     detail::tools_create_fiber(fiber->tools);
 
-    fiber->context.fctx = boost::context::detail::make_fcontext(
-        fiber->stack.high, 
-        fiber->stack.usable_size, 
-        &tinyio_fiber_entry
-    );
+    fiber->context.fctx =
+        boost::context::detail::make_fcontext(fiber->stack.high, fiber->stack.usable_size, &tinyio_fiber_entry);
 
     // push to active list
     push_ready(fiber);
@@ -459,7 +464,7 @@ Result<void> IO::submit_or_wait_for() noexcept
     {
         // Mark as sleeping to allow cross-thread post() to wake us via eventfd
         is_sleeping_.store(true, std::memory_order_seq_cst);
-        
+
         // Double check queues to prevent a race condition where work was posted
         // right before we set the sleeping flag.
         if (!ready_queue_.empty() || !post_queue_.empty() || io_uring_cq_ready(&ring_) > 0)
@@ -474,7 +479,7 @@ Result<void> IO::submit_or_wait_for() noexcept
             {
                 ret = io_uring_submit(&ring_);
             }
-            
+
             if (ret < 0 && ret != -EINTR)
             {
                 return fail(-ret, "submit_or_wait_for.io_uring_submit");
@@ -487,7 +492,7 @@ Result<void> IO::submit_or_wait_for() noexcept
             is_sleeping_.store(false, std::memory_order_relaxed);
             return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait");
         }
-        
+
         is_sleeping_.store(false, std::memory_order_relaxed);
     }
 
@@ -662,7 +667,7 @@ Result<void> IO::tick() noexcept
         {
             const size_t to_dequeue = std::min(kMaxBulk, opts_.batch_max_size - total_processed);
             dequeued = post_queue_.try_dequeue_bulk(fns, to_dequeue);
-            
+
             if (dequeued == 0)
             {
                 break;
@@ -672,7 +677,8 @@ Result<void> IO::tick() noexcept
             {
                 if (auto res = spawn_task(std::move(fns[i])); !res)
                 {
-                    ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op, res.error().error_code().message());
+                    ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op,
+                               res.error().error_code().message());
                 }
             }
             total_processed += dequeued;
@@ -782,8 +788,7 @@ void IO::run_until_done() noexcept
     // Note: inflight_ops_ is always at least 1 because the cross-thread wake_fd_
     // is constantly armed for reading. We check for > 1 to ensure there are
     // no active user I/O operations pending.
-    while (has_live_fibers() || inflight_ops_ > 1 || !ready_queue_.empty() ||
-           !post_queue_.empty())
+    while (has_live_fibers() || inflight_ops_ > 1 || !ready_queue_.empty() || !post_queue_.empty())
     {
         if (auto res = tick(); !res)
         {

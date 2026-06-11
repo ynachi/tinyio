@@ -121,4 +121,6 @@ struct WaitQueueTag
 {
 };
 
+struct IdleQueueTag {};
+
 }  // namespace tinyio

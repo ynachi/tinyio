@@ -4,20 +4,19 @@
 #include <cassert>
 #include <concepts>
 #include <filesystem>
+#include <functional>
 #include <thread>
 #include <vector>
-
-#include "detail/mpsc_queue.hpp"
 
 #include <fcntl.h>
 #include <liburing.h>
 
 #include "buffer_pool.hpp"
 #include "detail/fiber.hpp"
+#include "detail/mpsc_queue.hpp"
 #include "error.hpp"
 #include "fd.hpp"
 #include "logger.hpp"
-#include <functional>
 
 namespace tinyio
 {
@@ -39,9 +38,6 @@ struct IoOptions
 
     /// Additional flags passed to io_uring
     unsigned additional_uring_flags = kUringDefaultAdditionalFlag;
-
-    /// Max tick timeout
-    std::uint32_t tick_timeout_ms = 10;
 
     /// Number of submission queue entries requested from io_uring.
     std::uint32_t sq_entries = 4096;
@@ -96,7 +92,6 @@ public:
     void unpark(detail::fiber::Fiber* f) noexcept { push_ready(f); }
     ///@}
 
-
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
     explicit IO(size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs);
 
@@ -145,7 +140,7 @@ public:
     /// the runtime is waiting for io_uring completions.
     void run(const std::stop_token& st) noexcept;
 
-    std::size_t id() const noexcept {return id_;}
+    std::size_t id() const noexcept { return id_; }
 
     /// Run until all fibers have completed and the cross-thread post queue is empty.
     ///
@@ -446,7 +441,7 @@ private:
     detail::ToolFiberState scheduler_tools_{};
     IntrusiveList<detail::fiber::Fiber, AllFibersTag, false> all_fibers_;
     IntrusiveList<detail::fiber::Fiber, ReadyQueueTag, false> ready_queue_;
-    IntrusiveList<detail::fiber::Fiber, ReadyQueueTag, true> idle_fibers_;  ///< For recycle
+    IntrusiveList<detail::fiber::Fiber, IdleQueueTag, true> idle_fibers_;  ///< For recycle
     detail::fiber::Fiber* current_fiber_ = nullptr;
     FiberId next_fiber_id_ = 1;
     std::size_t live_fibers_ = 0;

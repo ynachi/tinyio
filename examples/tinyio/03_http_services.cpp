@@ -2,13 +2,13 @@
 // curl -v --http1.1 -H 'Connection: close' http://127.0.0.1:8080/
 //  printf 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
 
+#include "tinyio/tinyio.hpp"
+
 #include <chrono>
 #include <csignal>
 #include <iostream>
 #include <string_view>
 #include <thread>
-
-#include "tinyio/tinyio.hpp"
 
 using namespace tinyio;
 
@@ -23,7 +23,6 @@ struct Options
     size_t workers = 4;
     size_t stack_size = 64 * 1024;
 };
-
 
 void signal_handler(int)
 {
@@ -62,7 +61,6 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept
         {
             break;
         }
-
     }
 
     return {};
@@ -86,19 +84,22 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 {
     auto server_fd = TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
 
-    ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(),  port);
+    ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
 
     while (!st.stop_requested())
     {
         auto client_fd = TRY_LOG_ERR(fio.accept(server_fd), "failed to accept");
 
         // Schedule the client handler on the same worker
-        (void)fio.spawn([client_fd = std::move(client_fd)](IO& worker_fio) mutable noexcept {
-            // If handle_client returns a Result, you might want to log it if it fails
-            if (auto res = handle_client(worker_fio, std::move(client_fd)); !res) {
-                ALOG_ERROR("Client handler failed: {}", res.error().error_code().message());
-            }
-        });
+        (void)fio.spawn(
+            [client_fd = std::move(client_fd)](IO& worker_fio) mutable noexcept
+            {
+                // If handle_client returns a Result, you might want to log it if it fails
+                if (auto res = handle_client(worker_fio, std::move(client_fd)); !res)
+                {
+                    ALOG_ERROR("Client handler failed: {}", res.error().error_code().message());
+                }
+            });
     }
 
     return {};
@@ -114,7 +115,8 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 //         co_return std::unexpected(listener.error());
 //     }
 //
-//     std::cout << "[Dispatcher] Listening on http://0.0.0.0:" << port << " and dispatching to " << ctx.worker_count() - 1
+//     std::cout << "[Dispatcher] Listening on http://0.0.0.0:" << port << " and dispatching to " << ctx.worker_count()
+//     - 1
 //               << " workers.\n";
 //
 //     Fd server_fd = std::move(*listener);
@@ -148,14 +150,14 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 int main()
 {
     // Update ALOG namespace based on new logging
-    tinyio::log::set_level(log::Level::Debug);
+    tinyio::log::set_level(log::Level::Disabled);
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
     // Ignore SIGPIPE to prevent the server from crashing when clients abruptly disconnect
-    std::signal(SIGPIPE, SIG_IGN); 
+    std::signal(SIGPIPE, SIG_IGN);
 
-    size_t num_threads = 4;
+    constexpr size_t num_threads = 4;
     constexpr uint16_t port = 8080;
 
     std::vector<std::jthread> threads;
@@ -170,24 +172,30 @@ int main()
         auto st = stop_sources.back().get_token();
 
         // Launch a new OS thread for each worker
-        threads.emplace_back([i, port, st] {
-            tinyio::IoOptions opts;
-            tinyio::IO worker(i, opts, {});
+        threads.emplace_back(
+            [i, port, st]
+            {
+                tinyio::IoOptions opts;
+                tinyio::IO worker(i, opts, {});
 
-            // Spawn the initial accept loop fiber onto this worker
-            (void)worker.spawn([port, st](IO& fio) noexcept {
-                if (auto res = server_loop(fio, port, st); !res) {
-                    ALOG_ERROR("Server loop failed: {}", res.error().error_code().message());
-                }
+                // Spawn the initial accept loop fiber onto this worker
+                (void)worker.spawn(
+                    [port, st](IO& fio) noexcept
+                    {
+                        if (auto res = server_loop(fio, port, st); !res)
+                        {
+                            ALOG_ERROR("Server loop failed: {}", res.error().error_code().message());
+                        }
+                    });
+
+                // Start the I/O event loop (blocks until the stop token is triggered)
+                worker.run(st);
             });
-
-            // Start the I/O event loop (blocks until the stop token is triggered)
-            worker.run(st);
-        });
     }
 
     std::cout << "HTTP Server running on http"
-                 "://127.0.0.1:" << port << "\n";
+                 "://127.0.0.1:"
+              << port << "\n";
 
     // Wait for SIGINT / SIGTERM
     while (g_stop_requested == 0)
@@ -198,7 +206,8 @@ int main()
     std::cout << "Shutting down workers...\n";
 
     // Trigger the stop token for all workers, cleanly interrupting the loops
-    for (auto& source : stop_sources) {
+    for (auto& source : stop_sources)
+    {
         source.request_stop();
     }
 

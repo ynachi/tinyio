@@ -1,12 +1,13 @@
 #pragma once
+#include "tinyio/intrusive_list.hpp"
+
 #include <cstdint>
+#include <functional>
 
 #include <linux/time_types.h>
 
 #include "context.hpp"
 #include "sanitizer_hooks.hpp"
-#include "tinyio/intrusive_list.hpp"
-#include <functional>
 
 namespace tinyio
 {
@@ -61,7 +62,11 @@ struct Operation
 
 /// \brief Represents a single cooperative thread of execution (coroutine).
 /// Intrusive doubly-linked list
-struct Fiber : IntrusiveHook<AllFibersTag>, IntrusiveHook<ReadyQueueTag>, IntrusiveHook<WaitQueueTag> // NOLINT on multiple inheritance of non pure virtual classes. This as not classes per say
+struct Fiber  // NOLINT on multiple inheritance of non pure virtual classes. This as not classes per say
+    : IntrusiveHook<AllFibersTag>,
+      IntrusiveHook<ReadyQueueTag>,
+      IntrusiveHook<WaitQueueTag>,
+      IntrusiveHook<IdleQueueTag>
 {
     /// Pointer to the main event loop / scheduler that owns this fiber.
     IO* runtime = nullptr;
