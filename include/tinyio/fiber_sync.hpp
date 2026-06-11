@@ -10,7 +10,7 @@ namespace tinyio
 {
 
 // A wait list is just an intrusive list of fibers waiting on a condition
-using FiberWaitQueue = IntrusiveList<detail::fiber::Fiber, WaitQueueTag>;
+using FiberWaitQueue = IntrusiveList<detail::fiber::Fiber, WaitQueueTag, false>;
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds when all are done.
 ///
@@ -209,7 +209,7 @@ struct Mutex {
 
 private:
     IO& io_;
-    bool held_{false};
+    size_t held_{0};
     FiberWaitQueue waiters_;
 };
 
@@ -236,9 +236,11 @@ struct TaskGroup {
     explicit TaskGroup(IO& io) : io_(io) {}
 
     // Spawns a child fiber tracked by this group.
-    [[nodiscard]] Result<void> spawn(std::move_only_function<void(IO&) noexcept> task) noexcept
+    template <class Fn>
+        requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
+    [[nodiscard]] Result<void> spawn(Fn&& task) noexcept
     {
-        auto res = io_.spawn([this, t = std::move(task)](IO& io) mutable noexcept {
+        auto res = io_.spawn([this, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
             t(io);
             this->on_task_done();
         });
@@ -319,11 +321,13 @@ struct ResultGroup {
     // Spawns the next child fiber; its result lands in the next available slot.
     // If the runtime cannot allocate a fiber, the slot is pre-populated with the
     // error and the error is also returned (for early-abort if desired).
-    Result<void> spawn(std::move_only_function<Result<T>(IO&) noexcept> task) noexcept
+    template <class Fn>
+        requires std::constructible_from<std::move_only_function<Result<T>(IO&) noexcept>, Fn>
+    Result<void> spawn(Fn&& task) noexcept
     {
         assert(next_ < results_.size() && "ResultGroup: more spawns than capacity");
         std::size_t index = next_++;
-        auto res = tg_.spawn([this, index, t = std::move(task)](IO& io) mutable noexcept {
+        auto res = tg_.spawn([this, index, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
             results_[index] = t(io);
         });
         if (!res)

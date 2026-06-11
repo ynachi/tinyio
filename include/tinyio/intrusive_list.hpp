@@ -20,7 +20,7 @@ struct IntrusiveHook
 /// \brief A branchless, circular, doubly-linked intrusive list using dummy heads.
 /// \tparam T The node type (must publicly inherit from IntrusiveHook<Tag>).
 /// \tparam Tag The unique tag identifying which hook to use.
-template <typename T, typename Tag>
+template <typename T, typename Tag, bool TrackSize = true>
 class IntrusiveList
 {
 public:
@@ -91,7 +91,9 @@ private:
         node->prev = prev;
         prev->next = node;
         next->prev = node;
-        ++size_;
+        if constexpr (TrackSize) {
+            ++size_;
+        }
     }
 
     void remove_hook(IntrusiveHook<Tag>* node) noexcept
@@ -102,7 +104,9 @@ private:
         // Reset the hook to unlinked circular state
         node->next = node;
         node->prev = node;
-        --size_;
+        if constexpr (TrackSize) {
+            --size_;
+        }
     }
 };
 

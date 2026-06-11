@@ -427,9 +427,9 @@ private:
     // bool inside_run_ = false;
     detail::context::Context scheduler_context_{};
     detail::ToolFiberState scheduler_tools_{};
-    IntrusiveList<detail::fiber::Fiber, AllFibersTag> all_fibers_;
-    IntrusiveList<detail::fiber::Fiber, ReadyQueueTag> ready_queue_;
-    IntrusiveList<detail::fiber::Fiber, ReadyQueueTag> idle_fibers_;  ///< For recycle
+    IntrusiveList<detail::fiber::Fiber, AllFibersTag, false> all_fibers_;
+    IntrusiveList<detail::fiber::Fiber, ReadyQueueTag, false> ready_queue_;
+    IntrusiveList<detail::fiber::Fiber, ReadyQueueTag, true> idle_fibers_;  ///< For recycle
     detail::fiber::Fiber* current_fiber_ = nullptr;
     FiberId next_fiber_id_ = 1;
     std::size_t live_fibers_ = 0;
