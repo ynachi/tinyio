@@ -209,11 +209,12 @@ public:
     /// std::memcpy(buf.ptr(), data.data(), data.size());
     /// auto n = TRY(fio.write_fixed(fd, buf, data.size(), file_offset));
     /// @endcode
-    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> write_fixed(const Fd& fd, const FixedBuffer& buf, size_t len,
+                                               off_t offset = -1) noexcept;
 
     /// Write the whole contents of @p buf to @p fd starting at @p offset.
     /// Equivalent to write_fixed(fd, buf, buf.size(), offset).
-    [[nodiscard]] Result<uint32_t> write_fixed(Fd& fd, const FixedBuffer& buf, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> write_fixed(const Fd& fd, const FixedBuffer& buf, off_t offset = -1) noexcept;
     /// Read up to @p len bytes from @p fd into @p buf (a registered fixed buffer)
     /// starting at @p offset.
     ///
@@ -228,11 +229,11 @@ public:
     /// std::string_view content{reinterpret_cast<const char*>(buf.ptr()),
     ///                          static_cast<size_t>(n)};
     /// @endcode
-    [[nodiscard]] Result<uint32_t> read_fixed(Fd& fd, FixedBuffer& buf, size_t len, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> read_fixed(const Fd& fd, FixedBuffer& buf, size_t len, off_t offset = -1) noexcept;
 
     /// Read up to buf.size() bytes from @p fd into @p buf starting at @p offset.
     /// Equivalent to read_fixed(fd, buf, buf.size(), offset).
-    [[nodiscard]] Result<uint32_t> read_fixed(Fd& fd, FixedBuffer& buf, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> read_fixed(const Fd& fd, FixedBuffer& buf, off_t offset = -1) noexcept;
 
     /// Read up to buf.size() bytes from @p fd into the caller-provided span @p buf.
     ///
@@ -241,14 +242,14 @@ public:
     /// Pass @p offset = -1 to use the file's current position.
     ///
     /// @return Number of bytes read, or an error code.
-    [[nodiscard]] Result<uint32_t> read(Fd& fd, std::span<std::byte> buf, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> read(const Fd& fd, std::span<std::byte> buf, off_t offset = -1) noexcept;
 
     /// Write up to buf.size() bytes from the caller-provided span @p buf to @p fd.
     ///
     /// Pass @p offset = -1 to use the file's current position.
     ///
     /// @return Number of bytes written, or an error code.
-    [[nodiscard]] Result<uint32_t> write(Fd& fd, std::span<const std::byte> buf, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> write(const Fd& fd, std::span<const std::byte> buf, off_t offset = -1) noexcept;
 
     /// Write the scatter-gather vector @p iovecs to @p fd starting at @p offset.
     ///
@@ -256,7 +257,7 @@ public:
     /// Pass @p offset = -1 to use the file's current position.
     ///
     /// @return Total bytes written, or an error code.
-    [[nodiscard]] Result<uint32_t> writev(Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> writev(const Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
 
     /// Read the scatter-gather vector @p iovecs from @p fd starting at @p offset.
     ///
@@ -264,7 +265,7 @@ public:
     /// Pass @p offset = -1 to use the file's current position.
     ///
     /// @return Total bytes read, or an error code.
-    [[nodiscard]] Result<uint32_t> readv(Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> readv(const Fd& fd, std::span<const iovec> iovecs, off_t offset = -1) noexcept;
 
     /// Flush pending writes on @p fd to the storage device.
     ///
@@ -273,7 +274,7 @@ public:
     ///                  metadata such as mtime may lag).  If false, flushes
     ///                  both data and metadata (fsync semantics).
     /// @return {} on success, or an error code.
-    [[nodiscard]] Result<void> fsync(Fd& fd, bool datasync = false) noexcept;
+    [[nodiscard]] Result<void> fsync(const Fd& fd, bool datasync = false) noexcept;
 
     /// Open or create the file at @p path and return a file descriptor.
     ///
@@ -291,13 +292,13 @@ public:
     /// Accept a new connection on @p server_fd, retrieving the client address.
     ///
     /// @return An owned Fd on success, or an error code.
-    [[nodiscard]] Result<Fd> accept(Fd& server_fd, SocketAddress& client_addr,
+    [[nodiscard]] Result<Fd> accept(const Fd& server_fd, SocketAddress& client_addr,
                                     int flags = kDefaultAcceptFlags) noexcept;
 
     /// Accept a new connection on @p server_fd without retrieving the client address.
     ///
     /// @return An owned Fd on success, or an error code.
-    [[nodiscard]] Result<Fd> accept(Fd& server_fd, int flags = kDefaultAcceptFlags) noexcept;
+    [[nodiscard]] Result<Fd> accept(const Fd& server_fd, int flags = kDefaultAcceptFlags) noexcept;
 
     /// Close @p fd asynchronously via io_uring.
     ///
@@ -319,11 +320,11 @@ public:
     ///
     /// @param poll_mask Standard poll(2) mask (e.g. POLLIN, POLLOUT).
     /// @return The triggered events, or an error code.
-    [[nodiscard]] Result<uint32_t> poll(Fd& fd, unsigned poll_mask) noexcept;
+    [[nodiscard]] Result<uint32_t> poll(const Fd& fd, unsigned poll_mask) noexcept;
 
     /// Connect @p fd to the remote address @p addr.
     /// Note: @p addr must outlive this function call.
-    [[nodiscard]] Result<void> connect(Fd& fd, const SocketAddress& addr) noexcept;
+    [[nodiscard]] Result<void> connect(const Fd& fd, const SocketAddress& addr) noexcept;
 
     /// Allocate or deallocate disk space for @p fd in the range [@p offset, @p offset + @p len).
     ///
@@ -331,13 +332,13 @@ public:
     /// @param mode  fallocate(2) mode flags (0 for a simple pre-allocation,
     ///              FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to punch a hole, etc.).
     /// @return {} on success, or an error code.
-    [[nodiscard]] Result<void> fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept;
+    [[nodiscard]] Result<void> fallocate(const Fd& fd, int mode, off_t offset, off_t len) noexcept;
 
     /// Truncate or extend @p fd to exactly @p len bytes.
     ///
     /// Requires kernel 6.9+ and liburing 2.6+.
     /// @return {} on success, or an error code.
-    [[nodiscard]] Result<void> ftruncate(Fd& fd, off_t len) noexcept;
+    [[nodiscard]] Result<void> ftruncate(const Fd& fd, off_t len) noexcept;
 
     /// Suspend the current fiber for the given duration.
     ///
@@ -354,14 +355,15 @@ public:
     // honored with up to TimerWheel::kTickNs (64ms) of slack. The hot path
     // costs two intrusive-list operations; the kernel is only involved
     // (one ASYNC_CANCEL) when a timeout actually fires.
-    [[nodiscard]] Result<uint32_t> read(Fd& fd, std::span<std::byte> buf, std::chrono::nanoseconds timeout,
+    [[nodiscard]] Result<uint32_t> read(const Fd& fd, std::span<std::byte> buf, std::chrono::nanoseconds timeout,
                                         off_t offset = -1) noexcept;
-    [[nodiscard]] Result<uint32_t> write(Fd& fd, std::span<const std::byte> buf, std::chrono::nanoseconds timeout,
+    [[nodiscard]] Result<uint32_t> write(const Fd& fd, std::span<const std::byte> buf, std::chrono::nanoseconds timeout,
                                          off_t offset = -1) noexcept;
-    [[nodiscard]] Result<Fd> accept(Fd& server_fd, std::chrono::nanoseconds timeout,
+    [[nodiscard]] Result<Fd> accept(const Fd& server_fd, std::chrono::nanoseconds timeout,
                                     int flags = kDefaultAcceptFlags) noexcept;
-    [[nodiscard]] Result<void> connect(Fd& fd, const SocketAddress& addr, std::chrono::nanoseconds timeout) noexcept;
-    [[nodiscard]] Result<uint32_t> poll(Fd& fd, unsigned poll_mask, std::chrono::nanoseconds timeout) noexcept;
+    [[nodiscard]] Result<void> connect(const Fd& fd, const SocketAddress& addr,
+                                       std::chrono::nanoseconds timeout) noexcept;
+    [[nodiscard]] Result<uint32_t> poll(const Fd& fd, unsigned poll_mask, std::chrono::nanoseconds timeout) noexcept;
 
 private:
     static constexpr uint64_t kWakeupSentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
@@ -380,6 +382,8 @@ private:
     Result<void> arm_wake_read() noexcept;
     void wake() const noexcept;
     Result<std::size_t> drain_completions() noexcept;
+    void drain_remote();
+    void resume_ready_fibers();
 
     // Internal executor for I/O operations. Factorizes the SQE acquisition,
     // fiber suspension, and error mapping logic.

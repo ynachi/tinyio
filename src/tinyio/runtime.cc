@@ -628,6 +628,57 @@ Result<std::size_t> IO::drain_completions() noexcept
     return count;
 }
 
+void IO::drain_remote()
+{
+    constexpr size_t kMaxBulk = 64;
+    std::move_only_function<void(IO&) noexcept> fns[kMaxBulk];
+    size_t dequeued = 0;
+    size_t total_processed = 0;
+
+    while (total_processed < opts_.batch_max_size)
+    {
+        const size_t to_dequeue = std::min(kMaxBulk, opts_.batch_max_size - total_processed);
+        dequeued = post_queue_.try_dequeue_bulk(fns, to_dequeue);
+
+        if (dequeued == 0)
+        {
+            break;
+        }
+
+        for (size_t i = 0; i < dequeued; ++i)
+        {
+            if (auto res = spawn_task(std::move(fns[i])); !res)
+            {
+                ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op, res.error().error_code().message());
+            }
+        }
+        total_processed += dequeued;
+    }
+}
+
+void IO::resume_ready_fibers()
+{
+    size_t processed = 0;
+    while (processed < opts_.batch_max_size)
+    {
+        auto* fiber = pop_ready();
+        if (!fiber)
+        {
+            break;  // empty queue
+        }
+
+        // Jump into the user's code
+        resume_fiber(fiber);
+
+        // State Machine Cleanup
+        if (fiber->state == detail::fiber::FiberState::done)
+        {
+            destroy_fiber(fiber);
+        }
+
+        processed++;
+    }
+}
 Result<void> IO::tick() noexcept
 {
     // Flush SQEs and/or wait for CQEs.
@@ -653,54 +704,10 @@ Result<void> IO::tick() noexcept
     // ready queue alongside any fibers that were just woken by CQEs.
     // We use try_dequeue_bulk to grab multiple tasks at once efficiently,
     // and limit the total processed per tick to prevent I/O starvation.
-    {
-        constexpr size_t kMaxBulk = 64;
-        std::move_only_function<void(IO&) noexcept> fns[kMaxBulk];
-        size_t dequeued = 0;
-        size_t total_processed = 0;
 
-        while (total_processed < opts_.batch_max_size)
-        {
-            const size_t to_dequeue = std::min(kMaxBulk, opts_.batch_max_size - total_processed);
-            dequeued = post_queue_.try_dequeue_bulk(fns, to_dequeue);
+    drain_remote();
 
-            if (dequeued == 0)
-            {
-                break;
-            }
-
-            for (size_t i = 0; i < dequeued; ++i)
-            {
-                if (auto res = spawn_task(std::move(fns[i])); !res)
-                {
-                    ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op,
-                               res.error().error_code().message());
-                }
-            }
-            total_processed += dequeued;
-        }
-    }
-
-    size_t processed = 0;
-    while (processed < opts_.batch_max_size)
-    {
-        auto* fiber = pop_ready();
-        if (!fiber)
-        {
-            break;  // empty queue
-        }
-
-        // Jump into the user's code
-        resume_fiber(fiber);
-
-        // State Machine Cleanup
-        if (fiber->state == detail::fiber::FiberState::done)
-        {
-            destroy_fiber(fiber);
-        }
-
-        processed++;
-    }
+    resume_ready_fibers();
 
     return {};
 }
@@ -800,35 +807,35 @@ void IO::run_until_done() noexcept
 // ======================= IO Methods ==========================================
 //
 
-Result<uint32_t> IO::read(Fd& fd, const std::span<std::byte> buf, const off_t offset) noexcept
+Result<uint32_t> IO::read(const Fd& fd, const std::span<std::byte> buf, const off_t offset) noexcept
 {
     return syscall("read", [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<uint32_t> IO::read_fixed(Fd& fd, FixedBuffer& buf, size_t len, off_t offset) noexcept
+Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const size_t len, const off_t offset) noexcept
 {
     return syscall("read_fixed", [&](io_uring_sqe* sqe)
                    { io_uring_prep_read_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
 }
 
-Result<uint32_t> IO::read_fixed(Fd& fd, FixedBuffer& buf, off_t offset) noexcept
+Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const off_t offset) noexcept
 {
     return read_fixed(fd, buf, buf.size(), offset);
 }
 
-Result<uint32_t> IO::writev(Fd& fd, std::span<const iovec> iovecs, off_t offset) noexcept
+Result<uint32_t> IO::writev(const Fd& fd, std::span<const iovec> iovecs, const off_t offset) noexcept
 {
     return syscall("writev",
                    [&](io_uring_sqe* sqe) { io_uring_prep_writev(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
 }
 
-Result<void> IO::fsync(Fd& fd, bool datasync) noexcept
+Result<void> IO::fsync(const Fd& fd, const bool datasync) noexcept
 {
     return syscall<void>(
         "fsync", [&](io_uring_sqe* sqe) { io_uring_prep_fsync(sqe, fd.fd, datasync ? IORING_FSYNC_DATASYNC : 0); });
 }
 
-Result<Fd> IO::open(const std::filesystem::path& path, int flags, mode_t mode) noexcept
+Result<Fd> IO::open(const std::filesystem::path& path, const int flags, const mode_t mode) noexcept
 {
     return syscall<Fd>("open",
                        [&](io_uring_sqe* sqe) { io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode); });
@@ -841,18 +848,18 @@ Result<void> IO::close(Fd&& fd) noexcept
     return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, raw_fd); });
 }
 
-Result<void> IO::fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept
+Result<void> IO::fallocate(const Fd& fd, const int mode, const off_t offset, const off_t len) noexcept
 {
     return syscall<void>("fallocate",
                          [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
 }
 
-Result<void> IO::ftruncate(Fd& fd, off_t len) noexcept
+Result<void> IO::ftruncate(const Fd& fd, const off_t len) noexcept
 {
     return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
 }
 
-Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
+Result<Fd> IO::accept(const Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
 {
     return syscall<Fd>("accept",
                        [&](io_uring_sqe* sqe)
@@ -863,30 +870,30 @@ Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noex
                        });
 }
 
-Result<Fd> IO::accept(Fd& server_fd, int flags) noexcept
+Result<Fd> IO::accept(const Fd& server_fd, const int flags) noexcept
 {
     return syscall<Fd>("accept",
                        [&](io_uring_sqe* sqe) { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
 }
 
-Result<uint32_t> IO::write(Fd& fd, std::span<const std::byte> buf, off_t offset) noexcept
+Result<uint32_t> IO::write(const Fd& fd, std::span<const std::byte> buf, const off_t offset) noexcept
 {
     return syscall("write",
                    [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset) noexcept
+Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const size_t len, const off_t offset) noexcept
 {
     return syscall("write_fixed", [&](io_uring_sqe* sqe)
                    { io_uring_prep_write_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
 }
 
-Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, off_t offset) noexcept
+Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const off_t offset) noexcept
 {
     return write_fixed(fd, buf, buf.size(), offset);
 }
 
-Result<uint32_t> IO::readv(Fd& fd, std::span<const iovec> iovecs, off_t offset) noexcept
+Result<uint32_t> IO::readv(const Fd& fd, std::span<const iovec> iovecs, const off_t offset) noexcept
 {
     return syscall("readv",
                    [&](io_uring_sqe* sqe) { io_uring_prep_readv(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
@@ -903,12 +910,12 @@ Result<void> IO::rename(const std::filesystem::path& from, const std::filesystem
                          { io_uring_prep_renameat(sqe, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), 0); });
 }
 
-Result<uint32_t> IO::poll(Fd& fd, unsigned poll_mask) noexcept
+Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask) noexcept
 {
     return syscall("poll", [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
 }
 
-Result<void> IO::connect(Fd& fd, const SocketAddress& addr) noexcept
+Result<void> IO::connect(const Fd& fd, const SocketAddress& addr) noexcept
 {
     return syscall<void>("connect",
                          [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
@@ -950,39 +957,39 @@ void IO::process_expired_timers() noexcept
     }
 }
 
-Result<uint32_t> IO::read(Fd& fd, const std::span<std::byte> buf, const std::chrono::nanoseconds timeout,
+Result<uint32_t> IO::read(const Fd& fd, const std::span<std::byte> buf, const std::chrono::nanoseconds timeout,
                           const off_t offset) noexcept
 {
     return syscall_timed("read_timed", timeout,
                          [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<uint32_t> IO::write(Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
+Result<uint32_t> IO::write(const Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
                            const off_t offset) noexcept
 {
     return syscall_timed("write_timed", timeout,
                          [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<Fd> IO::accept(Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
+Result<Fd> IO::accept(const Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
 {
     return syscall_timed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe)
                              { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
 }
 
-Result<void> IO::connect(Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
+Result<void> IO::connect(const Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed<void>("connect_timed", timeout,
                                [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
 }
 
-Result<uint32_t> IO::poll(Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
+Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed("poll_timed", timeout,
                          [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
 }
 
-Result<void> IO::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
+Result<void> IO::sleep_for_ns(const std::chrono::nanoseconds duration) noexcept
 {
     if (duration.count() <= 0)
     {
