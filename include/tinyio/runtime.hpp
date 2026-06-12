@@ -354,15 +354,14 @@ public:
     // honored with up to TimerWheel::kTickNs (64ms) of slack. The hot path
     // costs two intrusive-list operations; the kernel is only involved
     // (one ASYNC_CANCEL) when a timeout actually fires.
-    [[nodiscard]] Result<uint32_t> read_timed(Fd& fd, std::span<std::byte> buf, std::chrono::nanoseconds timeout,
-                                              off_t offset = -1) noexcept;
-    [[nodiscard]] Result<uint32_t> write_timed(Fd& fd, std::span<const std::byte> buf, std::chrono::nanoseconds timeout,
-                                               off_t offset = -1) noexcept;
-    [[nodiscard]] Result<Fd> accept_timed(Fd& server_fd, std::chrono::nanoseconds timeout,
-                                          int flags = kDefaultAcceptFlags) noexcept;
-    [[nodiscard]] Result<void> connect_timed(Fd& fd, const SocketAddress& addr,
-                                             std::chrono::nanoseconds timeout) noexcept;
-    [[nodiscard]] Result<uint32_t> poll_timed(Fd& fd, unsigned poll_mask, std::chrono::nanoseconds timeout) noexcept;
+    [[nodiscard]] Result<uint32_t> read(Fd& fd, std::span<std::byte> buf, std::chrono::nanoseconds timeout,
+                                        off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> write(Fd& fd, std::span<const std::byte> buf, std::chrono::nanoseconds timeout,
+                                         off_t offset = -1) noexcept;
+    [[nodiscard]] Result<Fd> accept(Fd& server_fd, std::chrono::nanoseconds timeout,
+                                    int flags = kDefaultAcceptFlags) noexcept;
+    [[nodiscard]] Result<void> connect(Fd& fd, const SocketAddress& addr, std::chrono::nanoseconds timeout) noexcept;
+    [[nodiscard]] Result<uint32_t> poll(Fd& fd, unsigned poll_mask, std::chrono::nanoseconds timeout) noexcept;
 
 private:
     static constexpr uint64_t kWakeupSentinel = 0xDEAD'C0DE'DEAD'C0DEULL;

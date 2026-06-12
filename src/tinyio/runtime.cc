@@ -184,11 +184,9 @@ void IO::push_ready(detail::fiber::Fiber* fiber) noexcept
         return;
     }
 
-    assert(!static_cast<IntrusiveHook<IdleQueueTag>*>(fiber)->is_linked() &&
-           "push_ready on a recycled fiber — stale pointer?");
-
     // Ask the specific hook if it is already in a list
-    if (auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber); hook->is_linked())
+    auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
+    if (hook->is_linked())
     {
         return;
     }
@@ -313,7 +311,6 @@ TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexc
     current_fiber_ = fiber;
 
     fiber->state = detail::fiber::FiberState::running;
-    fiber->wait_kind = detail::fiber::WaitKind::none;
 
     detail::tools_before_switch(scheduler_tools_, &fiber->tools, &fiber->stack);
     boost::context::detail::transfer_t t = boost::context::detail::jump_fcontext(fiber->context.fctx, fiber);
@@ -380,17 +377,10 @@ void IO::cancel_and_drain() noexcept
 {
     bool issued_cancels = false;
     all_fibers_.for_each(
-        [&](detail::fiber::Fiber& fiber) noexcept
+        [&](const detail::fiber::Fiber& fiber) noexcept
         {
             if (fiber.state != detail::fiber::FiberState::waiting)
             {
-                return;
-            }
-            if (fiber.wait_kind == detail::fiber::WaitKind::sync)
-            {
-                // Sync primitives aren't waiting on the kernel, so just forcefully resume them with an error
-                fiber.operation.cqe_res = -ECANCELED;
-                push_ready(&fiber);
                 return;
             }
             auto res = get_sqe();
@@ -399,7 +389,7 @@ void IO::cancel_and_drain() noexcept
                 ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
                 return;
             }
-            io_uring_prep_cancel(res.value(), &fiber.operation, 0);
+            io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber.operation), 0);
             io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
             ++inflight_ops_;
             issued_cancels = true;
@@ -513,12 +503,6 @@ Result<io_uring_sqe*> IO::get_sqe() noexcept
 
 void IO::wake() const noexcept
 {
-    // Fast path: if the event loop is actively processing, don't write to eventfd
-    if (!is_sleeping_.load(std::memory_order_seq_cst))
-    {
-        return;
-    }
-
     // Always write to the eventfd. There is always one pending eventfd read
     // SQE in the kernel (armed by arm_wake_read() and re-armed after each
     // wakeup CQE). Writing here completes that read unconditionally, so
@@ -618,7 +602,6 @@ Result<std::size_t> IO::drain_completions() noexcept
                 {
                     timer_wheel_.disarm(op->fiber);
                 }
-
                 push_ready(op->fiber);
                 --inflight_ops_;
             }
@@ -864,7 +847,7 @@ Result<void> IO::fallocate(Fd& fd, int mode, off_t offset, off_t len) noexcept
                          [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
 }
 
-Result<void> IO::ftruncate(Fd& fd, const off_t len) noexcept
+Result<void> IO::ftruncate(Fd& fd, off_t len) noexcept
 {
     return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
 }
@@ -880,7 +863,7 @@ Result<Fd> IO::accept(Fd& server_fd, SocketAddress& client_addr, int flags) noex
                        });
 }
 
-Result<Fd> IO::accept(Fd& server_fd, const int flags) noexcept
+Result<Fd> IO::accept(Fd& server_fd, int flags) noexcept
 {
     return syscall<Fd>("accept",
                        [&](io_uring_sqe* sqe) { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
@@ -892,7 +875,7 @@ Result<uint32_t> IO::write(Fd& fd, std::span<const std::byte> buf, off_t offset)
                    [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, const size_t len, const off_t offset) noexcept
+Result<uint32_t> IO::write_fixed(Fd& fd, const FixedBuffer& buf, size_t len, off_t offset) noexcept
 {
     return syscall("write_fixed", [&](io_uring_sqe* sqe)
                    { io_uring_prep_write_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
@@ -931,31 +914,6 @@ Result<void> IO::connect(Fd& fd, const SocketAddress& addr) noexcept
                          [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
 }
 
-Result<void> IO::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
-{
-    if (duration.count() <= 0)
-    {
-        return {};
-    }
-
-    auto r = syscall<void>("sleep_for",
-                           [&](io_uring_sqe* sqe)
-                           {
-                               const auto ns = duration.count();
-                               auto& ts = current_fiber_->operation.timeout_ts;
-                               ts.tv_sec = ns / 1'000'000'000LL;
-                               ts.tv_nsec = ns % 1'000'000'000LL;
-                               io_uring_prep_timeout(sqe, &ts, 0U, 0U);
-                           });
-
-    if (!r && r.error().code == ETIME)
-    {
-        return {};  // ETIME is the expected success code for timeout
-    }
-
-    return r;
-}
-
 void IO::process_expired_timers() noexcept
 {
     if (!timer_wheel_.has_armed())
@@ -992,36 +950,60 @@ void IO::process_expired_timers() noexcept
     }
 }
 
-Result<uint32_t> IO::read_timed(Fd& fd, const std::span<std::byte> buf, const std::chrono::nanoseconds timeout,
-                                const off_t offset) noexcept
+Result<uint32_t> IO::read(Fd& fd, const std::span<std::byte> buf, const std::chrono::nanoseconds timeout,
+                          const off_t offset) noexcept
 {
     return syscall_timed("read_timed", timeout,
                          [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<uint32_t> IO::write_timed(Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
-                                 const off_t offset) noexcept
+Result<uint32_t> IO::write(Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
+                           const off_t offset) noexcept
 {
     return syscall_timed("write_timed", timeout,
                          [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
 }
 
-Result<Fd> IO::accept_timed(Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
+Result<Fd> IO::accept(Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
 {
     return syscall_timed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe)
                              { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
 }
 
-Result<void> IO::connect_timed(Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
+Result<void> IO::connect(Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed<void>("connect_timed", timeout,
                                [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
 }
 
-Result<uint32_t> IO::poll_timed(Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
+Result<uint32_t> IO::poll(Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed("poll_timed", timeout,
                          [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
 }
 
+Result<void> IO::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
+{
+    if (duration.count() <= 0)
+    {
+        return {};
+    }
+
+    auto r = syscall<void>("sleep_for",
+                           [&](io_uring_sqe* sqe)
+                           {
+                               const auto ns = duration.count();
+                               auto& ts = current_fiber_->operation.timeout_ts;
+                               ts.tv_sec = ns / 1'000'000'000LL;
+                               ts.tv_nsec = ns % 1'000'000'000LL;
+                               io_uring_prep_timeout(sqe, &ts, 0U, 0U);
+                           });
+
+    if (!r && r.error().code == ETIME)
+    {
+        return {};
+    }
+
+    return r;
+}
 }  // namespace tinyio
