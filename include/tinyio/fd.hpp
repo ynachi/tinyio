@@ -41,13 +41,13 @@ struct Fd
     Fd& operator=(const Fd&) = delete;
 
     /// @brief Get the raw file descriptor.
-    [[nodiscard]] int Get() const noexcept { return fd; }
+    [[nodiscard]] int get() const noexcept { return fd; }
 
     /// @brief Check if the descriptor is valid.
-    [[nodiscard]] bool IsValid() const noexcept { return fd >= 0; }
+    [[nodiscard]] bool is_valid() const noexcept { return fd >= 0; }
 
     /// @brief Release ownership to the caller.
-    [[nodiscard]] int Release() noexcept
+    [[nodiscard]] int release() noexcept
     {
         const int out = fd;
         fd = -1;
@@ -57,18 +57,18 @@ struct Fd
     /// Single option
     /// @code
     /// URing::Fd sock{raw_fd};
-    /// if (auto r = sock.SetOption(SockOpt::NoDelay{}); !r)
+    /// if (auto r = sock.set_option(SockOpt::NoDelay{}); !r)
     ///    return r;
     /// @endcode
     template <SocketOption Opt>
-    [[nodiscard]] Result<void> SetOption(const Opt& opt) const noexcept
+    [[nodiscard]] Result<void> set_option(const Opt& opt) const noexcept
     {
-        return opt.Apply(fd);
+        return opt.apply(fd);
     }
 
     /// Variadic — short-circuits on first error
     /// @code
-    /// if (auto r = sock.SetOptions(
+    /// if (auto r = sock.set_options(
     ///     SockOpt::ReuseAddr{},
     ///     SockOpt::ReusePort{},
     ///     SockOpt::NonBlocking{},
@@ -77,10 +77,10 @@ struct Fd
     /// return r;
     /// @endcode
     template <SocketOption... Opts>
-    [[nodiscard]] Result<void> SetOptions(Opts&&... opts) const noexcept
+    [[nodiscard]] Result<void> set_options(Opts&&... opts) const noexcept
     {
         Result<void> r;
-        ((r = std::forward<Opts>(opts).Apply(fd), r.has_value()) && ...);
+        ((r = std::forward<Opts>(opts).apply(fd), r.has_value()) && ...);
         return r;
     }
 };

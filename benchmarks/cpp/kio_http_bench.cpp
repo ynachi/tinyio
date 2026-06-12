@@ -133,7 +133,7 @@ URing::Task<void> handle_client(URing::IO& worker, URing::Fd client_fd)
 URing::Task<void> dispatch_accept_loop(URing::IoContext& ctx, URing::IO& dispatcher, uint16_t port,
                                        std::stop_token st)
 {
-    auto listener = URing::TcpListener::Bind(port, "0.0.0.0", 4096);
+    auto listener = URing::TcpListener::bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
         std::cerr << "bind failed: " << listener.error().message() << '\n';
@@ -164,7 +164,7 @@ URing::Task<void> dispatch_accept_loop(URing::IoContext& ctx, URing::IO& dispatc
 
 URing::Task<void> reuseport_accept_loop(URing::IO& worker, uint16_t port, std::stop_token st)
 {
-    auto listener = URing::TcpListener::Bind(port, "0.0.0.0", 4096);
+    auto listener = URing::TcpListener::bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
         co_return std::unexpected(listener.error());

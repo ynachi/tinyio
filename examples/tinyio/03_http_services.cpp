@@ -82,7 +82,7 @@ static Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
 // Accept incoming connections on a single worker
 static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 {
-    auto server_fd = TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
+    auto server_fd = TRY_LOG_ERR(TcpListener::bind(port, "0.0.0.0", 4096), "failed to bind");
 
     ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
 
@@ -108,7 +108,7 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 // // Accept connections on one worker and dispatch to others
 // static Task<void> dispatching_server_loop(IoContext& ctx, IO& dispatcher, uint16_t port, std::stop_token st)
 // {
-//     auto listener = TcpListener::Bind(port, "0.0.0.0", 4096);
+//     auto listener = TcpListener::bind(port, "0.0.0.0", 4096);
 //     if (!listener)
 //     {
 //         std::cerr << "[Dispatcher] Failed to bind: " << listener.error().message() << "\n";

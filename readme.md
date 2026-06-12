@@ -77,7 +77,7 @@ static Result<void> handle_client(IO& io, Fd client) noexcept {
 }
 
 static Result<void> accept_loop(IO& io, uint16_t port, std::stop_token st) noexcept {
-    auto server = TRY(TcpListener::Bind(port, "0.0.0.0"));
+    auto server = TRY(TcpListener::bind(port, "0.0.0.0"));
 
     while (!st.stop_requested()) {
         auto client = TRY(io.accept(server));
@@ -175,8 +175,8 @@ Result<void>     io.sleep_for_ns(std::chrono::nanoseconds)
 
 ```cpp
 // Bind to address + port (IPv4 or IPv6 auto-detected).
-Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog = 4096);
-Result<Fd> TcpListener::Bind(uint16_t port, const char* ip = nullptr, int backlog = 4096);
+Result<Fd> TcpListener::bind(const SocketAddress& addr, int backlog = 4096);
+Result<Fd> TcpListener::bind(uint16_t port, const char* ip = nullptr, int backlog = 4096);
 ```
 
 Sets `SO_REUSEPORT`, `SO_REUSEADDR`, and `TCP_NODELAY` automatically.

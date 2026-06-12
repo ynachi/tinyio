@@ -135,7 +135,7 @@ void accept_and_dispatch(tinyio::IO& acceptor,
                          std::vector<tinyio::IO*> handlers,
                          uint16_t port) noexcept
 {
-    auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
+    auto listener = tinyio::TcpListener::bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
         std::cerr << "[acceptor] bind failed: " << listener.error().error_code().message() << '\n';
@@ -155,7 +155,7 @@ void accept_and_dispatch(tinyio::IO& acceptor,
             return;
         }
 
-        const int raw_fd = client->Release();
+        const int raw_fd = client->release();
 
         if (handlers.empty())
         {

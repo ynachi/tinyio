@@ -133,7 +133,7 @@ URing::Result<void> handle_client(URing::FiberIO& fio, int raw_fd)
 
 URing::Task<void> accept_loop(URing::IO& worker, uint16_t port, size_t stack_size, std::stop_token st)
 {
-    auto listener = URing::TcpListener::Bind(port, "0.0.0.0", 4096);
+    auto listener = URing::TcpListener::bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
         std::cerr << "bind failed on worker " << worker.id() << ": " << listener.error().message() << '\n';
@@ -153,7 +153,7 @@ URing::Task<void> accept_loop(URing::IO& worker, uint16_t port, size_t stack_siz
             co_return {};
         }
 
-        const int raw_fd = client_res->Release();
+        const int raw_fd = client_res->release();
         worker.spawn_fiber([raw_fd](URing::FiberIO& fio) { return handle_client(fio, raw_fd); }, stack_size);
     }
 

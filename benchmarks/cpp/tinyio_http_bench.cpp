@@ -129,7 +129,7 @@ void handle_client(tinyio::IO& fio, int raw_fd)
 
 void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size)
 {
-    auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
+    auto listener = tinyio::TcpListener::bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
         std::cerr << "bind failed: " << listener.error().error_code().message() << '\n';
@@ -149,7 +149,7 @@ void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size)
             return;
         }
 
-        const int raw_fd = client_res->Release();
+        const int raw_fd = client_res->release();
         (void)worker.spawn([raw_fd](tinyio::IO& fio) noexcept { handle_client(fio, raw_fd); });
     }
 }

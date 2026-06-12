@@ -8,7 +8,7 @@
 
 namespace tinyio
 {
-SocketAddress SocketAddress::V4(const uint16_t port, const char* ip)
+SocketAddress SocketAddress::v4(const uint16_t port, const char* ip)
 {
     SocketAddress sa;
     auto* in = reinterpret_cast<sockaddr_in*>(&sa.addr);
@@ -26,7 +26,7 @@ SocketAddress SocketAddress::V4(const uint16_t port, const char* ip)
     return sa;
 }
 
-SocketAddress SocketAddress::V6(const uint16_t port, const char* ip)
+SocketAddress SocketAddress::v6(const uint16_t port, const char* ip)
 {
     SocketAddress sa;
     auto* in6 = reinterpret_cast<sockaddr_in6*>(&sa.addr);
@@ -44,7 +44,7 @@ SocketAddress SocketAddress::V6(const uint16_t port, const char* ip)
     return sa;
 }
 
-[[nodiscard]] std::optional<std::string> SocketAddress::GetIp() const
+[[nodiscard]] std::optional<std::string> SocketAddress::get_ip() const
 {
     char buffer[INET6_ADDRSTRLEN];
     if (addr.ss_family == AF_INET)
@@ -66,7 +66,7 @@ SocketAddress SocketAddress::V6(const uint16_t port, const char* ip)
     return std::nullopt;
 }
 
-[[nodiscard]] std::optional<uint16_t> SocketAddress::GetPort() const
+[[nodiscard]] std::optional<uint16_t> SocketAddress::get_port() const
 {
     if (addr.ss_family == AF_INET)
     {
@@ -81,7 +81,7 @@ SocketAddress SocketAddress::V6(const uint16_t port, const char* ip)
     return std::nullopt;
 }
 
-Result<SocketAddress> ResolveIp(const std::string_view host, const uint16_t port)
+Result<SocketAddress> resolve_ip(const std::string_view host, const uint16_t port)
 {
     addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;

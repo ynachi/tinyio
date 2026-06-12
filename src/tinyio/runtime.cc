@@ -844,7 +844,7 @@ Result<Fd> IO::open(const std::filesystem::path& path, const int flags, const mo
 Result<void> IO::close(Fd&& fd) noexcept
 {
     // Nullify so Fd destructor doesn't close it twice
-    int raw_fd = fd.Release();
+    int raw_fd = fd.release();
     return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, raw_fd); });
 }
 
@@ -865,7 +865,7 @@ Result<Fd> IO::accept(const Fd& server_fd, SocketAddress& client_addr, int flags
                        [&](io_uring_sqe* sqe)
                        {
                            client_addr.addrlen = sizeof(sockaddr_storage);
-                           io_uring_prep_accept(sqe, server_fd.fd, client_addr.GetMutable(), &client_addr.addrlen,
+                           io_uring_prep_accept(sqe, server_fd.fd, client_addr.get_mutable(), &client_addr.addrlen,
                                                 flags);
                        });
 }
@@ -918,7 +918,7 @@ Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask) noexcept
 Result<void> IO::connect(const Fd& fd, const SocketAddress& addr) noexcept
 {
     return syscall<void>("connect",
-                         [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
+                         [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.get(), addr.addrlen); });
 }
 
 void IO::process_expired_timers() noexcept
@@ -980,7 +980,7 @@ Result<Fd> IO::accept(const Fd& server_fd, const std::chrono::nanoseconds timeou
 Result<void> IO::connect(const Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed<void>("connect_timed", timeout,
-                               [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
+                               [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.get(), addr.addrlen); });
 }
 
 Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept

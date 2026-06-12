@@ -6,7 +6,7 @@
 
 namespace tinyio
 {
-Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog)
+Result<Fd> TcpListener::bind(const SocketAddress& addr, int backlog)
 {
     // Create the raw socket
     const int raw_fd = ::socket(addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -20,7 +20,7 @@ Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog)
 
     // Reuse your variadic SetOptions!
     // Note: TCP_NODELAY set on a listening socket is inherited by accepted clients in Linux.
-    if (auto r = sock.SetOptions(SockOpt::ReuseAddr{true}, SockOpt::ReusePort{true}, SockOpt::NoDelay{true},
+    if (auto r = sock.set_options(SockOpt::ReuseAddr{true}, SockOpt::ReusePort{true}, SockOpt::NoDelay{true},
                                  SockOpt::NonBlocking{true});
         !r)
     {
@@ -28,13 +28,13 @@ Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog)
     }
 
     // Explicit bind
-    if (::bind(sock.Get(), addr.Get(), addr.addrlen) < 0)
+    if (::bind(sock.get(), addr.get(), addr.addrlen) < 0)
     {
         return fail(errno, "bind");
     }
 
     // Start listening
-    if (::listen(sock.Get(), backlog) < 0)
+    if (::listen(sock.get(), backlog) < 0)
     {
         return fail(errno, "listen");
     }
@@ -42,19 +42,19 @@ Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog)
     return sock;
 }
 
-Result<Fd> TcpListener::Bind(const uint16_t port, const char* ip, const int backlog)
+Result<Fd> TcpListener::bind(const uint16_t port, const char* ip, const int backlog)
 {
     SocketAddress addr;
 
     if (ip != nullptr && std::string_view(ip).find(':') != std::string_view::npos)
     {
-        addr = SocketAddress::V6(port, ip);
+        addr = SocketAddress::v6(port, ip);
     }
     else
     {
-        addr = SocketAddress::V4(port, ip);
+        addr = SocketAddress::v4(port, ip);
     }
 
-    return Bind(addr, backlog);
+    return bind(addr, backlog);
 }
 }  // namespace tinyio

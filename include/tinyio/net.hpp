@@ -14,7 +14,7 @@ namespace tinyio
 {
 template <typename Opt>
 concept SocketOption = requires(const Opt& o, int fd) {
-    { o.Apply(fd) } noexcept -> std::same_as<Result<void>>;
+    { o.apply(fd) } noexcept -> std::same_as<Result<void>>;
 };
 
 // ----------------------------------------------------------
@@ -28,7 +28,7 @@ struct BasicOption
     T value;
     explicit BasicOption(T v) noexcept : value(v) {}
 
-    [[nodiscard]] Result<void> Apply(const int fd) const noexcept
+    [[nodiscard]] Result<void> apply(const int fd) const noexcept
     {
         if (::setsockopt(fd, Level, Name, &value, sizeof(value)) < 0)
             return fail(errno, "setsockopt");
@@ -71,7 +71,7 @@ struct NonBlocking
     bool enable;
     explicit NonBlocking(const bool e = true) noexcept : enable(e) {}
 
-    [[nodiscard]] Result<void> Apply(const int fd) const noexcept
+    [[nodiscard]] Result<void> apply(const int fd) const noexcept
     {
         int flags = ::fcntl(fd, F_GETFL, 0);
         if (flags == -1)
@@ -94,7 +94,7 @@ struct NonBlocking
 ///
 /// @code
 ///   // Direct IPv4 address
-///   auto addr = SocketAddress::V4(8080, "0.0.0.0");
+///   auto addr = SocketAddress::v4(8080, "0.0.0.0");
 ///
 ///   // Async DNS resolution (non-blocking)
 ///   auto addr = co_await SocketAddress::ResolveAsync(ctx, pool, "example.com", 443);
@@ -112,10 +112,10 @@ struct SocketAddress
     /// @return SocketAddress configured for IPv4
     ///
     /// @code
-    ///   auto any = SocketAddress::V4(8080);              // Bind to all interfaces
-    ///   auto local = SocketAddress::V4(8080, "127.0.0.1"); // Localhost only
+    ///   auto any = SocketAddress::v4(8080);              // Bind to all interfaces
+    ///   auto local = SocketAddress::v4(8080, "127.0.0.1"); // Localhost only
     /// @endcode
-    static SocketAddress V4(std::uint16_t port, const char* ip = nullptr);
+    static SocketAddress v4(std::uint16_t port, const char* ip = nullptr);
 
     /// @brief Creates an IPv6 address.
     /// @param port Port number in host byte order (automatically converted to network order)
@@ -123,22 +123,22 @@ struct SocketAddress
     /// @return SocketAddress configured for IPv6
     ///
     /// @code
-    ///   auto any = SocketAddress::V6(8080);         // Bind to all IPv6 interfaces
-    ///   auto local = SocketAddress::V6(8080, "::1"); // IPv6 localhost only
+    ///   auto any = SocketAddress::v6(8080);         // Bind to all IPv6 interfaces
+    ///   auto local = SocketAddress::v6(8080, "::1"); // IPv6 localhost only
     /// @endcode
-    static SocketAddress V6(uint16_t port, const char* ip = nullptr);
+    static SocketAddress v6(uint16_t port, const char* ip = nullptr);
 
     /// @brief Returns the raw sockaddr pointer.
-    [[nodiscard]] const sockaddr* Get() const { return reinterpret_cast<const sockaddr*>(&addr); }
+    [[nodiscard]] const sockaddr* get() const { return reinterpret_cast<const sockaddr*>(&addr); }
 
     /// @brief Returns the raw sockaddr pointer (mutable).
-    [[nodiscard]] sockaddr* GetMutable() { return reinterpret_cast<sockaddr*>(&addr); }
+    [[nodiscard]] sockaddr* get_mutable() { return reinterpret_cast<sockaddr*>(&addr); }
 
     /// @brief Retrieves the IP address as a string.
-    [[nodiscard]] std::optional<std::string> GetIp() const;
+    [[nodiscard]] std::optional<std::string> get_ip() const;
 
     /// @brief Retrieves the port number (host byte order).
-    [[nodiscard]] std::optional<uint16_t> GetPort() const;
+    [[nodiscard]] std::optional<uint16_t> get_port() const;
 };
 
 /// @brief Synchronously resolves a hostname to an address (BLOCKING).
@@ -153,6 +153,6 @@ struct SocketAddress
 ///   // OK in initialization code
 ///   auto addr = SocketAddress::Resolve("database.local", 5432);
 /// @endcode
-Result<SocketAddress> ResolveIp(std::string_view host, uint16_t port);
+Result<SocketAddress> resolve_ip(std::string_view host, uint16_t port);
 
 }  // namespace tinyio
