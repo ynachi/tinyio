@@ -66,6 +66,15 @@ struct Operation
     /// Persists timeout structs in user-space. io_uring requires this struct to
     /// remain valid in memory until the timeout operation completes in the kernel.
     __kernel_timespec timeout_ts{};
+
+    /// Absolute CLOCK_MONOTONIC deadline (ns) while this op is armed in the
+    /// runtime's TimerWheel; 0 when no timeout is attached.
+    uint64_t deadline_ns = 0;
+
+    /// Set by the timer wheel when it expires this op (before issuing the
+    /// ASYNC_CANCEL). Lets syscall_timed() map the resulting -ECANCELED to
+    /// ETIMEDOUT instead of ECANCELED.
+    bool timed_out = false;
 };
 
 /// \brief Represents a single cooperative thread of execution (coroutine).
@@ -74,7 +83,8 @@ struct Fiber  // NOLINT on multiple inheritance of non pure virtual classes. Thi
     : IntrusiveHook<AllFibersTag>,
       IntrusiveHook<ReadyQueueTag>,
       IntrusiveHook<WaitQueueTag>,
-      IntrusiveHook<IdleQueueTag>
+      IntrusiveHook<IdleQueueTag>,
+      IntrusiveHook<TimerTag>
 {
     /// Pointer to the main event loop / scheduler that owns this fiber.
     IO* runtime = nullptr;

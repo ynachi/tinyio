@@ -28,7 +28,11 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return dummy_.next == &dummy_; }
 
-    [[nodiscard]] std::size_t size() const noexcept requires TrackSize { return size_; }
+    [[nodiscard]] std::size_t size() const noexcept
+        requires TrackSize
+    {
+        return size_;
+    }
 
     /// \brief Pushes a node to the front of the list (O(1), branchless)
     void push_front(T* node) noexcept { insert_between(get_hook(node), &dummy_, dummy_.next); }
@@ -91,7 +95,8 @@ private:
         node->prev = prev;
         prev->next = node;
         next->prev = node;
-        if constexpr (TrackSize) {
+        if constexpr (TrackSize)
+        {
             ++size_;
         }
     }
@@ -104,7 +109,8 @@ private:
         // Reset the hook to unlinked circular state
         node->next = node;
         node->prev = node;
-        if constexpr (TrackSize) {
+        if constexpr (TrackSize)
+        {
             --size_;
         }
     }
@@ -120,7 +126,11 @@ struct ReadyQueueTag
 struct WaitQueueTag
 {
 };
-
-struct IdleQueueTag {};
+struct IdleQueueTag
+{
+};
+struct TimerTag
+{
+};
 
 }  // namespace tinyio
