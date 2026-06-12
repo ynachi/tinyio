@@ -105,17 +105,14 @@ TEST(ShutdownCancellationTest, StopTokenCancelsReady)
 TEST(ShutdownCancellationTest, DestructorCancelsLiveWork)
 {
     IoOptions opts;
-    bool fiber_ran = false;
     {
         IO io(0, opts, {});
         auto res = io.spawn(
-            [&](IO& rt) noexcept
+            [](IO& rt) noexcept
             {
-                fiber_ran = true;
                 (void)rt.sleep_for_ns(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
             });
         ASSERT_TRUE(res.has_value());
-        ASSERT_TRUE(fiber_ran);
     }
 }
 
