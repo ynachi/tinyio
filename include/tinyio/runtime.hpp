@@ -14,6 +14,7 @@
 #include "buffer_pool.hpp"
 #include "detail/fiber.hpp"
 #include "detail/mpsc_queue.hpp"
+#include "detail/timer_wheel.hpp"
 #include "error.hpp"
 #include "fd.hpp"
 #include "logger.hpp"
@@ -344,6 +345,25 @@ public:
     /// @return {} on success, or an error code.
     [[nodiscard]] Result<void> sleep_for_ns(std::chrono::nanoseconds duration) noexcept;
 
+    // =====
+    // Timed I/O (timer-wheel based)
+    // =====
+    // TODO create overload instead of different methods
+    // Each *_timed op behaves like its untimed counterpart but fails with
+    // ETIMEDOUT if no completion arrives within @p timeout. Timeouts are
+    // honored with up to TimerWheel::kTickNs (64ms) of slack. The hot path
+    // costs two intrusive-list operations; the kernel is only involved
+    // (one ASYNC_CANCEL) when a timeout actually fires.
+    [[nodiscard]] Result<uint32_t> read_timed(Fd& fd, std::span<std::byte> buf, std::chrono::nanoseconds timeout,
+                                              off_t offset = -1) noexcept;
+    [[nodiscard]] Result<uint32_t> write_timed(Fd& fd, std::span<const std::byte> buf, std::chrono::nanoseconds timeout,
+                                               off_t offset = -1) noexcept;
+    [[nodiscard]] Result<Fd> accept_timed(Fd& server_fd, std::chrono::nanoseconds timeout,
+                                          int flags = kDefaultAcceptFlags) noexcept;
+    [[nodiscard]] Result<void> connect_timed(Fd& fd, const SocketAddress& addr,
+                                             std::chrono::nanoseconds timeout) noexcept;
+    [[nodiscard]] Result<uint32_t> poll_timed(Fd& fd, unsigned poll_mask, std::chrono::nanoseconds timeout) noexcept;
+
 private:
     static constexpr uint64_t kWakeupSentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
     static constexpr uint64_t kFiberCancelSentinel = 0xDEAD'C0DE'DEAD'C0CCULL;
@@ -414,6 +434,78 @@ private:
             return static_cast<T>(op.cqe_res);
         }
     }
+
+    /// Timed variant of syscall(): identical submission path, plus the fiber
+    /// is armed in the timer wheel. No extra SQE, no kernel timer. If the
+    /// wheel expires the op first, the resulting -ECANCELED is surfaced as
+    /// ETIMEDOUT (via Operation::timed_out).
+    template <typename T = uint32_t, typename Prep>
+    TIO_NO_SANITIZE_ADDRESS Result<T> syscall_timed(const char* op_name, const std::chrono::nanoseconds timeout,
+                                                    Prep&& prep) noexcept
+    {
+        if (timeout.count() <= 0)
+        {
+            return syscall<T>(op_name, std::forward<Prep>(prep));
+        }
+
+        if (stopping_)
+        {
+            return fail(ECANCELED, op_name);
+        }
+
+        if (!is_owner_thread() || current_fiber_ == nullptr)
+        {
+            return fail(EPERM, op_name);
+        }
+
+        assert(current_fiber_->runtime == this);
+        assert(current_fiber_->state == detail::fiber::FiberState::running);
+        assert(!static_cast<IntrusiveHook<TimerTag>*>(current_fiber_)->is_linked() &&
+               "fiber already armed in the timer wheel");
+
+        auto sqe = TRY_LOG_ERR(get_sqe(), "failed to get sqe: io ops [{}]", op_name);
+
+        detail::fiber::Operation& op = current_fiber_->operation;
+        op = detail::fiber::Operation{};
+        op.fiber = current_fiber_;
+        op.op_name = op_name;
+
+        std::forward<Prep>(prep)(sqe);
+        io_uring_sqe_set_data64(sqe, reinterpret_cast<__u64>(&op));
+
+        timer_wheel_.arm(current_fiber_, detail::monotonic_now_ns() + static_cast<uint64_t>(timeout.count()));
+
+        current_fiber_->state = detail::fiber::FiberState::waiting;
+        ++inflight_ops_;
+
+        suspend_fiber(current_fiber_);
+
+        // On resume the fiber is always disarmed: drain_completions() disarms
+        // on normal completion; process_expired_timers() disarmed on expiry.
+        if (op.cqe_res == -ECANCELED && op.timed_out)
+        {
+            return fail(ETIMEDOUT, op_name);
+        }
+        if (op.cqe_res < 0)
+        {
+            return fail(-op.cqe_res, op_name);
+        }
+
+        if constexpr (std::is_same_v<T, void>)
+        {
+            return {};
+        }
+        else
+        {
+            return static_cast<T>(op.cqe_res);
+        }
+    }
+
+    /// Cancel every op whose wheel deadline has passed (rare path).
+    void process_expired_timers() noexcept;
+
+    /// Per-op timeout bookkeeping. Owner-thread only.
+    detail::TimerWheel timer_wheel_;
 
     //
     // event fd for cross-thread signaling

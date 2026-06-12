@@ -188,8 +188,7 @@ void IO::push_ready(detail::fiber::Fiber* fiber) noexcept
            "push_ready on a recycled fiber — stale pointer?");
 
     // Ask the specific hook if it is already in a list
-    auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
-    if (hook->is_linked())
+    if (auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber); hook->is_linked())
     {
         return;
     }
@@ -222,6 +221,7 @@ void IO::destroy_fiber(detail::fiber::Fiber* fiber) noexcept
     }
 
     ready_queue_.remove(fiber);
+    timer_wheel_.disarm(fiber);
     fiber->task = nullptr;
 
     detail::tools_destroy_fiber(fiber->tools);
@@ -470,38 +470,24 @@ Result<void> IO::submit_or_wait_for() noexcept
     }
     else
     {
-        // Mark as sleeping to allow cross-thread post() to wake us via eventfd
-        is_sleeping_.store(true, std::memory_order_seq_cst);
-
-        // Double check queues to prevent a race condition where work was posted
-        // right before we set the sleeping flag.
-        if (!ready_queue_.empty() || !post_queue_.empty() || io_uring_cq_ready(&ring_) > 0)
+        // Sleep until a CQE arrives, the eventfd is written, or the nearest
+        // armed wheel deadline passes. The bound is a syscall argument
+        // (IORING_ENTER_EXT_ARG) - no timeout SQE exists anywhere.
+        __kernel_timespec ts{};
+        __kernel_timespec* tsp = nullptr;
+        if (const auto ns = timer_wheel_.ns_until_next(detail::monotonic_now_ns()); ns.has_value())
         {
-            is_sleeping_.store(false, std::memory_order_seq_cst);
-            int ret = 0;
-            if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN)
-            {
-                ret = io_uring_submit_and_get_events(&ring_);
-            }
-            else
-            {
-                ret = io_uring_submit(&ring_);
-            }
-
-            if (ret < 0 && ret != -EINTR)
-            {
-                return fail(-ret, "submit_or_wait_for.io_uring_submit");
-            }
-            return {};
+            ts.tv_sec = static_cast<long long>(*ns / 1'000'000'000ULL);
+            ts.tv_nsec = static_cast<long long>(*ns % 1'000'000'000ULL);
+            tsp = &ts;
         }
 
-        if (const auto ret = io_uring_submit_and_wait(&ring_, 1); ret < 0 && ret != -EINTR)
+        io_uring_cqe* cqe = nullptr;
+        if (const auto ret = io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
+            ret < 0 && ret != -EINTR && ret != -ETIME)
         {
-            is_sleeping_.store(false, std::memory_order_relaxed);
-            return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait");
+            return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait_timeout");
         }
-
-        is_sleeping_.store(false, std::memory_order_relaxed);
     }
 
     return {};
@@ -573,6 +559,13 @@ Result<void> IO::activate() noexcept
         return {};
     }
 
+    // Register the scheduler (this OS thread) with the sanitizer runtimes
+    // BEFORE the first context switch. Under TSAN, every fiber-to-scheduler
+    // switch targets scheduler_tools_.tsan_fiber; if it was never captured,
+    // tools_before_switch() silently skips __tsan_switch_to_fiber and TSAN's
+    // shadow state diverges from reality on the first suspend - SEGV.
+    detail::tools_capture_current_thread(scheduler_tools_);
+
     if (const int ret = io_uring_register(ring_.ring_fd, IORING_REGISTER_ENABLE_RINGS, nullptr, 0); ret < 0)
     {
         return fail(-ret, "io_uring_register");
@@ -619,6 +612,13 @@ Result<std::size_t> IO::drain_completions() noexcept
 
             if (op->fiber)
             {
+                // If a timeout was armed for this op, retire it: this is the
+                // common case where the op beat its deadline. O(1) unlink.
+                if (op->deadline_ns != 0)
+                {
+                    timer_wheel_.disarm(op->fiber);
+                }
+
                 push_ready(op->fiber);
                 --inflight_ops_;
             }
@@ -659,6 +659,11 @@ Result<void> IO::tick() noexcept
     auto count = TRY_LOG_ERR(drain_completions(), "current tick run failed to drain completions");
 
     ALOG_DEBUG("drained {} io completions", count);
+
+    // Cancel overdue timed ops. Runs after drain_completions() on purpose:
+    // ops that completed in this batch have already been disarmed, so we
+    // never cancel an op whose result the fiber is about to consume.
+    process_expired_timers();
 
     // Drain tasks posted from remote threads and spawn them as fibers.
     // Done here, after drain_completions(), so newly spawned tasks join the
@@ -950,4 +955,73 @@ Result<void> IO::sleep_for_ns(std::chrono::nanoseconds duration) noexcept
 
     return r;
 }
+
+void IO::process_expired_timers() noexcept
+{
+    if (!timer_wheel_.has_armed())
+    {
+        return;
+    }
+
+    bool issued = false;
+    timer_wheel_.expire(detail::monotonic_now_ns(),
+                        [&](detail::fiber::Fiber* fiber) noexcept
+                        {
+                            auto res = get_sqe();
+                            if (!res)
+                            {
+                                // Could not cancel now: re-arm one tick out and retry.
+                                ALOG_ERROR("timeout cancel SQE alloc failed: [{}] {}", res.error().op,
+                                           res.error().error_code().message());
+                                timer_wheel_.arm(fiber, detail::monotonic_now_ns() + detail::TimerWheel::kTickNs);
+                                return;
+                            }
+                            fiber->operation.timed_out = true;
+                            io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber->operation), 0);
+                            io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
+                            ++inflight_ops_;
+                            issued = true;
+                        });
+
+    if (issued)
+    {
+        // Submit immediately (rare path, cheap insurance): the cancel must
+        // reach the kernel before any future SQE that reuses this fiber's
+        // &Operation as user_data, so it can never match a successor op.
+        io_uring_submit(&ring_);
+    }
+}
+
+Result<uint32_t> IO::read_timed(Fd& fd, const std::span<std::byte> buf, const std::chrono::nanoseconds timeout,
+                                const off_t offset) noexcept
+{
+    return syscall_timed("read_timed", timeout,
+                         [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
+}
+
+Result<uint32_t> IO::write_timed(Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
+                                 const off_t offset) noexcept
+{
+    return syscall_timed("write_timed", timeout,
+                         [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
+}
+
+Result<Fd> IO::accept_timed(Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
+{
+    return syscall_timed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe)
+                             { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
+}
+
+Result<void> IO::connect_timed(Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
+{
+    return syscall_timed<void>("connect_timed", timeout,
+                               [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.Get(), addr.addrlen); });
+}
+
+Result<uint32_t> IO::poll_timed(Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
+{
+    return syscall_timed("poll_timed", timeout,
+                         [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
+}
+
 }  // namespace tinyio
