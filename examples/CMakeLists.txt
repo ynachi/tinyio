@@ -4,6 +4,9 @@
 tio_add_demo(03_http_services tinyio/03_http_services.cpp TAGS core LIBS gflags::gflags tinyio)
 tio_add_sanitizers(03_http_services)
 
+tio_add_demo(02_fanout tinyio/02_fanout.cc TAGS core LIBS gflags::gflags tinyio)
+tio_add_sanitizers(02_fanout)
+
 tio_add_demo(01_hello_echo tinyio/01_hello_echo.cc TAGS core LIBS gflags::gflags tinyio)
 tio_add_sanitizers(01_hello_echo)
 
@@ -14,6 +17,7 @@ tio_add_sanitizers(04_echo_client)
 add_custom_target(examples
         DEPENDS
         01_hello_echo
+        02_fanout
         03_http_services
         04_echo_client
 )

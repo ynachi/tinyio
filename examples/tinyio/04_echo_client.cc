@@ -32,7 +32,7 @@ std::atomic<uint64_t> total_errors{0};
 
 Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_id)
 {
-    auto addr = SocketAddress::v4(FLAGS_port, FLAGS_ip.c_str());
+    const auto addr = SocketAddress::v4(FLAGS_port, FLAGS_ip.c_str());
     Fd sock{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
     if (!sock.is_valid())
     {
