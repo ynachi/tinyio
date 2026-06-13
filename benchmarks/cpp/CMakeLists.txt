@@ -38,3 +38,5 @@ target_link_libraries(context_switch_bench PRIVATE tinyio)
 
 add_executable(sync_bench sync_bench.cpp)
 target_link_libraries(sync_bench PRIVATE tinyio)
+add_executable(try_macro_bench try_macro_bench.cpp)
+target_link_libraries(try_macro_bench PRIVATE tinyio)

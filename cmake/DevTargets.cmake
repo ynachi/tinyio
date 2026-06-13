@@ -3,10 +3,10 @@
 # ============================================================================
 
 # Find clang-format
-find_program(CLANG_FORMAT_EXE NAMES clang-format-22)
+find_program(CLANG_FORMAT_EXE NAMES clang-format)
 
 # Find clang-tidy
-find_program(CLANG_TIDY_EXE NAMES clang-tidy-22)
+find_program(CLANG_TIDY_EXE NAMES clang-tidy)
 
 # Collect all source files for formatting/linting
 file(GLOB_RECURSE ALL_SOURCE_FILES

@@ -2,6 +2,7 @@
 #include <expected>
 #include <string_view>
 #include <system_error>
+#include <format>
 
 namespace tinyio
 {
@@ -23,7 +24,26 @@ struct Error
 
     /// Returns true when this object contains a non-zero errno value.
     [[nodiscard]] explicit operator bool() const noexcept { return code != 0; }
+
+    /// Returns the system error message string for this error.
+    [[nodiscard]] std::string message() const { return error_code().message(); }
 };
+
+}  // namespace tinyio
+
+template <>
+struct std::formatter<tinyio::Error> : std::formatter<std::string>
+{
+    template <typename FormatContext>
+    auto format(const tinyio::Error& err, FormatContext& ctx) const
+    {
+        return std::formatter<std::string>::format(
+            std::format("{} ({})", err.message(), err.code), ctx);
+    }
+};
+
+namespace tinyio
+{
 
 /// \brief Equality compares only the code (context is diagnostic, not identity).
 [[nodiscard]] constexpr bool operator==(const Error& a, const Error& b) noexcept
@@ -87,7 +107,7 @@ decltype(auto) unwrap_expected(std::expected<T, E>& result) noexcept
         if (!_tinyio_res)                                                                           \
         {                                                                                           \
             const auto _tinyio_err = _tinyio_res.error();                                           \
-            ALOG_ERROR("{} failed: code={} " FMT, _tinyio_err.op, _tinyio_err.code, ##__VA_ARGS__); \
+            ALOG_ERROR("{} failed: code={} " FMT, _tinyio_err.op ? _tinyio_err.op : "unknown", _tinyio_err.code, ##__VA_ARGS__); \
             return std::unexpected(_tinyio_err);                                                    \
         }                                                                                           \
         ::tinyio::detail::unwrap_expected(_tinyio_res);                                             \

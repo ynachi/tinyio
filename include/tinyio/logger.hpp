@@ -4,10 +4,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include <ctime>
 #include <format>
 #include <mutex>
 #include <print>
+#include <semaphore>
 #include <source_location>
 #include <string_view>
 #include <thread>
@@ -52,11 +53,11 @@ struct Record
 };
 
 inline std::mutex g_mtx;
-inline std::condition_variable g_cv;
+inline std::counting_semaphore<1024> g_sem{0};
+inline std::atomic g_stop{false};
 inline std::vector<Record> g_queue;
-inline std::vector<Record> g_worker_queue;  // Double buffering
+inline std::vector<Record> g_worker_queue;
 inline std::jthread g_worker;
-inline bool g_stop = false;
 
 [[nodiscard]] constexpr const char* basename(const char* path) noexcept
 {
@@ -67,19 +68,32 @@ inline bool g_stop = false;
     return last;
 }
 
+// CLOCK_REALTIME_COARSE: ~2ns vs ~20ns for system_clock::now().
+// Millisecond resolution is more than enough for log timestamps.
+inline std::chrono::system_clock::time_point now_coarse() noexcept
+{
+#if defined(__linux__)
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    using namespace std::chrono;
+    return system_clock::time_point{
+        duration_cast<system_clock::duration>(seconds{ts.tv_sec} + nanoseconds{ts.tv_nsec})};
+#else
+    return std::chrono::system_clock::now();
+#endif
+}
+
 inline void worker_loop()
 {
     while (true)
     {
+        g_sem.acquire();
+
         {
-            std::unique_lock lock(g_mtx);
-            // Wait until there is work or we are stopping
-            g_cv.wait(lock, [] { return !g_queue.empty() || g_stop; });
-
+            std::scoped_lock lock(g_mtx);
             // If stopping and everything is drained, exit
-            if (g_stop && g_queue.empty())
+            if (g_stop.load(std::memory_order_relaxed) && g_queue.empty())
                 break;
-
             // Instantly swap the queues to release the lock!
             g_worker_queue.swap(g_queue);
         }
@@ -144,6 +158,14 @@ inline void worker_loop()
                          basename(r.loc.file_name()), r.loc.line(), std::string_view(r.msg.data(), r.len), reset);
         }
         g_worker_queue.clear();  // Keeps vector capacity to avoid allocations
+
+        // Re-arm: items or a stop signal that arrived while we were processing
+        // must not be silently swallowed — release once so the loop wakes again.
+        {
+            std::scoped_lock lock(g_mtx);
+            if (!g_queue.empty() || g_stop.load(std::memory_order_relaxed))
+                g_sem.release();
+        }
     }
 }
 
@@ -172,11 +194,10 @@ inline void set_colors(bool enable) noexcept
 
 inline void stop()
 {
-    {
-        std::scoped_lock lock(detail::g_mtx);
-        detail::g_stop = true;
-    }
-    detail::g_cv.notify_one();
+    // No lock needed: g_stop is atomic, and the semaphore is self-synchronizing.
+    // The release guarantees the worker sees the store (happens-before through acquire).
+    detail::g_stop.store(true, std::memory_order_relaxed);
+    detail::g_sem.release();
 }
 
 inline struct AutoStop
@@ -195,7 +216,7 @@ void log_impl(const std::source_location loc, std::format_string<Args...> fmt, A
     detail::Record r;
     r.level = L;
     r.loc = loc;
-    r.ts = std::chrono::system_clock::now();
+    r.ts = detail::now_coarse();
     r.tid = std::this_thread::get_id();
 
     try
@@ -216,16 +237,14 @@ void log_impl(const std::source_location loc, std::format_string<Args...> fmt, A
         if (detail::g_queue.size() < 1024)
         {
             detail::g_queue.push_back(std::move(r));
-            // Only execute syscall wake if the queue transitioned from empty to 1
+            // Only release the semaphore if the queue transitioned from empty to 1
             notify = (detail::g_queue.size() == 1);
         }
         // If >= 1024, the message is instantly dropped. No spinning!
     }
 
     if (notify)
-    {
-        detail::g_cv.notify_one();
-    }
+        detail::g_sem.release();
 }
 
 }  // namespace tinyio::log

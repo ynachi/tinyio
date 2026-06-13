@@ -1,6 +1,4 @@
 #include "tinyio/runtime.hpp"
-#include <tinyio/tcp_listener.hpp>
-#include <tinyio/logger.hpp>
 
 #include <atomic>
 #include <charconv>
@@ -13,6 +11,9 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <tinyio/logger.hpp>
+#include <tinyio/tcp_listener.hpp>
 
 namespace
 {
@@ -100,7 +101,7 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd, std::span<const 
         {
             return tinyio::fail(EIO, "write");
         }
-        data = data.subspan(static_cast<size_t>(written));
+        data = data.subspan(written);
     }
     return {};
 }
@@ -163,7 +164,7 @@ int main(int argc, char** argv)
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
         std::signal(SIGPIPE, SIG_IGN);
-        
+
         tinyio::log::set_level(tinyio::log::Level::Disabled);
 
         std::vector<std::jthread> threads;
@@ -176,17 +177,18 @@ int main(int argc, char** argv)
         {
             stop_sources.emplace_back();
             auto st = stop_sources.back().get_token();
-            threads.emplace_back([i, opts, st] {
-                tinyio::IoOptions io_opts;
-                io_opts.stack_size = opts.stack_size;
-                tinyio::IO worker(i, io_opts, {});
-                
-                (void)worker.spawn([opts](tinyio::IO& io) noexcept {
-                    accept_loop(io, opts.port, opts.stack_size);
+            threads.emplace_back(
+                [i, opts, st]
+                {
+                    tinyio::IoOptions io_opts;
+                    io_opts.stack_size = opts.stack_size;
+                    tinyio::IO worker(i, io_opts, {});
+
+                    (void)worker.spawn([opts](tinyio::IO& io) noexcept
+                                       { accept_loop(io, opts.port, opts.stack_size); });
+
+                    worker.run(st);
                 });
-                
-                worker.run(st);
-            });
         }
 
         while (!g_stop_requested.load(std::memory_order_relaxed))
@@ -194,10 +196,10 @@ int main(int argc, char** argv)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        for (auto& source : stop_sources) {
+        for (auto& source : stop_sources)
+        {
             source.request_stop();
         }
-
     }
     catch (const std::exception& e)
     {

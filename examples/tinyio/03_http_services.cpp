@@ -53,11 +53,9 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept
             break;
         }
 
-        std::span out_buf(reinterpret_cast<const std::byte*>(kHttpResponse.data()), kHttpResponse.size());
+        const std::span out_buf(reinterpret_cast<const std::byte*>(kHttpResponse.data()), kHttpResponse.size());
 
-        auto w_n = TRY_LOG_ERR(fio.write(client_fd, out_buf), "failed to write to client");
-
-        if (w_n == 0)
+        if (const auto w_n = TRY_LOG_ERR(fio.write(client_fd, out_buf), "failed to write to client"); w_n == 0)
         {
             break;
         }
@@ -66,11 +64,11 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept
     return {};
 }
 
-static Result<void> write_all(IO& fio, Fd& fd, std::span<const std::byte> data)
+static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> data)
 {
     while (!data.empty())
     {
-        auto written = TRY(fio.write(fd, data));
+        const auto written = TRY(fio.write(fd, data));
         if (written == 0)
         {
             return fail(EIO, "write");
@@ -105,48 +103,6 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
     return {};
 }
 
-// // Accept connections on one worker and dispatch to others
-// static Task<void> dispatching_server_loop(IoContext& ctx, IO& dispatcher, uint16_t port, std::stop_token st)
-// {
-//     auto listener = TcpListener::bind(port, "0.0.0.0", 4096);
-//     if (!listener)
-//     {
-//         std::cerr << "[Dispatcher] Failed to bind: " << listener.error().message() << "\n";
-//         co_return std::unexpected(listener.error());
-//     }
-//
-//     std::cout << "[Dispatcher] Listening on http://0.0.0.0:" << port << " and dispatching to " << ctx.worker_count()
-//     - 1
-//               << " workers.\n";
-//
-//     Fd server_fd = std::move(*listener);
-//     std::size_t next_worker = 1;
-//
-//     while (!st.stop_requested())
-//     {
-//         auto client_res = co_await dispatcher.accept(server_fd);
-//         if (!client_res)
-//         {
-//             co_return std::unexpected(client_res.error());
-//         }
-//
-//         const std::size_t worker_count = ctx.worker_count();
-//         // Dispatch to workers 1..N (round-robin)
-//         const std::size_t target_idx = worker_count > 1 ? 1 + ((next_worker++ - 1) % (worker_count - 1)) : 0;
-//
-//         IO& target = ctx.worker(target_idx);
-//
-//         // Option 1: Direct scheduling on target worker (Thread-safe)
-//         target.schedule(handle_client(target, std::move(*client_res)));
-//
-//         /*
-//         // Option 2: Using TransferTo (Demonstration)
-//         usage: co_await io.schedule_on(other);
-//         */
-//     }
-//     co_return {};
-// }
-
 int main()
 {
     // Update ALOG namespace based on new logging
@@ -175,8 +131,8 @@ int main()
         threads.emplace_back(
             [i, port, st]
             {
-                tinyio::IoOptions opts;
-                tinyio::IO worker(i, opts, {});
+                IoOptions opts;
+                IO worker(i, opts, {});
 
                 // Spawn the initial accept loop fiber onto this worker
                 (void)worker.spawn(
