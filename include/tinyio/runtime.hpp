@@ -368,7 +368,6 @@ public:
 private:
     static constexpr uint64_t kWakeupSentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
     static constexpr uint64_t kFiberCancelSentinel = 0xDEAD'C0DE'DEAD'C0CCULL;
-    static constexpr size_t kMaxResumesPerTick = 128;
     //
     // IO Uring management
     //

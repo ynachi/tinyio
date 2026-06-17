@@ -61,8 +61,7 @@ public:
     /// completes before its deadline (the overwhelmingly common case).
     void disarm(fiber::Fiber* f) noexcept
     {
-        auto* hook = static_cast<IntrusiveHook<TimerTag>*>(f);
-        if (!hook->is_linked())
+        if (const auto* hook = static_cast<IntrusiveHook<TimerTag>*>(f); !hook->is_linked())
         {
             return;
         }
@@ -122,6 +121,7 @@ public:
         {
             return std::nullopt;
         }
+
         const uint64_t cur = now_ns / kTickNs;
         for (uint64_t off = 0; off < kSlots; ++off)
         {
@@ -133,7 +133,9 @@ public:
                 return target > now_ns ? target - now_ns : 0;
             }
         }
-        return std::nullopt;  // unreachable while armed_ > 0
+
+        // unreachable while armed_ > 0
+        return std::nullopt;
     }
 
 private:

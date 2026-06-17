@@ -23,18 +23,18 @@ void SegmentManager::prepare_write(std::span<const std::byte> key, std::span<con
     payload_crc = XXH3_64bits_digest(state);
 }
 
-URing::Task<uint64_t> SegmentManager::append(URing::IO& io, std::span<const std::byte> key,
-                                             std::span<const std::byte> value, const EntryFlags flags)
+tinyio::Result<uint64_t> SegmentManager::append(tinyio::IO& io, std::span<const std::byte> key,
+                                                std::span<const std::byte> value, const EntryFlags flags)
 {
     if (auto fast_res = try_append_buffered_fast(key, value, flags); fast_res.has_value()) [[likely]]
     {
-        co_return *fast_res;
+        return *fast_res;
     }
 
     // ensure active file
     if (!active_segment_.has_value())
     {
-        URING_TRY_VOID(co_await create_active(io));
+        TRY_LOG_ERR(create_active(io), "failed to create active segment");
     }
 
     const uint64_t total_entry_size = sizeof(LogEntryHeader) + key.size() + value.size() + sizeof(uint64_t);
@@ -43,31 +43,31 @@ URing::Task<uint64_t> SegmentManager::append(URing::IO& io, std::span<const std:
     if (cfg_.durability == Durability::SyncOnWrite || total_entry_size > cfg_.flush_buffer_size)
     {
         // flush first
-        URING_TRY_VOID(co_await flush(io));
+        TRY_LOG_ERR(flush(io), "unable to flush active segment");
 
         LogEntryHeader hdr{};
         uint64_t payload_crc{};
         prepare_write(key, value, flags, hdr, payload_crc);
 
-        URING_TRY(uint64_t entry_offset, co_await append_direct(io, key, value, hdr, payload_crc));
+        uint64_t entry_offset = TRY(append_direct(io, key, value, hdr, payload_crc));
 
         if (next_disk_offset_ + next_buf_offset_ >= cfg_.max_segment_size)
         {
-            URING_TRY_VOID(co_await rotate(io));
+            TRY(rotate(io));
         }
 
         if (cfg_.durability == Durability::SyncOnWrite)
         {
-            URING_TRY_VOID(co_await io.fsync(*active_segment_, /*datasync=*/true));
+            TRY(io.fsync(*active_segment_, /*datasync=*/true));
         }
 
-        co_return entry_offset;
+        return entry_offset;
     }
 
     // ensure active buffer
     if (!write_buffer_.has_value())
     {
-        URING_TRY(auto buf, io.take_fixed_buffer(cfg_.flush_buffer_size));
+        auto buf = TRY(io.take_fixed_buffer(cfg_.flush_buffer_size));
         write_buffer_.emplace(std::move(buf));
     }
 
@@ -75,13 +75,13 @@ URing::Task<uint64_t> SegmentManager::append(URing::IO& io, std::span<const std:
     // space
     if (next_buf_offset_ + total_entry_size > cfg_.flush_buffer_size)
     {
-        URING_TRY_VOID(co_await flush(io));
+        TRY(flush(io));
     }
 
-    co_return append_buffered_ready(key, value, flags, total_entry_size);
+    return append_buffered_ready(key, value, flags, total_entry_size);
 }
 
-bool SegmentManager::serve_from_buffer(URing::FixedBuffer& out, const uint64_t offset, const size_t len)
+bool SegmentManager::serve_from_buffer(tinyio::FixedBuffer& out, const uint64_t offset, const size_t len)
 {
     if (!should_read_from_buffer(offset, len))
     {
@@ -99,9 +99,9 @@ bool SegmentManager::should_read_from_buffer(const uint64_t offset, const size_t
     return write_buffer_.has_value() && offset >= next_disk_offset_ && offset + len <= buffer_end;
 }
 
-URing::Task<uint64_t> SegmentManager::append_direct(URing::IO& io, std::span<const std::byte> key,
-                                                    std::span<const std::byte> value, LogEntryHeader& hdr,
-                                                    uint64_t payload_crc)
+tinyio::Result<uint64_t> SegmentManager::append_direct(tinyio::IO& io, std::span<const std::byte> key,
+                                                       std::span<const std::byte> value, LogEntryHeader& hdr,
+                                                       uint64_t payload_crc)
 {
     std::array<iovec, 4> iovs = {
         {{&hdr, sizeof(hdr)},
@@ -111,22 +111,17 @@ URing::Task<uint64_t> SegmentManager::append_direct(URing::IO& io, std::span<con
     };
 
     const uint64_t entry_offset = next_disk_offset_;
-    auto write_res = co_await io.writev(*active_segment_, iovs, static_cast<off_t>(entry_offset));
-    if (!write_res.has_value()) [[unlikely]]
-    {
-        co_return std::unexpected(write_res.error());
-    }
+    auto bytes_written = TRY(io.writev(*active_segment_, iovs, static_cast<off_t>(entry_offset)));
 
-    const auto bytes_written = *write_res;
-    if (bytes_written != static_cast<int32_t>(hdr.total_size()))
+    if (bytes_written != hdr.total_size())
     {
         // Handle partial write (though rare in io_uring with O_DIRECT/Regular files)
-        co_return std::unexpected(URing::make_error_code(EIO));
+        return tinyio::fail(EIO, "bitcask.append");
     }
 
     next_disk_offset_ += bytes_written;
 
-    co_return entry_offset;
+    return entry_offset;
 }
 
 uint64_t SegmentManager::copy_to_buffer(std::span<const std::byte> key, std::span<const std::byte> value,
@@ -197,30 +192,27 @@ std::optional<uint64_t> SegmentManager::try_append_buffered_fast(std::span<const
     return append_buffered_ready(key, value, flags, total_entry_size);
 }
 
-URing::Task<void> SegmentManager::flush(URing::IO& io)
+tinyio::Result<void> SegmentManager::flush(tinyio::IO& io)
 {
     if (!write_buffer_.has_value() || next_buf_offset_ == 0)
     {
-        co_return {};
+        return {};
     }
 
-    auto res = co_await io.write_fixed(*active_segment_, *write_buffer_, next_buf_offset_, next_disk_offset_);
-    if (!res)
-    {
-        co_return std::unexpected(res.error());
-    }
-    next_disk_offset_ += res.value();
+    const auto res = TRY(io.write_fixed(*active_segment_, *write_buffer_, next_buf_offset_, next_disk_offset_));
+
+    next_disk_offset_ += res;
     // TODO: we might want to clear the buffer does we ?
     next_buf_offset_ = 0;
 
-    co_return {};
+    return {};
 }
 
-URing::Task<void> SegmentManager::value_into(URing::IO& io, URing::FixedBuffer& buf, ValueLocation& loc)
+tinyio::Result<void> SegmentManager::value_into(tinyio::IO& io, tinyio::FixedBuffer& buf, ValueLocation& loc)
 {
     if (loc.segment_id == active_segment_id_ && serve_from_buffer(buf, loc.value_offset, loc.value_len))
     {
-        co_return {};
+        return {};
     }
 
     auto fd = ro_fd_cache_.get(loc.segment_id);
@@ -228,28 +220,18 @@ URing::Task<void> SegmentManager::value_into(URing::IO& io, URing::FixedBuffer& 
     if (!fd.has_value()) [[unlikely]]
     {
         // We only suspend for the OPEN if we actually missed the cache.
-        auto open_res = co_await open_and_cache_fd(io, loc.segment_id);
-        if (!open_res.has_value()) [[unlikely]]
-        {
-            co_return std::unexpected(open_res.error());
-        }
-        fd = *open_res;
+        fd = TRY(open_and_cache_fd(io, loc.segment_id));
     }
 
-    auto read_res = co_await io.read_fixed(*fd->get(), buf, loc.value_len, loc.value_offset);
-    if (!read_res.has_value()) [[unlikely]]
+    auto bytes_read = TRY(io.read_fixed(*fd->get(), buf, loc.value_len, loc.value_offset));
+
+    if (bytes_read != loc.value_len)
     {
-        co_return std::unexpected(read_res.error());
-    }
-    auto res = *read_res;
-
-    if (res != static_cast<int32_t>(loc.value_len))
-    {
-        ALOG_ERROR("Short read from segment {}: expected {}, got {}", loc.segment_id, loc.value_len, res);
-        co_return std::unexpected(URing::error_from_errc(std::errc::io_error));
+        ALOG_ERROR("Short read from segment {}: expected {}, got {}", loc.segment_id, loc.value_len, bytes_read);
+        return tinyio::fail(EIO, "bitcask.append");
     }
 
-    co_return {};
+    return {};
 }
 
 // TODO: ia badly generetad, rewrite.

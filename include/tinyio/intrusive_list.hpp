@@ -75,7 +75,7 @@ public:
 
 private:
     IntrusiveHook<Tag> dummy_;
-    std::size_t size_ = 0;
+    [[no_unique_address]] std::size_t size_ = 0;
 
     static IntrusiveHook<Tag>* get_hook(T* node) noexcept
     {

@@ -68,6 +68,7 @@ void run_probes(IO& io) noexcept
         }
     }
 
+    // everyone wait here, the line completed before we move on
     if (auto res = probes.wait(); !res)
     {
         ALOG_ERROR("probe group interrupted: {}", res.error());
