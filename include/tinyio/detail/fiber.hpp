@@ -1,10 +1,7 @@
 #pragma once
 #include "tinyio/intrusive_list.hpp"
 
-#include <cstdint>
 #include <functional>
-
-#include <linux/time_types.h>
 
 #include "context.hpp"
 #include "sanitizer_hooks.hpp"
@@ -65,7 +62,7 @@ struct Operation
 
     /// Persists timeout structs in user-space. io_uring requires this struct to
     /// remain valid in memory until the timeout operation completes in the kernel.
-    __kernel_timespec timeout_ts{};
+    timespec timeout_ts{};
 
     /// Absolute CLOCK_MONOTONIC deadline (ns) while this op is armed in the
     /// runtime's TimerWheel; 0 when no timeout is attached.

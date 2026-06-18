@@ -1003,7 +1003,14 @@ Result<void> IO::sleep_for_ns(const std::chrono::nanoseconds duration) noexcept
                                auto& ts = current_fiber_->operation.timeout_ts;
                                ts.tv_sec = ns / 1'000'000'000LL;
                                ts.tv_nsec = ns % 1'000'000'000LL;
-                               io_uring_prep_timeout(sqe, &ts, 0U, 0U);
+
+                               // Both structs have two 64-bit signed integers (tv_sec, tv_nsec) on 64-bit systems.
+                               static_assert(sizeof(struct timespec) == sizeof(__kernel_timespec),
+                                             "POSIX timespec and __kernel_timespec size mismatch");
+
+                               const auto* kts = reinterpret_cast<__kernel_timespec*>(&ts);
+
+                               io_uring_prep_timeout(sqe, kts, 0U, 0U);
                            });
 
     if (!r && r.error().code == ETIME)
