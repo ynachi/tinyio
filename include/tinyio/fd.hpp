@@ -9,30 +9,33 @@ namespace tinyio
 struct Fd
 {
     int fd = -1;
+    bool direct = false;
+    void* io_ptr = nullptr;
 
     Fd() = default;
     explicit Fd(const int f) : fd(f) {}
     ~Fd()
     {
-        if (fd >= 0)
-        {
-            ::close(fd);
-            fd = -1;
-        }
+        close_impl();
     }
 
-    Fd(Fd&& other) noexcept : fd(other.fd) { other.fd = -1; }
+    Fd(Fd&& other) noexcept : fd(other.fd), direct(other.direct), io_ptr(other.io_ptr) { 
+        other.fd = -1; 
+        other.direct = false;
+        other.io_ptr = nullptr;
+    }
 
     Fd& operator=(Fd&& other) noexcept
     {
         if (this != &other)
         {
-            if (fd >= 0)
-            {
-                ::close(fd);
-            }
+            close_impl();
             fd = other.fd;
+            direct = other.direct;
+            io_ptr = other.io_ptr;
             other.fd = -1;
+            other.direct = false;
+            other.io_ptr = nullptr;
         }
         return *this;
     }
@@ -40,19 +43,26 @@ struct Fd
     Fd(const Fd&) = delete;
     Fd& operator=(const Fd&) = delete;
 
-    /// @brief Get the raw file descriptor.
+    /// @brief Get the raw file descriptor or direct idx.
     [[nodiscard]] int get() const noexcept { return fd; }
 
     /// @brief Check if the descriptor is valid.
     [[nodiscard]] bool is_valid() const noexcept { return fd >= 0; }
+
+    /// @brief Check if it's a direct descriptor.
+    [[nodiscard]] bool is_direct() const noexcept { return direct; }
 
     /// @brief Release ownership to the caller.
     [[nodiscard]] int release() noexcept
     {
         const int out = fd;
         fd = -1;
+        direct = false;
+        io_ptr = nullptr;
         return out;
     }
+
+    void close_impl() noexcept;
 
     /// Single option
     /// @code

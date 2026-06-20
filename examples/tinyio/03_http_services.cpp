@@ -131,7 +131,7 @@ int main()
         threads.emplace_back(
             [i, port, st]
             {
-                IoOptions opts;
+                IoOptions opts{.sq_entries = 4096};
                 IO worker(i, opts, {});
 
                 // Spawn the initial accept loop fiber onto this worker

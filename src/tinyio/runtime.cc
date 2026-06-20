@@ -77,6 +77,15 @@ IO::~IO() noexcept
         ALOG_INFO("unregistered buffers, worker: {}", id_);
     }
 
+    if (ring_.ring_fd > 0 && !direct_fds_.empty())
+    {
+        if (const int ret = io_uring_unregister_files(&ring_); ret < 0)
+        {
+            ALOG_ERROR("Failed to unregister files: {}", std::strerror(-ret));
+        }
+        ALOG_INFO("unregistered files, worker: {}", id_);
+    }
+
     if (ring_.ring_fd > 0)
     {
         io_uring_queue_exit(&ring_);
@@ -142,6 +151,16 @@ Result<void> IO::initialize() noexcept
         ALOG_INFO("the buffer pool have been registered to io_uring");
     }
 
+    if (opts_.direct_fd_table_size > 0)
+    {
+        direct_fds_.resize(opts_.direct_fd_table_size, -1);
+        if (const int ret = io_uring_register_files(&ring_, direct_fds_.data(), direct_fds_.size()); ret < 0)
+        {
+            return fail(-ret, "io_uring_register_files");
+        }
+        ALOG_INFO("registered direct fd table of size {}", opts_.direct_fd_table_size);
+    }
+
     ALOG_INFO("Initialized IO context with {} submission entries (SQPOLL: {})", opts_.sq_entries,
               (opts_.additional_uring_flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
 
@@ -173,6 +192,90 @@ Result<void> IO::unregister_buffers() noexcept
     }
     return {};
 }
+
+void Fd::close_impl() noexcept
+{
+    if (fd < 0) return;
+    if (direct && io_ptr)
+    {
+        static_cast<IO*>(io_ptr)->unregister_direct_fd(fd);
+    }
+    else if (!direct)
+    {
+        ::close(fd);
+    }
+    fd = -1;
+    direct = false;
+    io_ptr = nullptr;
+}
+
+
+Result<Fd> IO::register_file(Fd fd) noexcept
+{
+    if (!fd.is_valid() || fd.is_direct()) return fd;
+
+    if (direct_fds_.empty()) return fd;
+
+    auto it = std::find(direct_fds_.begin() + next_free_direct_idx_, direct_fds_.end(), -1);
+    if (it == direct_fds_.end()) return fd;
+
+    int idx = std::distance(direct_fds_.begin(), it);
+    int raw_fd = fd.get();
+    
+    if (const int ret = io_uring_register_files_update(&ring_, idx, &raw_fd, 1); ret < 0)
+    {
+        return fd;
+    }
+
+    direct_fds_[idx] = raw_fd;
+    next_free_direct_idx_ = idx + 1;
+    direct_fds_cnt_++;
+
+    ::close(fd.release()); // raw kernel fd is consumed
+
+    Fd direct_fd(idx);
+    direct_fd.direct = true;
+    direct_fd.io_ptr = this;
+    return direct_fd;
+}
+
+void IO::unregister_direct_fd(int direct_idx) noexcept
+{
+    if (direct_idx < 0 || static_cast<size_t>(direct_idx) >= direct_fds_.size()) return;
+    
+    int empty_fd = -1;
+    if (const int ret = io_uring_register_files_update(&ring_, direct_idx, &empty_fd, 1); ret >= 0)
+    {
+        direct_fds_[direct_idx] = -1;
+        direct_fds_cnt_--;
+        if (static_cast<uint32_t>(direct_idx) < next_free_direct_idx_)
+        {
+            next_free_direct_idx_ = direct_idx;
+        }
+    }
+}
+
+Result<void> IO::close(int fd) noexcept
+{
+    return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd); });
+}
+
+Result<void> IO::close(Fd fd) noexcept
+{
+    if (!fd.is_valid()) return {};
+
+    if (fd.is_direct())
+    {
+        unregister_direct_fd(fd.get());
+        fd.release();
+        return {};
+    }
+    else
+    {
+        return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd.release()); });
+    }
+}
+
 
 //
 // Fiber management
@@ -460,9 +563,9 @@ Result<void> IO::submit_or_wait_for() noexcept
     }
     else
     {
-        // Sleep until a CQE arrives, the eventfd is written, or the nearest
-        // armed wheel deadline passes. The bound is a syscall argument
-        // (IORING_ENTER_EXT_ARG) - no timeout SQE exists anywhere.
+    // Sleep until a CQE arrives, the eventfd is written, or the nearest
+    // armed wheel deadline passes. The bound is a syscall argument
+    // (IORING_ENTER_EXT_ARG) - no timeout SQE exists anywhere.
         __kernel_timespec ts{};
         __kernel_timespec* tsp = nullptr;
         if (const auto ns = timer_wheel_.ns_until_next(detail::monotonic_now_ns()); ns.has_value())
@@ -809,13 +912,19 @@ void IO::run_until_done() noexcept
 
 Result<uint32_t> IO::read(const Fd& fd, const std::span<std::byte> buf, const off_t offset) noexcept
 {
-    return syscall("read", [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
+    return syscall("read", [&](io_uring_sqe* sqe) { 
+        io_uring_prep_read(sqe, fd.get(), buf.data(), buf.size(), offset); 
+        if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+    });
 }
 
 Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const size_t len, const off_t offset) noexcept
 {
     return syscall("read_fixed", [&](io_uring_sqe* sqe)
-                   { io_uring_prep_read_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
+                   { 
+                       io_uring_prep_read_fixed(sqe, fd.get(), buf.ptr(), len, offset, buf.index()); 
+                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                   });
 }
 
 Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const off_t offset) noexcept
@@ -826,13 +935,19 @@ Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const off_t offs
 Result<uint32_t> IO::writev(const Fd& fd, std::span<const iovec> iovecs, const off_t offset) noexcept
 {
     return syscall("writev",
-                   [&](io_uring_sqe* sqe) { io_uring_prep_writev(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
+                   [&](io_uring_sqe* sqe) { 
+                       io_uring_prep_writev(sqe, fd.get(), iovecs.data(), iovecs.size(), offset); 
+                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                   });
 }
 
 Result<void> IO::fsync(const Fd& fd, const bool datasync) noexcept
 {
     return syscall<void>(
-        "fsync", [&](io_uring_sqe* sqe) { io_uring_prep_fsync(sqe, fd.fd, datasync ? IORING_FSYNC_DATASYNC : 0); });
+        "fsync", [&](io_uring_sqe* sqe) { 
+            io_uring_prep_fsync(sqe, fd.get(), datasync ? IORING_FSYNC_DATASYNC : 0); 
+            if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+        });
 }
 
 Result<Fd> IO::open(const std::filesystem::path& path, const int flags, const mode_t mode) noexcept
@@ -841,22 +956,21 @@ Result<Fd> IO::open(const std::filesystem::path& path, const int flags, const mo
                        [&](io_uring_sqe* sqe) { io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode); });
 }
 
-Result<void> IO::close(Fd&& fd) noexcept
-{
-    // Nullify so Fd destructor doesn't close it twice
-    int raw_fd = fd.release();
-    return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, raw_fd); });
-}
-
 Result<void> IO::fallocate(const Fd& fd, const int mode, const off_t offset, const off_t len) noexcept
 {
     return syscall<void>("fallocate",
-                         [&](io_uring_sqe* sqe) { io_uring_prep_fallocate(sqe, fd.fd, mode, offset, len); });
+                         [&](io_uring_sqe* sqe) { 
+                             io_uring_prep_fallocate(sqe, fd.get(), mode, offset, len); 
+                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                         });
 }
 
 Result<void> IO::ftruncate(const Fd& fd, const off_t len) noexcept
 {
-    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.fd, len); });
+    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { 
+        io_uring_prep_ftruncate(sqe, fd.get(), len); 
+        if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+    });
 }
 
 Result<Fd> IO::accept(const Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
@@ -865,27 +979,37 @@ Result<Fd> IO::accept(const Fd& server_fd, SocketAddress& client_addr, int flags
                        [&](io_uring_sqe* sqe)
                        {
                            client_addr.addrlen = sizeof(sockaddr_storage);
-                           io_uring_prep_accept(sqe, server_fd.fd, client_addr.get_mutable(), &client_addr.addrlen,
+                           io_uring_prep_accept(sqe, server_fd.get(), client_addr.get_mutable(), &client_addr.addrlen,
                                                 flags);
+                           if (server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
                        });
 }
 
 Result<Fd> IO::accept(const Fd& server_fd, const int flags) noexcept
 {
     return syscall<Fd>("accept",
-                       [&](io_uring_sqe* sqe) { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
+                       [&](io_uring_sqe* sqe) { 
+                           io_uring_prep_accept(sqe, server_fd.get(), nullptr, nullptr, flags); 
+                           if (server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                       });
 }
 
 Result<uint32_t> IO::write(const Fd& fd, std::span<const std::byte> buf, const off_t offset) noexcept
 {
     return syscall("write",
-                   [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
+                   [&](io_uring_sqe* sqe) { 
+                       io_uring_prep_write(sqe, fd.get(), buf.data(), buf.size(), offset); 
+                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                   });
 }
 
 Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const size_t len, const off_t offset) noexcept
 {
     return syscall("write_fixed", [&](io_uring_sqe* sqe)
-                   { io_uring_prep_write_fixed(sqe, fd.fd, buf.ptr(), len, offset, buf.index()); });
+                   { 
+                       io_uring_prep_write_fixed(sqe, fd.get(), buf.ptr(), len, offset, buf.index()); 
+                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                   });
 }
 
 Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const off_t offset) noexcept
@@ -896,7 +1020,10 @@ Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const off
 Result<uint32_t> IO::readv(const Fd& fd, std::span<const iovec> iovecs, const off_t offset) noexcept
 {
     return syscall("readv",
-                   [&](io_uring_sqe* sqe) { io_uring_prep_readv(sqe, fd.fd, iovecs.data(), iovecs.size(), offset); });
+                   [&](io_uring_sqe* sqe) { 
+                       io_uring_prep_readv(sqe, fd.get(), iovecs.data(), iovecs.size(), offset); 
+                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                   });
 }
 
 Result<void> IO::remove(const std::filesystem::path& path) noexcept
@@ -912,13 +1039,19 @@ Result<void> IO::rename(const std::filesystem::path& from, const std::filesystem
 
 Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask) noexcept
 {
-    return syscall("poll", [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
+    return syscall("poll", [&](io_uring_sqe* sqe) { 
+        io_uring_prep_poll_add(sqe, fd.get(), poll_mask); 
+        if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+    });
 }
 
 Result<void> IO::connect(const Fd& fd, const SocketAddress& addr) noexcept
 {
     return syscall<void>("connect",
-                         [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.get(), addr.addrlen); });
+                         [&](io_uring_sqe* sqe) { 
+                             io_uring_prep_connect(sqe, fd.get(), addr.get(), addr.addrlen); 
+                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                         });
 }
 
 void IO::process_expired_timers() noexcept
@@ -961,32 +1094,47 @@ Result<uint32_t> IO::read(const Fd& fd, const std::span<std::byte> buf, const st
                           const off_t offset) noexcept
 {
     return syscall_timed("read_timed", timeout,
-                         [&](io_uring_sqe* sqe) { io_uring_prep_read(sqe, fd.fd, buf.data(), buf.size(), offset); });
+                         [&](io_uring_sqe* sqe) { 
+                             io_uring_prep_read(sqe, fd.get(), buf.data(), buf.size(), offset); 
+                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                         });
 }
 
 Result<uint32_t> IO::write(const Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
                            const off_t offset) noexcept
 {
     return syscall_timed("write_timed", timeout,
-                         [&](io_uring_sqe* sqe) { io_uring_prep_write(sqe, fd.fd, buf.data(), buf.size(), offset); });
+                         [&](io_uring_sqe* sqe) { 
+                             io_uring_prep_write(sqe, fd.get(), buf.data(), buf.size(), offset); 
+                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                         });
 }
 
 Result<Fd> IO::accept(const Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
 {
     return syscall_timed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe)
-                             { io_uring_prep_accept(sqe, server_fd.fd, nullptr, nullptr, flags); });
+                             { 
+                                 io_uring_prep_accept(sqe, server_fd.get(), nullptr, nullptr, flags); 
+                                 if (server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                             });
 }
 
 Result<void> IO::connect(const Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed<void>("connect_timed", timeout,
-                               [&](io_uring_sqe* sqe) { io_uring_prep_connect(sqe, fd.fd, addr.get(), addr.addrlen); });
+                               [&](io_uring_sqe* sqe) { 
+                                   io_uring_prep_connect(sqe, fd.get(), addr.get(), addr.addrlen); 
+                                   if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                               });
 }
 
 Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
 {
     return syscall_timed("poll_timed", timeout,
-                         [&](io_uring_sqe* sqe) { io_uring_prep_poll_add(sqe, fd.fd, poll_mask); });
+                         [&](io_uring_sqe* sqe) { 
+                             io_uring_prep_poll_add(sqe, fd.get(), poll_mask); 
+                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+                         });
 }
 
 Result<void> IO::sleep_for_ns(const std::chrono::nanoseconds duration) noexcept

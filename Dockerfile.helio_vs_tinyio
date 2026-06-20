@@ -1,0 +1,75 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc-14 g++-14 \
+    cmake \
+    pkg-config \
+    liburing-dev \
+    libgflags-dev \
+    libboost-context-dev \
+    libssl-dev \
+    curl \
+    git \
+    ninja-build \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CC=gcc-14
+ENV CXX=g++-14
+
+# Install oha based on architecture
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+        curl -L https://github.com/hatoo/oha/releases/latest/download/oha-linux-arm64 -o /usr/local/bin/oha; \
+    else \
+        curl -L https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64 -o /usr/local/bin/oha; \
+    fi && \
+    chmod +x /usr/local/bin/oha
+
+WORKDIR /app
+
+# Copy project files
+COPY . /app
+
+# Build the tinyio benchmark
+RUN rm -rf build && mkdir -p build && cd build && cmake -DTIO_BUILD_BENCHMARK=ON -DCMAKE_BUILD_TYPE=Release .. && make tinyio_http_bench -j$(nproc)
+
+# Clone helio
+RUN git clone https://github.com/romange/helio.git /app/helio
+# Copy the helio_echo_server.cc we have locally which has TinyioHttpConnection
+RUN cp /app/helio_echo_server.cc /app/helio/examples/echo_server.cc
+# Edit the response to match tinyio exactly
+RUN sed -i 's/"Content-Length: 13\\r\\n"/"Content-Length: 16\\r\\n"/g' /app/helio/examples/echo_server.cc
+RUN sed -i 's/"Hello, World!"/"Hello, io_uring!"/g' /app/helio/examples/echo_server.cc
+
+# Build helio
+RUN cd /app/helio && ./install-dependencies.sh && ./blaze.sh -release && cd build-opt && ninja -j$(nproc) echo_server
+
+# Create the benchmark runner script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "=========================================================="\n\
+echo " Benchmarking tinyio"\n\
+echo "=========================================================="\n\
+/app/build/benchmarks/cpp/tinyio_http_bench --port=8081 --workers=4 &\n\
+TINYIO_PID=$!\n\
+sleep 2\n\
+oha -m GET -z 10s -c 1000 http://127.0.0.1:8081/\n\
+kill $TINYIO_PID\n\
+sleep 2\n\
+echo "=========================================================="\n\
+echo " Benchmarking helio"\n\
+echo "=========================================================="\n\
+/app/helio/build-opt/examples/echo_server --http_port=8082 --threads=4 &\n\
+HELIO_PID=$!\n\
+sleep 2\n\
+oha -m GET -z 10s -c 1000 http://127.0.0.1:8082/\n\
+kill $HELIO_PID\n\
+sleep 2\n\
+echo "Benchmark complete!"\n\
+' > /app/run_helio_bench.sh && chmod +x /app/run_helio_bench.sh
+
+CMD ["/app/run_helio_bench.sh"]

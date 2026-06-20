@@ -13,6 +13,9 @@ tio_add_sanitizers(01_hello_echo)
 tio_add_demo(04_echo_client tinyio/04_echo_client.cc TAGS core LIBS gflags::gflags tinyio)
 tio_add_sanitizers(04_echo_client)
 
+tio_add_demo(05_bench_io tinyio/05_bench_io.cpp TAGS core LIBS gflags::gflags tinyio)
+tio_add_sanitizers(05_bench_io)
+
 # Create a custom target to build all examples
 add_custom_target(examples
         DEPENDS
@@ -20,6 +23,7 @@ add_custom_target(examples
         02_fanout
         03_http_services
         04_echo_client
+        05_bench_io
 )
 
 message(STATUS "  Examples will be installed to: ${CMAKE_INSTALL_PREFIX}/bin/examples")

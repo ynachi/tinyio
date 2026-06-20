@@ -24,7 +24,7 @@ namespace tinyio
 
 /// Default io uring flag
 static constexpr unsigned kUringDefaultAdditionalFlag =
-    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN;
+    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
 
 /// These are mandatory base flags
 static constexpr unsigned kUringBaseFlags = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_R_DISABLED;
@@ -57,6 +57,9 @@ struct IoOptions
 
     /// Capacity for the cross-thread post queue (must be power of 2)
     std::size_t post_queue_capacity = 4096;
+
+    /// Direct FD table size (0 to disable)
+    std::uint32_t direct_fd_table_size = 1024;
 
     // Liburing auto wakeup the kernel thread so no need to manually do it
     /// IORING_SETUP_DEFER_TASKRUN is not compatible to SQ_POLL
@@ -306,9 +309,19 @@ public:
     /// close CQE returns an error.  Callers should use std::move:
     ///
     /// @code
-    /// TRY(fio.close(std::move(fd)));
-    /// @endcode
-    [[nodiscard]] Result<void> close(Fd&& fd) noexcept;
+    /// @brief Manually close a raw file descriptor via io_uring.
+    [[nodiscard]] Result<void> close(int fd) noexcept;
+
+    /// @brief Close an Fd via io_uring. Unregisters if it's a direct Fd.
+    [[nodiscard]] Result<void> close(Fd fd) noexcept;
+
+    /// @brief Registers an Fd as a direct file descriptor to bypass kernel FD lookup overhead.
+    /// The input fd is consumed. The resulting Fd will have `is_direct()` true.
+    [[nodiscard]] Result<Fd> register_file(Fd fd) noexcept;
+
+    /// @brief Internal: Unregister a direct FD immediately (synchronous syscall).
+    void unregister_direct_fd(int direct_idx) noexcept;
+
 
     /// Remove (unlink) the file at @p path.
     [[nodiscard]] Result<void> remove(const std::filesystem::path& path) noexcept;
@@ -514,6 +527,12 @@ private:
     //
     int wake_fd_{-1};
     uint64_t wake_value_{0};
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tq_wakeup_ev_{0};
+
+    // Direct FD Table Management
+    std::vector<int> direct_fds_;
+    uint32_t direct_fds_cnt_ = 0;
+    uint32_t next_free_direct_idx_ = 0;
 
     //
     // Lifecycle
