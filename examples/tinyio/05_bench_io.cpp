@@ -66,19 +66,8 @@ Result<void> handle_client(IO& fio, Fd client_fd, const std::string& filename) n
         auto r_n = TRY(fio.read(client_fd, std::span{buf}));
         if (r_n == 0) break;
         
-        auto file_fd = TRY(fio.open(filename, O_RDONLY));
-        const std::string header = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n";
-        if (!fio.write(client_fd, std::span{reinterpret_cast<const std::byte*>(header.data()), header.size()})) break;
-        
-        off_t offset = 0;
-        while (true) {
-            auto file_n_res = fio.read(file_fd, std::span{buf}, offset);
-            if (!file_n_res || *file_n_res == 0) break;
-            
-            if (!fio.write(client_fd, std::span{buf}.subspan(0, *file_n_res))) break;
-            offset += *file_n_res;
-        }
-        TRY(fio.close(std::move(file_fd)));
+        const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
+        if (!fio.write(client_fd, std::span{reinterpret_cast<const std::byte*>(response.data()), response.size()})) break;
     }
     return {};
 }
@@ -87,13 +76,11 @@ Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st, const std::
     auto server_fd = TRY_LOG_ERR(TcpListener::bind(port, "0.0.0.0", 4096), "bind");
     ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
 
-    while (!st.stop_requested()) {
-        auto client_fd = TRY_LOG_ERR(fio.accept(server_fd), "accept");
-        (void)fio.spawn([client_fd = std::move(client_fd), filename](IO& worker_fio) mutable noexcept {
-            (void)handle_client(worker_fio, std::move(client_fd), filename);
-        });
-    }
-    return {};
+    return fio.accept_loop(std::move(server_fd), [filename](IO& worker_fio, Result<Fd> client_fd) noexcept {
+        if (client_fd) {
+            (void)handle_client(worker_fio, std::move(*client_fd), filename);
+        }
+    });
 }
 
 int main(int argc, char* argv[]) {

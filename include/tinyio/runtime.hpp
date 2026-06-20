@@ -303,6 +303,12 @@ public:
     /// @return An owned Fd on success, or an error code.
     [[nodiscard]] Result<Fd> accept(const Fd& server_fd, int flags = kDefaultAcceptFlags) noexcept;
 
+    /// Accept connections in a continuous background loop using IORING_ACCEPT_MULTISHOT.
+    /// Every accepted connection will automatically spawn a new fiber executing @p handler.
+    template <class Fn>
+        requires std::constructible_from<std::move_only_function<void(IO&, Result<Fd>) noexcept>, Fn>
+    [[nodiscard]] Result<void> accept_loop(Fd server_fd, Fn&& handler) noexcept;
+
     /// Close @p fd asynchronously via io_uring.
     ///
     /// Takes ownership of @p fd so that it is released exactly once even if the
@@ -393,6 +399,13 @@ private:
     Result<void> tick() noexcept;
     Result<void> arm_wake_read() noexcept;
     void wake() const noexcept;
+
+    struct MultishotAcceptState {
+        Fd server_fd;
+        std::move_only_function<void(IO&, Result<Fd>) noexcept> handler;
+    };
+    std::vector<uint64_t> active_multishots_;
+
     Result<std::size_t> drain_completions() noexcept;
     void drain_remote();
     void resume_ready_fibers();
@@ -596,4 +609,33 @@ private:
 
     void pin_to_cpu() const;
 };
+
+template <class Fn>
+    requires std::constructible_from<std::move_only_function<void(IO&, Result<Fd>) noexcept>, Fn>
+[[nodiscard]] Result<void> IO::accept_loop(Fd server_fd, Fn&& handler) noexcept
+{
+    if (stopping_) return fail(ECANCELED, "accept_loop");
+    if (!server_fd.is_valid()) return fail(EBADF, "accept_loop: invalid fd");
+
+    auto* state = new (std::nothrow) MultishotAcceptState{std::move(server_fd), std::forward<Fn>(handler)};
+    if (!state) return fail(ENOMEM, "accept_loop: OOM allocating state");
+
+    auto* sqe = get_sqe().value_or(nullptr);
+    if (!sqe) {
+        delete state;
+        return fail(EAGAIN, "accept_loop: ring full");
+    }
+
+    io_uring_prep_multishot_accept(sqe, state->server_fd.get(), nullptr, nullptr, 0);
+    if (state->server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
+
+    // Tag the lowest bit to indicate a MultishotAcceptState
+    uint64_t tagged_ptr = reinterpret_cast<uint64_t>(state) | 1ULL;
+    io_uring_sqe_set_data64(sqe, tagged_ptr);
+    active_multishots_.push_back(tagged_ptr);
+
+    inflight_ops_++;
+    return {};
+}
+
 }  // namespace tinyio

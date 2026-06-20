@@ -267,7 +267,7 @@ Result<void> IO::close(Fd fd) noexcept
     if (fd.is_direct())
     {
         unregister_direct_fd(fd.get());
-        fd.release();
+        (void)fd.release();
         return {};
     }
     else
@@ -498,6 +498,21 @@ void IO::cancel_and_drain() noexcept
             issued_cancels = true;
         });
 
+    for (uint64_t tagged_ptr : active_multishots_)
+    {
+        auto res = get_sqe();
+        if (!res)
+        {
+            ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
+            continue;
+        }
+        io_uring_prep_cancel64(res.value(), tagged_ptr, 0);
+        io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
+        ++inflight_ops_;
+        issued_cancels = true;
+    }
+    active_multishots_.clear();
+
     if (issued_cancels)
     {
         io_uring_submit(&ring_);
@@ -680,7 +695,36 @@ Result<std::size_t> IO::drain_completions() noexcept
     {
         const uint64_t raw_data = io_uring_cqe_get_data64(cqe);
 
-        if (raw_data == kWakeupSentinel)
+        if (__builtin_expect(!!(raw_data & 1ULL), 0))
+        {
+            auto* state = reinterpret_cast<MultishotAcceptState*>(raw_data & ~1ULL);
+
+            Result<Fd> client_res;
+            if (cqe->res >= 0)
+            {
+                client_res = Fd{cqe->res};
+            }
+            else
+            {
+                client_res = fail(-cqe->res, "multishot_accept");
+            }
+
+            if (client_res.has_value() || (cqe->flags & IORING_CQE_F_MORE))
+            {
+                (void)spawn([state, res = std::move(client_res)](IO& io) mutable noexcept {
+                    state->handler(io, std::move(res));
+                });
+            }
+
+            if (!(cqe->flags & IORING_CQE_F_MORE))
+            {
+                // Erase from active list
+                std::erase(active_multishots_, raw_data);
+                delete state;
+                --inflight_ops_;
+            }
+        }
+        else if (raw_data == kWakeupSentinel)
         {
             // Defer re-arm until after cq_advance to avoid submitting a new SQE
             // while the CQ ring is still being iterated.
