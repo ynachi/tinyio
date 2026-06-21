@@ -71,7 +71,7 @@ decltype(auto) unwrap_expected(std::expected<T, E>& result) noexcept
 {
     if constexpr (!std::is_void_v<T>)
     {
-        return T(std::move(*result));;
+        return T(std::move(*result));
     }
 }
 

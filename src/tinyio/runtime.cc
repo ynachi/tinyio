@@ -8,6 +8,7 @@
 #include <format>
 #include <memory>
 
+#include <sched.h>
 #include <sys/eventfd.h>
 
 namespace tinyio
@@ -109,8 +110,8 @@ Result<void> IO::initialize() noexcept
 
     owner_tid_ = std::this_thread::get_id();
 
-    // disable the ring first
-    params.flags |= kUringBaseFlags | opts_.additional_uring_flags | IORING_SETUP_R_DISABLED;
+    // disable the ring first (kUringBaseFlags already includes IORING_SETUP_R_DISABLED)
+    params.flags |= kUringBaseFlags | opts_.additional_uring_flags;
 
     params.cq_entries = opts_.sq_entries * 2;
 
@@ -137,7 +138,7 @@ Result<void> IO::initialize() noexcept
         return fail(-rc, "io_uring_queue_init_params");
     }
 
-    wake_fd_ = eventfd(0, EFD_CLOEXEC);
+    wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (wake_fd_ < 0)
     {
         io_uring_queue_exit(&ring_);
@@ -198,7 +199,7 @@ void Fd::close_impl() noexcept
     if (fd < 0) return;
     if (direct && io_ptr)
     {
-        static_cast<IO*>(io_ptr)->unregister_direct_fd(fd);
+        io_ptr->unregister_direct_fd(fd);
     }
     else if (!direct)
     {
@@ -217,13 +218,20 @@ Result<Fd> IO::register_file(Fd fd) noexcept
     if (direct_fds_.empty()) return fd;
 
     auto it = std::find(direct_fds_.begin() + next_free_direct_idx_, direct_fds_.end(), -1);
-    if (it == direct_fds_.end()) return fd;
+    if (it == direct_fds_.end())
+    {
+        ALOG_WARN("register_file: direct FD table full ({}/{}), fd {} will use indirect path",
+                  direct_fds_cnt_, direct_fds_.size(), fd.get());
+        return fd;
+    }
 
     int idx = std::distance(direct_fds_.begin(), it);
     int raw_fd = fd.get();
     
     if (const int ret = io_uring_register_files_update(&ring_, idx, &raw_fd, 1); ret < 0)
     {
+        ALOG_WARN("register_file: io_uring_register_files_update failed for fd {}: {}",
+                  raw_fd, std::strerror(-ret));
         return fd;
     }
 
@@ -531,6 +539,9 @@ void IO::cancel_and_drain() noexcept
 
 }  // namespace tinyio
 
+// Note: extern "C" with a C++ parameter type (transfer_t) is technically
+// non-conforming but required by Boost.Context's API. transfer_t is trivial,
+// so this works correctly on all targeted compilers (GCC/Clang).
 extern "C" [[noreturn]] void tinyio_fiber_entry(boost::context::detail::transfer_t t) noexcept
 {
     auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(t.data);
@@ -709,12 +720,12 @@ Result<std::size_t> IO::drain_completions() noexcept
                 client_res = fail(-cqe->res, "multishot_accept");
             }
 
-            if (client_res.has_value() || (cqe->flags & IORING_CQE_F_MORE))
-            {
-                (void)spawn([state, res = std::move(client_res)](IO& io) mutable noexcept {
-                    state->handler(io, std::move(res));
-                });
-            }
+            // Always invoke the handler: on success, on transient errors (MORE set),
+            // and on terminal errors (MORE unset) so the application learns the
+            // accept loop ended and can restart or abort.
+            (void)spawn([state, res = std::move(client_res)](IO& io) mutable noexcept {
+                state->handler(io, std::move(res));
+            });
 
             if (!(cqe->flags & IORING_CQE_F_MORE))
             {

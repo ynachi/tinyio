@@ -6,11 +6,13 @@
 
 namespace tinyio
 {
+class IO;  // forward declaration for typed back-pointer
+
 struct Fd
 {
     int fd = -1;
     bool direct = false;
-    void* io_ptr = nullptr;
+    IO* io_ptr = nullptr;
 
     Fd() = default;
     explicit Fd(const int f) : fd(f) {}

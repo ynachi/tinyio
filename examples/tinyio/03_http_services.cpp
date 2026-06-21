@@ -84,23 +84,21 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 
     ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
 
-    while (!st.stop_requested())
-    {
-        auto client_fd = TRY_LOG_ERR(fio.accept(server_fd), "failed to accept");
-
-        // Schedule the client handler on the same worker
-        (void)fio.spawn(
-            [client_fd = std::move(client_fd)](IO& worker_fio) mutable noexcept
+    return fio.accept_loop(std::move(server_fd), [](IO& worker_fio, Result<Fd> client_fd_res) noexcept {
+        if (!client_fd_res) {
+            ALOG_ERROR("Accept failed: {}", client_fd_res.error().error_code().message());
+            return;
+        }
+        
+        (void)worker_fio.spawn(
+            [client_fd = std::move(*client_fd_res)](IO& worker_fio) mutable noexcept
             {
-                // If handle_client returns a Result, you might want to log it if it fails
                 if (auto res = handle_client(worker_fio, std::move(client_fd)); !res)
                 {
                     ALOG_ERROR("Client handler failed: {}", res.error().error_code().message());
                 }
             });
-    }
-
-    return {};
+    });
 }
 
 int main()

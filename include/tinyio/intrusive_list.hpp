@@ -17,12 +17,34 @@ struct IntrusiveHook
     [[nodiscard]] bool is_linked() const noexcept { return next != this; }
 };
 
+namespace detail
+{
+/// Mixin that holds the size counter only when TrackSize is true.
+template <bool TrackSize>
+struct SizeTracker
+{
+    std::size_t size_ = 0;
+    void inc() noexcept { ++size_; }
+    void dec() noexcept { --size_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+};
+
+template <>
+struct SizeTracker<false>
+{
+    static void inc() noexcept {}
+    static void dec() noexcept {}
+};
+}  // namespace detail
+
 /// \brief A branchless, circular, doubly-linked intrusive list using dummy heads.
 /// \tparam T The node type (must publicly inherit from IntrusiveHook<Tag>).
 /// \tparam Tag The unique tag identifying which hook to use.
 template <typename T, typename Tag, bool TrackSize = true>
-class IntrusiveList
+class IntrusiveList : private detail::SizeTracker<TrackSize>
 {
+    using Tracker = detail::SizeTracker<TrackSize>;
+
 public:
     constexpr IntrusiveList() noexcept = default;
 
@@ -31,7 +53,7 @@ public:
     [[nodiscard]] std::size_t size() const noexcept
         requires TrackSize
     {
-        return size_;
+        return Tracker::size();
     }
 
     /// \brief Pushes a node to the front of the list (O(1), branchless)
@@ -75,7 +97,6 @@ public:
 
 private:
     IntrusiveHook<Tag> dummy_;
-    [[no_unique_address]] std::size_t size_ = 0;
 
     static IntrusiveHook<Tag>* get_hook(T* node) noexcept
     {
@@ -95,10 +116,7 @@ private:
         node->prev = prev;
         prev->next = node;
         next->prev = node;
-        if constexpr (TrackSize)
-        {
-            ++size_;
-        }
+        Tracker::inc();
     }
 
     void remove_hook(IntrusiveHook<Tag>* node) noexcept
@@ -109,10 +127,7 @@ private:
         // Reset the hook to unlinked circular state
         node->next = node;
         node->prev = node;
-        if constexpr (TrackSize)
-        {
-            --size_;
-        }
+        Tracker::dec();
     }
 };
 

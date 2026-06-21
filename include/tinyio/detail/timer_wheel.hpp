@@ -141,7 +141,7 @@ public:
 private:
     [[nodiscard]] static size_t slot_of(const uint64_t deadline_ns) noexcept
     {
-        return deadline_ns / kTickNs & kSlots - 1;
+        return (deadline_ns / kTickNs) & (kSlots - 1);
     }
 
     std::array<Queue, kSlots> slots_{};

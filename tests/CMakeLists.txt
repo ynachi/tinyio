@@ -31,6 +31,11 @@ tio_add_test(cross_thread_post_tests tinyio/cross_thread_post_test.cc
         LIBS tinyio GTest::gtest GTest::gtest_main
 )
 
+tio_add_test(io_correctness_tests tinyio/io_correctness_test.cc
+        TAGS tinyio unit io correctness
+        LIBS tinyio GTest::gtest GTest::gtest_main
+)
+
 
 #========= uring
 #tio_add_test(op_pool_tests uring/op_pool_test.cpp

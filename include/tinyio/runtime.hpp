@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cassert>
 #include <concepts>
 #include <filesystem>
@@ -23,14 +22,14 @@ namespace tinyio
 {
 
 /// Default io uring flag
-static constexpr unsigned kUringDefaultAdditionalFlag =
+inline constexpr unsigned kUringDefaultAdditionalFlag =
     IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
 
 /// These are mandatory base flags
-static constexpr unsigned kUringBaseFlags = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_R_DISABLED;
+inline constexpr unsigned kUringBaseFlags = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_R_DISABLED;
 
 /// Default io accept flags
-static constexpr int kDefaultAcceptFlags = SOCK_NONBLOCK | SOCK_CLOEXEC;
+inline constexpr int kDefaultAcceptFlags = SOCK_NONBLOCK | SOCK_CLOEXEC;
 
 struct IoOptions
 {
@@ -504,6 +503,7 @@ private:
         timer_wheel_.arm(current_fiber_, detail::monotonic_now_ns() + static_cast<uint64_t>(timeout.count()));
 
         current_fiber_->state = detail::fiber::FiberState::waiting;
+        current_fiber_->wait_kind = detail::fiber::WaitKind::io;
         ++inflight_ops_;
 
         suspend_fiber(current_fiber_);
@@ -540,7 +540,6 @@ private:
     //
     int wake_fd_{-1};
     uint64_t wake_value_{0};
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> tq_wakeup_ev_{0};
 
     // Direct FD Table Management
     std::vector<int> direct_fds_;
@@ -550,7 +549,6 @@ private:
     //
     // Lifecycle
     //
-    std::atomic<bool> is_sleeping_{false};
     bool is_activated_{false};
     bool is_running_{false};
     bool stopping_{false};
@@ -567,7 +565,6 @@ private:
     //
     // Fiber management
     //
-    // bool inside_run_ = false;
     detail::context::Context scheduler_context_{};
     detail::ToolFiberState scheduler_tools_{};
     IntrusiveList<detail::fiber::Fiber, AllFibersTag, false> all_fibers_;
@@ -619,6 +616,7 @@ template <class Fn>
 
     auto* state = new (std::nothrow) MultishotAcceptState{std::move(server_fd), std::forward<Fn>(handler)};
     if (!state) return fail(ENOMEM, "accept_loop: OOM allocating state");
+    static_assert(alignof(MultishotAcceptState) >= 2, "tagged pointer requires even alignment");
 
     auto* sqe = get_sqe().value_or(nullptr);
     if (!sqe) {

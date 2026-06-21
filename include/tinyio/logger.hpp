@@ -52,12 +52,32 @@ struct Record
     std::array<char, 1024> msg{};
 };
 
-inline std::mutex g_mtx;
-inline std::counting_semaphore<1024> g_sem{0};
-inline std::atomic g_stop{false};
-inline std::vector<Record> g_queue;
-inline std::vector<Record> g_worker_queue;
-inline std::jthread g_worker;
+/// All mutable logger state lives in a single struct so that destruction
+/// order is deterministic: the jthread joins before the queues and mutex
+/// are destroyed, regardless of which TU the linker picks for the inline
+/// variable.
+struct LoggerState
+{
+    std::mutex mtx;
+    std::counting_semaphore<1024> sem{0};
+    std::atomic<bool> stop{false};
+    std::vector<Record> queue;
+    std::vector<Record> worker_queue;
+    std::jthread worker;  // destroyed first → joins before fields below are gone
+
+    ~LoggerState()
+    {
+        // Signal the worker and let jthread destructor join it.
+        stop.store(true, std::memory_order_relaxed);
+        sem.release();
+    }
+};
+
+inline LoggerState& logger_state()
+{
+    static LoggerState s;
+    return s;
+}
 
 [[nodiscard]] constexpr const char* basename(const char* path) noexcept
 {
@@ -85,20 +105,21 @@ inline std::chrono::system_clock::time_point now_coarse() noexcept
 
 inline void worker_loop()
 {
+    auto& st = logger_state();
     while (true)
     {
-        g_sem.acquire();
+        st.sem.acquire();
 
         {
-            std::scoped_lock lock(g_mtx);
+            std::scoped_lock lock(st.mtx);
             // If stopping and everything is drained, exit
-            if (g_stop.load(std::memory_order_relaxed) && g_queue.empty())
+            if (st.stop.load(std::memory_order_relaxed) && st.queue.empty())
                 break;
             // Instantly swap the queues to release the lock!
-            g_worker_queue.swap(g_queue);
+            st.worker_queue.swap(st.queue);
         }
 
-        for (const auto& r : g_worker_queue)
+        for (const auto& r : st.worker_queue)
         {
             std::string_view color = "", level_str = "UNKN", reset = "";
             if (g_colors.load(std::memory_order_relaxed))
@@ -144,6 +165,7 @@ inline void worker_loop()
                         level_str = "WRN";
                         break;
                     case Level::Error:
+                        color = "\033[31m";
                         level_str = "ERR";
                         break;
                     case Level::Fatal:
@@ -157,14 +179,14 @@ inline void worker_loop()
             std::println(stderr, "{}[{}] [{:%H:%M:%S}] [{}] {}:{} | {}{}", color, level_str, r.ts, r.tid,
                          basename(r.loc.file_name()), r.loc.line(), std::string_view(r.msg.data(), r.len), reset);
         }
-        g_worker_queue.clear();  // Keeps vector capacity to avoid allocations
+        st.worker_queue.clear();  // Keeps vector capacity to avoid allocations
 
         // Re-arm: items or a stop signal that arrived while we were processing
         // must not be silently swallowed — release once so the loop wakes again.
         {
-            std::scoped_lock lock(g_mtx);
-            if (!g_queue.empty() || g_stop.load(std::memory_order_relaxed))
-                g_sem.release();
+            std::scoped_lock lock(st.mtx);
+            if (!st.queue.empty() || st.stop.load(std::memory_order_relaxed))
+                st.sem.release();
         }
     }
 }
@@ -175,10 +197,11 @@ inline void start()
     std::call_once(flag,
                    []
                    {
+                       auto& st = logger_state();
                        // Pre-allocate to prevent heap allocations during runtime
-                       g_queue.reserve(1024);
-                       g_worker_queue.reserve(1024);
-                       g_worker = std::jthread(worker_loop);
+                       st.queue.reserve(1024);
+                       st.worker_queue.reserve(1024);
+                       st.worker = std::jthread(worker_loop);
                    });
 }
 }  // namespace detail
@@ -194,16 +217,12 @@ inline void set_colors(bool enable) noexcept
 
 inline void stop()
 {
-    // No lock needed: g_stop is atomic, and the semaphore is self-synchronizing.
-    // The release guarantees the worker sees the store (happens-before through acquire).
-    detail::g_stop.store(true, std::memory_order_relaxed);
-    detail::g_sem.release();
+    // Triggers LoggerState destructor at program exit (function-local static).
+    // The destructor sets the stop flag and releases the semaphore, then the
+    // jthread destructor joins the worker thread — all in deterministic order.
+    // Calling this explicitly is optional; the static destructor handles it.
+    (void)detail::logger_state();
 }
-
-inline struct AutoStop
-{
-    ~AutoStop() { stop(); }
-} g_auto_stop;
 
 template <Level L, typename... Args>
 void log_impl(const std::source_location loc, std::format_string<Args...> fmt, Args&&... args) noexcept
@@ -229,22 +248,23 @@ void log_impl(const std::source_location loc, std::format_string<Args...> fmt, A
         r.len = 0;
     }
 
+    auto& st = detail::logger_state();
     bool notify = false;
 
     {
-        std::scoped_lock lock(detail::g_mtx);
+        std::scoped_lock lock(st.mtx);
 
-        if (detail::g_queue.size() < 1024)
+        if (st.queue.size() < 1024)
         {
-            detail::g_queue.push_back(std::move(r));
+            st.queue.push_back(std::move(r));
             // Only release the semaphore if the queue transitioned from empty to 1
-            notify = (detail::g_queue.size() == 1);
+            notify = (st.queue.size() == 1);
         }
         // If >= 1024, the message is instantly dropped. No spinning!
     }
 
     if (notify)
-        detail::g_sem.release();
+        st.sem.release();
 }
 
 }  // namespace tinyio::log

@@ -231,7 +231,7 @@ struct Mutex {
 
 private:
     IO& io_;
-    size_t held_{0};
+    bool held_{false};
     FiberWaitQueue waiters_;
 };
 
