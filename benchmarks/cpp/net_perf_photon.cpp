@@ -6,6 +6,7 @@
 #include <photon/photon.h>
 #include <thread>
 #include <vector>
+#include <netinet/tcp.h>
 
 // Command-line flags
 DEFINE_string(ip, "0.0.0.0", "IP address to bind to");
@@ -17,10 +18,10 @@ DEFINE_uint64(buf_size, 8192, "Buffer size for reading");
 static constexpr std::string_view HTTP_RESPONSE =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/plain\r\n"
-    "Content-Length: 13\r\n"
+    "Content-Length: 16\r\n"
     "Connection: keep-alive\r\n"
     "\r\n"
-    "Hello from AIO!";
+    "Hello, io_uring!";
 
 void handle_connection(photon::net::ISocketStream* stream)
 {
@@ -62,6 +63,7 @@ int main(int argc, char** argv)
 
             server->setsockopt<int>(SOL_SOCKET, SO_REUSEADDR, 1);
             server->setsockopt<int>(SOL_SOCKET, SO_REUSEPORT, 1);
+            server->setsockopt<int>(IPPROTO_TCP, TCP_NODELAY, 1);
 
             photon::net::IPAddr addr{FLAGS_ip.c_str()};
             if (server->bind(FLAGS_port, addr) < 0) return;

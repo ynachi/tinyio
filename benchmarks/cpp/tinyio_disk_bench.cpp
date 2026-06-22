@@ -16,6 +16,7 @@
 #include <tinyio/runtime.hpp>
 #include <tinyio/fd.hpp>
 #include <tinyio/error.hpp>
+#include <tinyio/fiber_sync.hpp>
 
 namespace
 {
@@ -114,7 +115,7 @@ struct BenchResult
 void print_result(const BenchResult& r)
 {
     std::cout << "  " << r.name;
-    for (std::size_t i = r.name.size(); i < 16; ++i)
+    for (std::size_t i = r.name.size(); i < 20; ++i)
     {
         std::cout << ' ';
     }
@@ -139,12 +140,12 @@ tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::Fd& fd, std
     return {};
 }
 
-BenchResult bench_tinyio_fiber(const Options& opts, const std::vector<std::byte>& block)
+BenchResult bench_tinyio_fiber(const Options& opts, std::span<const std::byte> block)
 {
     const auto path = opts.path.string() + ".tinyio";
     prepare_file(path, opts.bytes);
 
-    const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC | O_DIRECT);
     if (raw_fd < 0)
     {
         throw std::runtime_error("open tinyio file failed: " + std::string(std::strerror(errno)));
@@ -153,48 +154,126 @@ BenchResult bench_tinyio_fiber(const Options& opts, const std::vector<std::byte>
     tinyio::Fd fd{raw_fd};
     tinyio::IoOptions io_opts;
     tinyio::IO io(0, io_opts, {});
-    
-    // We want to run the write inside a fiber, and wait for it to finish
-    bool finished = false;
+
     std::optional<tinyio::Result<void>> result;
-    
+
     const auto start = Clock::now();
     (void)io.spawn([&](tinyio::IO& fio) noexcept {
         result = tinyio_fiber_write_all(fio, fd, block, opts.bytes);
-        finished = true;
     });
-    
+
     io.run_until_done();
     const auto end = Clock::now();
-    
+
     if (!result.value())
     {
         throw std::runtime_error("tinyio write failed: " + result.value().error().error_code().message());
     }
 
     const double seconds = std::chrono::duration<double>(end - start).count();
-    return {"tinyio", seconds, static_cast<double>(opts.bytes) / (1024.0 * 1024.0) / seconds};
+    return {"fibers=1", seconds, static_cast<double>(opts.bytes) / (1024.0 * 1024.0) / seconds};
+}
+
+// N fibers each write a non-overlapping segment of the file concurrently.
+// All fibers are on the same thread/io_uring instance, so their SQEs batch
+// together in a single io_uring_submit call per tick — this is the true QD>1
+// test for io_uring batching efficiency.
+BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::byte> block, std::size_t n_fibers)
+{
+    // Align segment size down to a multiple of block (required for O_DIRECT).
+    const std::uint64_t segment = (opts.bytes / n_fibers / opts.block) * opts.block;
+    if (segment == 0)
+    {
+        throw std::invalid_argument("too many fibers: segment size rounded to zero, reduce --fibers or increase --bytes/--block");
+    }
+    const std::uint64_t total = segment * n_fibers;
+
+    const auto path = opts.path.string() + ".concurrent";
+    prepare_file(path, total);
+
+    const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC | O_DIRECT);
+    if (raw_fd < 0)
+    {
+        throw std::runtime_error("open concurrent file failed: " + std::string(std::strerror(errno)));
+    }
+
+    tinyio::Fd fd{raw_fd};
+    tinyio::IoOptions io_opts;
+    tinyio::IO io(0, io_opts, {});
+
+    const auto start = Clock::now();
+
+    (void)io.spawn([&](tinyio::IO& fio) noexcept {
+        tinyio::ResultGroup<std::uint64_t> group(fio, n_fibers);
+
+        for (std::size_t i = 0; i < n_fibers; ++i)
+        {
+            const std::uint64_t seg_start = i * segment;
+            const std::uint64_t seg_end   = seg_start + segment;
+
+            // Each fiber writes its own region; all use the same read-only
+            // block buffer (safe: single thread, buffer is never modified).
+            (void)group.spawn([&fio, &fd, &block, seg_start, seg_end](tinyio::IO&) noexcept
+                              -> tinyio::Result<std::uint64_t> {
+                std::uint64_t offset = seg_start;
+                while (offset < seg_end)
+                {
+                    const auto len = std::min<std::uint64_t>(block.size(), seg_end - offset);
+                    iovec iov{.iov_base = const_cast<std::byte*>(block.data()),
+                              .iov_len  = static_cast<std::size_t>(len)};
+                    TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
+                    offset += len;
+                }
+                return seg_end - seg_start;
+            });
+        }
+
+        (void)group.wait();
+    });
+
+    io.run_until_done();
+    const auto end = Clock::now();
+
+    const double seconds = std::chrono::duration<double>(end - start).count();
+    const std::string name = "fibers=" + std::to_string(n_fibers);
+    return {name, seconds, static_cast<double>(total) / (1024.0 * 1024.0) / seconds};
 }
 } // namespace
 
 int main(int argc, char** argv)
 {
+    void* ptr = nullptr;
     try
     {
         const auto opts = parse_args(argc, argv);
-        std::vector<std::byte> block(opts.block, std::byte{0x42});
+        
+        if (::posix_memalign(&ptr, 4096, opts.block) != 0) {
+            throw std::runtime_error("posix_memalign failed");
+        }
+        std::memset(ptr, 0x42, opts.block);
+        std::span<const std::byte> block(static_cast<const std::byte*>(ptr), opts.block);
         
         tinyio::log::set_level(tinyio::log::Level::Disabled);
 
-        std::cout << "Benchmarking disk write:\n"
-                  << "  Bytes: " << opts.bytes << '\n'
-                  << "  Block: " << opts.block << '\n';
+        std::cout << "Benchmarking disk write (O_DIRECT, sequential per fiber):\n"
+                  << "  Total bytes : " << opts.bytes << '\n'
+                  << "  Block size  : " << opts.block << '\n'
+                  << "  Path        : " << opts.path << '\n'
+                  << '\n';
 
         print_result(bench_tinyio_fiber(opts, block));
+
+        for (const std::size_t n : {2, 4, 8, 16, 32})
+        {
+            print_result(bench_tinyio_concurrent(opts, block, n));
+        }
+
+        std::free(ptr);
     }
     catch (const std::exception& e)
     {
         std::cerr << "Error: " << e.what() << '\n';
+        if (ptr) std::free(ptr);
         return 1;
     }
     return 0;

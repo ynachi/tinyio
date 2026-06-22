@@ -71,7 +71,7 @@ find_package(Threads REQUIRED)
 
 # for benchmarks
 if (TIO_BUILD_BENCHMARK)
-    # find_package(PhotonLibOS REQUIRED)
+    find_package(PhotonLibOS REQUIRED)
 endif ()
 
 include(DevTargets)
@@ -155,14 +155,14 @@ if (TIO_BUILD_TESTS)
     add_subdirectory(tests)
 
     # Check target - runs all tests
-    add_custom_target(check
+    add_custom_target(tio-check
             COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
             COMMENT "Running all tests"
             VERBATIM
     )
 
     # Quick check - only fast tests
-    add_custom_target(check-quick
+    add_custom_target(tio-check-quick
             COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -L "unit"
             COMMENT "Running quick unit tests"
             VERBATIM

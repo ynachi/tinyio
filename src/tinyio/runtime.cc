@@ -632,12 +632,6 @@ Result<io_uring_sqe*> IO::get_sqe() noexcept
 
 void IO::wake() const noexcept
 {
-    // Always write to the eventfd. There is always one pending eventfd read
-    // SQE in the kernel (armed by arm_wake_read() and re-armed after each
-    // wakeup CQE). Writing here completes that read unconditionally, so
-    // submit_and_wait returns regardless of whether is_sleeping_ is set yet.
-    // This closes the race where request_stop() fires between the last
-    // stop_requested() check and the thread entering submit_and_wait.
     constexpr uint64_t one = 1;
     for (;;)
     {
@@ -723,9 +717,7 @@ Result<std::size_t> IO::drain_completions() noexcept
             // Always invoke the handler: on success, on transient errors (MORE set),
             // and on terminal errors (MORE unset) so the application learns the
             // accept loop ended and can restart or abort.
-            (void)spawn([state, res = std::move(client_res)](IO& io) mutable noexcept {
-                state->handler(io, std::move(res));
-            });
+            state->handler(*this, std::move(client_res));
 
             if (!(cqe->flags & IORING_CQE_F_MORE))
             {
