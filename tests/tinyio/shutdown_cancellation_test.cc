@@ -1,9 +1,9 @@
-#include "tinyio/runtime.hpp"
-
 #include <chrono>
 #include <thread>
 
 #include <gtest/gtest.h>
+
+#include "../../src/tinyio/runtime.hpp"
 
 using namespace tinyio;
 

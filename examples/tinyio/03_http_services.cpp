@@ -2,13 +2,13 @@
 // curl -v --http1.1 -H 'Connection: close' http://127.0.0.1:8080/
 //  printf 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
 
-#include "tinyio/tinyio.hpp"
-
 #include <chrono>
 #include <csignal>
 #include <iostream>
 #include <string_view>
 #include <thread>
+
+#include "../../src/tinyio/tinyio.hpp"
 
 using namespace tinyio;
 

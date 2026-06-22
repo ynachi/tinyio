@@ -1,16 +1,14 @@
 #pragma once
 #define XXH_INLINE_ALL
-#include "external_libraries/xxhash/xxhash.h"
-
-#include "tinyio/tinyio.hpp"
-
 #include <memory>
 #include <memory_resource>
 #include <optional>
 #include <span>
 #include <string_view>
 
+#include "../../src/tinyio/tinyio.hpp"
 #include "common.hpp"
+#include "external_libraries/xxhash/xxhash.h"
 #include "fdcache.hpp"
 
 namespace bitcask

@@ -1,15 +1,15 @@
 #include "tinyio/detail/stack.hpp"
 
-#include "tinyio/error.hpp"
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 
-#include <unistd.h>
-
 #include <sys/mman.h>
+
+#include "error.hpp"
 
 #if __has_include(<valgrind/valgrind.h>)
     #include <valgrind/valgrind.h>

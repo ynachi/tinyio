@@ -1,9 +1,9 @@
-#include "tinyio/buffer_pool.hpp"
+#include "buffer_pool.hpp"
 
 #include <algorithm>
 #include <utility>
 
-#include "tinyio/logger.hpp"
+#include "logger.hpp"
 
 namespace tinyio
 {

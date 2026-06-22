@@ -4,11 +4,11 @@
 // Demonstrate
 //  - timout
 //  - error management
-#include "tinyio/tinyio.hpp"
-
 #include <chrono>
 
 #include <gflags/gflags.h>
+
+#include "../../src/tinyio/tinyio.hpp"
 
 using tinyio::Fd;
 using tinyio::IO;

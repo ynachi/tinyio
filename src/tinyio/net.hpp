@@ -1,14 +1,15 @@
 #pragma once
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
 
-#include <fcntl.h>
-#include <unistd.h>
-
-#include "tinyio/error.hpp"
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+#include "error.hpp"
 
 namespace tinyio
 {

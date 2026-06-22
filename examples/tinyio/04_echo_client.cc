@@ -1,18 +1,17 @@
 //
 // Multithreaded echo client using tinyio
 //
-#include "tinyio/tinyio.hpp"
-
 #include <atomic>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <sys/socket.h>
-
 #include <gflags/gflags.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+
+#include "../../src/tinyio/tinyio.hpp"
 
 using tinyio::Fd;
 using tinyio::IO;

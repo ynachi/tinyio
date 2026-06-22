@@ -1,11 +1,11 @@
-#include "tinyio/tinyio.hpp"
-
 #include <chrono>
+#include <csignal>
 #include <iostream>
 #include <random>
-#include <vector>
 #include <thread>
-#include <csignal>
+#include <vector>
+
+#include "../../src/tinyio/tinyio.hpp"
 
 using namespace tinyio;
 using namespace std::chrono;

@@ -1,6 +1,6 @@
-#include "tinyio/runtime.hpp"
+#include "runtime.hpp"
 
-#include "tinyio/logger.hpp"
+#include <sched.h>
 
 #include <cassert>
 #include <cerrno>
@@ -8,8 +8,9 @@
 #include <format>
 #include <memory>
 
-#include <sched.h>
 #include <sys/eventfd.h>
+
+#include "logger.hpp"
 
 namespace tinyio
 {

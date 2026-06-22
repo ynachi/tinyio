@@ -1,8 +1,8 @@
-#include "tinyio/net.hpp"
-
-#include <cstring>
+#include "net.hpp"
 
 #include <netdb.h>
+
+#include <cstring>
 
 #include <arpa/inet.h>
 

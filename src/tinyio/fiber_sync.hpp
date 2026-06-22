@@ -1,10 +1,11 @@
 #pragma once
 
-#include "tinyio/runtime.hpp"
 #include <cassert>
 #include <cstddef>
-#include <vector>
 #include <optional>
+#include <vector>
+
+#include "runtime.hpp"
 
 namespace tinyio
 {

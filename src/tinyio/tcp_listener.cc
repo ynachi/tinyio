@@ -1,8 +1,8 @@
-#include "tinyio/tcp_listener.hpp"
+#include "tcp_listener.hpp"
 
 #include <sys/socket.h>
 
-#include "tinyio/error.hpp"
+#include "error.hpp"
 
 namespace tinyio
 {

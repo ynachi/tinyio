@@ -1,3 +1,6 @@
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -10,13 +13,10 @@
 #include <string>
 #include <vector>
 
-#include <fcntl.h>
-#include <unistd.h>
-
-#include <tinyio/runtime.hpp>
+#include <../../src/tinyio/error.hpp>
 #include <tinyio/fd.hpp>
-#include <tinyio/error.hpp>
 #include <tinyio/fiber_sync.hpp>
+#include <tinyio/runtime.hpp>
 
 namespace
 {

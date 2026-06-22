@@ -1,5 +1,8 @@
 #pragma once
 
+#include <fcntl.h>
+#include <liburing.h>
+
 #include <atomic>
 #include <cassert>
 #include <concepts>
@@ -7,9 +10,6 @@
 #include <functional>
 #include <thread>
 #include <vector>
-
-#include <fcntl.h>
-#include <liburing.h>
 
 #include "buffer_pool.hpp"
 #include "detail/fiber.hpp"

@@ -1,11 +1,11 @@
-#include "tinyio/runtime.hpp"
-
 #include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "../../src/tinyio/runtime.hpp"
 
 using namespace tinyio;
 

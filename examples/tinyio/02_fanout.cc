@@ -3,15 +3,14 @@
 // report UP/DOWN with round-trip latency.
 // Demonstrates ResultGroup (fan-out/fan-in) and Semaphore throttle.
 //
-#include "tinyio/tinyio.hpp"
-
 #include <chrono>
 #include <string>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <sys/socket.h>
 
-#include <gflags/gflags.h>
+#include "../../src/tinyio/tinyio.hpp"
 
 using tinyio::Fd;
 using tinyio::IO;

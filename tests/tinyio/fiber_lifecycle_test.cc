@@ -1,8 +1,8 @@
-#include "tinyio/runtime.hpp"
-
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "../../src/tinyio/runtime.hpp"
 
 using namespace tinyio;
 
