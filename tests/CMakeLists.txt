@@ -16,9 +16,9 @@ function(add_tinyio_test test_name)
 
     add_executable(${test_name})
 
-    if(ARG_SOURCES)
+    if (ARG_SOURCES)
         target_sources(${test_name} PRIVATE ${ARG_SOURCES})
-    endif()
+    endif ()
 
     # Link against the tinyio ALIAS, plus GTest and any extra LIBS provided
     target_link_libraries(${test_name}
@@ -32,6 +32,10 @@ endfunction()
 
 add_tinyio_test(buffer_pool_tests
         SOURCES tinyio/buffer_pool_test.cc
+)
+
+add_tinyio_test(intrusive_list_tests
+        SOURCES tinyio/intrusive_list_test.cc
 )
 
 ## tinyio tests
