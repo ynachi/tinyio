@@ -326,9 +326,9 @@ TEST_F(FiberSyncTest, ResultGroupBasic)
     (void)io.Spawn([](IO& rt) noexcept {
         ResultGroup<int> group(rt, 3);
 
-        group.spawn([](IO&) noexcept -> Result<int> { return 10; });
-        group.spawn([](IO&) noexcept -> Result<int> { return 20; });
-        group.spawn([](IO&) noexcept -> Result<int> { return 30; });
+        group.Spawn([](IO&) noexcept -> Result<int> { return 10; });
+        group.Spawn([](IO&) noexcept -> Result<int> { return 20; });
+        group.Spawn([](IO&) noexcept -> Result<int> { return 30; });
 
         (void)group.Wait();
 
@@ -347,8 +347,8 @@ TEST_F(FiberSyncTest, ResultGroupTaskError)
     (void)io.Spawn([](IO& rt) noexcept {
         ResultGroup<int> group(rt, 2);
 
-        group.spawn([](IO&) noexcept -> Result<int> { return 42; });
-        group.spawn([](IO&) noexcept -> Result<int> {
+        group.Spawn([](IO&) noexcept -> Result<int> { return 42; });
+        group.Spawn([](IO&) noexcept -> Result<int> {
             return std::unexpected(Error{EINVAL, "test-op"});
         });
 
@@ -371,7 +371,7 @@ TEST_F(FiberSyncTest, ResultGroupUnspawnedSlotIsNullopt)
     (void)io.Spawn([](IO& rt) noexcept {
         ResultGroup<int> group(rt, 3);
 
-        group.spawn([](IO&) noexcept -> Result<int> { return 1; });
+        group.Spawn([](IO&) noexcept -> Result<int> { return 1; });
         // slots 1 and 2 are never spawned
 
         (void)group.Wait();

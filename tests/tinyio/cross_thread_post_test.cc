@@ -44,7 +44,7 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread)
             IO io(0, opts, {});
             io_ptr = &io;
             thread_started = true;
-            // Since there are no fibers, run() will just wait for eventfd wakeup.
+            // Since there are no fibers, Run() will just wait for eventfd wakeup.
             io.Run(ss.get_token());
         });
 

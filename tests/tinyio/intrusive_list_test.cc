@@ -41,9 +41,9 @@ class IntrusiveListTest : public ::testing::Test {
 
 // Drains a list into a vector of values via repeated pop_front.
 template <typename Tag>
-static std::vector<int> drain(IntrusiveList<Node, Tag>& list) {
+static std::vector<int> Drain(IntrusiveList<Node, Tag>& list) {
   std::vector<int> result;
-  while (auto* n = list.pop_front()) {
+  while (auto* n = list.PopFront()) {
     result.push_back(n->value);
   }
   return result;
@@ -54,9 +54,9 @@ static std::vector<int> drain(IntrusiveList<Node, Tag>& list) {
 // ---------------------------------------------------------------------------
 
 TEST_F(IntrusiveListTest, EmptyListInvariants) {
-  EXPECT_TRUE(list_.empty());
+  EXPECT_TRUE(list_.Empty());
   EXPECT_EQ(list_.Size(), 0u);
-  EXPECT_EQ(list_.pop_front(), nullptr);
+  EXPECT_EQ(list_.PopFront(), nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -68,17 +68,17 @@ TEST_F(IntrusiveListTest, SingleNodeRoundtrip) {
 
   list_.PushBack(&n0_);
 
-  EXPECT_FALSE(list_.empty());
+  EXPECT_FALSE(list_.Empty());
   EXPECT_EQ(list_.Size(), 1u);
   EXPECT_TRUE(n0_.IntrusiveHook<PrimaryTag>::IsLinked());
 
-  Node* popped = list_.pop_front();
+  Node* popped = list_.PopFront();
 
   EXPECT_EQ(popped, &n0_);
-  EXPECT_TRUE(list_.empty());
+  EXPECT_TRUE(list_.Empty());
   EXPECT_EQ(list_.Size(), 0u);
   EXPECT_FALSE(n0_.IntrusiveHook<PrimaryTag>::IsLinked());
-  EXPECT_EQ(list_.pop_front(), nullptr);
+  EXPECT_EQ(list_.PopFront(), nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ TEST_F(IntrusiveListTest, PushBackGivesFifoOrder) {
   list_.PushBack(&n3_);
   list_.PushBack(&n4_);
 
-  EXPECT_EQ(drain(list_), (std::vector{0, 1, 2, 3, 4}));
+  EXPECT_EQ(Drain(list_), (std::vector{0, 1, 2, 3, 4}));
 }
 
 TEST_F(IntrusiveListTest, PushFrontReversesOrder) {
@@ -102,7 +102,7 @@ TEST_F(IntrusiveListTest, PushFrontReversesOrder) {
   list_.PushFront(&n3_);
   list_.PushFront(&n4_);
 
-  EXPECT_EQ(drain(list_), (std::vector{4, 3, 2, 1, 0}));
+  EXPECT_EQ(Drain(list_), (std::vector{4, 3, 2, 1, 0}));
 }
 
 TEST_F(IntrusiveListTest, MixedFrontAndBackInsertion) {
@@ -111,7 +111,7 @@ TEST_F(IntrusiveListTest, MixedFrontAndBackInsertion) {
   list_.PushBack(&n2_);   // [1, 0, 2]
   list_.PushFront(&n3_);  // [3, 1, 0, 2]
 
-  EXPECT_EQ(drain(list_), (std::vector{3, 1, 0, 2}));
+  EXPECT_EQ(Drain(list_), (std::vector{3, 1, 0, 2}));
 }
 
 // ---------------------------------------------------------------------------
@@ -124,17 +124,17 @@ TEST_F(IntrusiveListTest, SizeTracksAllMutations) {
   list_.PushBack(&n2_);
   EXPECT_EQ(list_.Size(), 3u);
 
-  (void)list_.pop_front();
+  (void)list_.PopFront();
   EXPECT_EQ(list_.Size(), 2u);
 
   list_.PushBack(&n3_);
   list_.PushBack(&n4_);
   EXPECT_EQ(list_.Size(), 4u);
 
-  while (list_.pop_front()) {
+  while (list_.PopFront()) {
   }
   EXPECT_EQ(list_.Size(), 0u);
-  EXPECT_TRUE(list_.empty());
+  EXPECT_TRUE(list_.Empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ TEST_F(IntrusiveListTest, RemoveMiddleElement) {
 
   EXPECT_EQ(list_.Size(), 4u);
   EXPECT_FALSE(n2_.IntrusiveHook<PrimaryTag>::IsLinked());
-  EXPECT_EQ(drain(list_), (std::vector{0, 1, 3, 4}));
+  EXPECT_EQ(Drain(list_), (std::vector{0, 1, 3, 4}));
 }
 
 TEST_F(IntrusiveListTest, RemoveFrontElement) {
@@ -163,7 +163,7 @@ TEST_F(IntrusiveListTest, RemoveFrontElement) {
   list_.Remove(&n0_);
 
   EXPECT_EQ(list_.Size(), 2u);
-  EXPECT_EQ(drain(list_), (std::vector{1, 2}));
+  EXPECT_EQ(Drain(list_), (std::vector{1, 2}));
 }
 
 TEST_F(IntrusiveListTest, RemoveBackElement) {
@@ -174,7 +174,7 @@ TEST_F(IntrusiveListTest, RemoveBackElement) {
   list_.Remove(&n2_);
 
   EXPECT_EQ(list_.Size(), 2u);
-  EXPECT_EQ(drain(list_), (std::vector{0, 1}));
+  EXPECT_EQ(Drain(list_), (std::vector{0, 1}));
 }
 
 TEST_F(IntrusiveListTest, RemoveNeverLinkedNodeIsNoOp) {
@@ -182,18 +182,18 @@ TEST_F(IntrusiveListTest, RemoveNeverLinkedNodeIsNoOp) {
   list_.Remove(&n1_);  // n1 was never pushed
 
   EXPECT_EQ(list_.Size(), 1u);
-  EXPECT_EQ(drain(list_), (std::vector{0}));
+  EXPECT_EQ(Drain(list_), (std::vector{0}));
 }
 
 TEST_F(IntrusiveListTest, RemoveAlreadyUnlinkedNodeIsNoOp) {
   list_.PushBack(&n0_);
   list_.PushBack(&n1_);
 
-  (void)list_.pop_front();  // unlinks n0
-  list_.Remove(&n0_);       // n0 is already unlinked, must be a no-op
+  (void)list_.PopFront();  // unlinks n0
+  list_.Remove(&n0_);      // n0 is already unlinked, must be a no-op
 
   EXPECT_EQ(list_.Size(), 1u);
-  EXPECT_EQ(drain(list_), (std::vector{1}));
+  EXPECT_EQ(Drain(list_), (std::vector{1}));
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +228,7 @@ TEST_F(IntrusiveListTest, ForEachSafeToRemoveCurrentNode) {
   });
 
   EXPECT_EQ(visited, (std::vector{0, 1, 2}));
-  EXPECT_TRUE(list_.empty());
+  EXPECT_TRUE(list_.Empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +258,6 @@ TEST(IntrusiveListMultiTagTest, NodeCanLiveInTwoListsSimultaneously) {
   EXPECT_FALSE(b.IntrusiveHook<PrimaryTag>::IsLinked());
   EXPECT_TRUE(b.IntrusiveHook<SecondaryTag>::IsLinked());
 
-  EXPECT_EQ(drain(primary), (std::vector{10, 30}));
-  EXPECT_EQ(drain(secondary), (std::vector{20}));
+  EXPECT_EQ(Drain(primary), (std::vector{10, 30}));
+  EXPECT_EQ(Drain(secondary), (std::vector{20}));
 }
