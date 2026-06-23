@@ -7,535 +7,481 @@
 #include <cstring>
 #include <format>
 #include <memory>
+#include <utility>
 
 #include <sys/eventfd.h>
 
 #include "logger.hpp"
 
-namespace tinyio
-{
+namespace tinyio {
 IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs)
-    : id_(id), opts_(opts), buffer_pool_(std::move(pool_configs)), post_queue_(opts.post_queue_capacity)
-{
-    if (auto res = initialize(); !res)
-    {
-        const auto err = res.error();
-        throw std::system_error(err.error_code(), std::format("tinyio::IO init failed in {}", err.op));
-    }
+    : id_(id),
+      opts_(opts),
+      buffer_pool_(std::move(pool_configs)),
+      post_queue_(opts.post_queue_capacity) {
+  if (auto res = Initialize(); !res) {
+    const auto err = res.error();
+    throw std::system_error(err.ErrorCode(),
+                            std::format("tinyio::IO init failed in {}", err.op));
+  }
 }
 
-IO::~IO() noexcept
-{
-    // Discard any tasks that were posted but not yet spawned.
-    // Their destructors release any captured resources before we tear down the ring.
-    {
-        ALOG_INFO("discarding ready tasks, worker {}", id_);
-        std::move_only_function<void(IO&) noexcept> fn;
-        while (post_queue_.try_dequeue(fn))
-        {
-        }
+IO::~IO() noexcept {
+  // Discard any tasks that were posted but not yet spawned.
+  // Their destructors release any captured resources before we tear down the ring.
+  {
+    ALOG_INFO("discarding ready tasks, worker {}", id_);
+    std::move_only_function<void(IO&) noexcept> fn;
+    while (post_queue_.TryDequeue(fn)) {
+    }
+  }
+
+  // Quiesce in-flight work before releasing kernel resources.
+  //
+  // If the ring was activated and there is still live work (fibers waiting
+  // on io_uring CQEs, ready fibers not yet resumed), we must cancel and drain
+  // here so the kernel does not reference freed Operation* pointers after
+  // io_uring_queue_exit().
+  //
+  // This MUST run on the owner thread: IORING_SETUP_SINGLE_ISSUER forbids
+  // cross-thread submission.  Destroying the IO from another thread while
+  // the ring has live work is a kernel UAF and causes abort.
+  const bool has_live_work =
+      live_fibers_ > 0 || inflight_ops_ > 0 || !ready_queue_.Empty();
+
+  if (is_activated_ && !stopping_ && has_live_work) {
+    if (!IsOwnerThread()) {
+      ALOG_ERROR(
+          "IO #{} destroyed from a non-owner thread with {} live fiber(s) "
+          "and {} op(s) in-flight — aborting to prevent kernel UAF",
+          id_, live_fibers_, inflight_ops_);
+      std::abort();
     }
 
-    // Quiesce in-flight work before releasing kernel resources.
-    //
-    // If the ring was activated and there is still live work (fibers waiting
-    // on io_uring CQEs, ready fibers not yet resumed), we must cancel and drain
-    // here so the kernel does not reference freed Operation* pointers after
-    // io_uring_queue_exit().
-    //
-    // This MUST run on the owner thread: IORING_SETUP_SINGLE_ISSUER forbids
-    // cross-thread submission.  Destroying the IO from another thread while
-    // the ring has live work is a kernel UAF and causes abort.
-    const bool has_live_work = live_fibers_ > 0 || inflight_ops_ > 0 || !ready_queue_.empty();
+    ALOG_WARN("IO #{} destroyed with {} live fiber(s); issuing cancels and draining", id_,
+              live_fibers_);
+    stopping_ = true;
+    CancelAndDrain();
+  }
 
-    if (is_activated_ && !stopping_ && has_live_work)
-    {
-        if (!is_owner_thread())
-        {
-            ALOG_ERROR(
-                "IO #{} destroyed from a non-owner thread with {} live fiber(s) "
-                "and {} op(s) in-flight — aborting to prevent kernel UAF",
-                id_, live_fibers_, inflight_ops_);
-            std::abort();
-        }
+  if (live_fibers_ > 0) {
+    ALOG_WARN("IO #{} teardown: {} fiber(s) still live (stuck in app logic?)", id_,
+              live_fibers_);
+  }
 
-        ALOG_WARN("IO #{} destroyed with {} live fiber(s); issuing cancels and draining", id_, live_fibers_);
-        stopping_ = true;
-        cancel_and_drain();
+  if (ring_.ring_fd > 0 && buffer_pool_.IsRegistered()) {
+    if (auto res = UnregisterBuffers(); !res.has_value()) {
+      auto err = res.error();
+      ALOG_ERROR("Failed to unregister buffers: [{}] {}", err.op, err);
     }
+    ALOG_INFO("unregistered buffers, worker: {}", id_);
+  }
 
-    if (live_fibers_ > 0)
-    {
-        ALOG_WARN("IO #{} teardown: {} fiber(s) still live (stuck in app logic?)", id_, live_fibers_);
+  if (ring_.ring_fd > 0 && !direct_fds_.empty()) {
+    if (const int ret = io_uring_unregister_files(&ring_); ret < 0) {
+      ALOG_ERROR("Failed to unregister files: {}", std::strerror(-ret));
     }
+    ALOG_INFO("unregistered files, worker: {}", id_);
+  }
 
-    if (ring_.ring_fd > 0 && buffer_pool_.is_registered())
-    {
-        if (auto res = unregister_buffers(); !res.has_value())
-        {
-            auto err = res.error();
-            ALOG_ERROR("Failed to unregister buffers: [{}] {}", err.op, err.error_code().message());
-        }
-        ALOG_INFO("unregistered buffers, worker: {}", id_);
-    }
+  if (ring_.ring_fd > 0) {
+    io_uring_queue_exit(&ring_);
+    ring_.ring_fd = -1;
+    ALOG_INFO("exited io-uring ring, worker {}", id_);
+  }
 
-    if (ring_.ring_fd > 0 && !direct_fds_.empty())
-    {
-        if (const int ret = io_uring_unregister_files(&ring_); ret < 0)
-        {
-            ALOG_ERROR("Failed to unregister files: {}", std::strerror(-ret));
-        }
-        ALOG_INFO("unregistered files, worker: {}", id_);
-    }
+  if (wake_fd_ >= 0) {
+    ::close(wake_fd_);
+    wake_fd_ = -1;
+  }
 
-    if (ring_.ring_fd > 0)
-    {
-        io_uring_queue_exit(&ring_);
-        ring_.ring_fd = -1;
-        ALOG_INFO("exited io-uring ring, worker {}", id_);
-    }
-
-    if (wake_fd_ >= 0)
-    {
-        ::close(wake_fd_);
-        wake_fd_ = -1;
-    }
-
-    // Release all fiber stacks and Fiber objects (both live and idle).
-    destroy_all_fibers();
+  // Release all fiber stacks and Fiber objects (both live and idle).
+  DestroyAllFibers();
 }
 
-Result<void> IO::initialize() noexcept
-{
-    io_uring_params params{};
+Result<void> IO::Initialize() noexcept {
+  io_uring_params params{};
 
-    owner_tid_ = std::this_thread::get_id();
+  owner_tid_ = std::this_thread::get_id();
 
-    // disable the ring first (kUringBaseFlags already includes IORING_SETUP_R_DISABLED)
-    params.flags |= kUringBaseFlags | opts_.additional_uring_flags;
+  // disable the ring first (kUringBaseFlags already includes IORING_SETUP_R_DISABLED)
+  params.flags |= k_uring_base_flags | opts_.additional_uring_flags;
 
-    params.cq_entries = opts_.sq_entries * 2;
+  params.cq_entries = opts_.sq_entries * 2;
 
-    // Safely configure SQPOLL if requested
-    if (params.flags & IORING_SETUP_SQPOLL)
-    {
-        params.sq_thread_idle = opts_.sq_thread_idle_ms;
-        if (opts_.sq_thread_cpu >= 0)
-        {
-            params.flags |= IORING_SETUP_SQ_AFF;
-            params.sq_thread_cpu = opts_.sq_thread_cpu;
-        }
+  // Safely configure SQPOLL if requested
+  if (params.flags & IORING_SETUP_SQPOLL) {
+    params.sq_thread_idle = opts_.sq_thread_idle_ms;
+    if (opts_.sq_thread_cpu >= 0) {
+      params.flags |= IORING_SETUP_SQ_AFF;
+      params.sq_thread_cpu = opts_.sq_thread_cpu;
     }
+  }
 
-    if ((params.flags & IORING_SETUP_SQPOLL) && (params.flags & IORING_SETUP_DEFER_TASKRUN))
-    {
-        return fail(EINVAL,
-                    "IORING_SETUP_SQPOLL is incompatible with DEFER_TASKRUN; "
-                    "clear kUringDefaultAdditionalFlag bits when enabling SQPOLL");
+  if ((params.flags & IORING_SETUP_SQPOLL) &&
+      (params.flags & IORING_SETUP_DEFER_TASKRUN)) {
+    return Fail(EINVAL,
+                "IORING_SETUP_SQPOLL is incompatible with DEFER_TASKRUN; "
+                "clear kUringDefaultAdditionalFlag bits when enabling SQPOLL");
+  }
+
+  if (const int rc = io_uring_queue_init_params(opts_.sq_entries, &ring_, &params);
+      rc < 0) {
+    return Fail(-rc, "io_uring_queue_init_params");
+  }
+
+  wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (wake_fd_ < 0) {
+    io_uring_queue_exit(&ring_);
+    return Fail(errno, "eventfd");
+  }
+
+  // register pool if not empty
+  if (buffer_pool_.BucketCount() != 0) {
+    TRY(RegisterBuffers(buffer_pool_));
+    ALOG_INFO("the buffer pool have been registered to io_uring");
+  }
+
+  if (opts_.direct_fd_table_size > 0) {
+    direct_fds_.resize(opts_.direct_fd_table_size, -1);
+    if (const int ret =
+            io_uring_register_files(&ring_, direct_fds_.data(), direct_fds_.size());
+        ret < 0) {
+      return Fail(-ret, "io_uring_register_files");
     }
+    ALOG_INFO("registered direct fd table of size {}", opts_.direct_fd_table_size);
+  }
 
-    if (const int rc = io_uring_queue_init_params(opts_.sq_entries, &ring_, &params); rc < 0)
-    {
-        return fail(-rc, "io_uring_queue_init_params");
+  ALOG_INFO(
+      "Initialized IO context with {} submission entries (SQPOLL: {})", opts_.sq_entries,
+      (opts_.additional_uring_flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
+
+  return {};
+}
+
+Result<void> IO::RegisterBuffers(FixedBufferPool& pool) noexcept {
+  if (pool.IsRegistered()) {
+    return Fail(EALREADY, "register_buffers: pool already registered");
+  }
+
+  if (const int ret =
+          io_uring_register_buffers(&ring_, pool.IovecsPtr(), pool.TotalCapacity());
+      ret < 0) {
+    return Fail(-ret, "io_uring_register_buffers");
+  }
+
+  pool.SetRegistered();
+
+  return {};
+}
+
+Result<void> IO::UnregisterBuffers() noexcept {
+  if (const int ret = io_uring_unregister_buffers(&ring_); ret < 0) {
+    return Fail(-ret, "io_uring_unregister_buffers");
+  }
+  return {};
+}
+
+void Fd::CloseImpl() noexcept {
+  if (fd < 0) return;
+  if (direct && io_ptr) {
+    io_ptr->UnregisterDirectFd(fd);
+  } else if (!direct) {
+    ::close(fd);
+  }
+  fd = -1;
+  direct = false;
+  io_ptr = nullptr;
+}
+
+Result<Fd> IO::RegisterFile(Fd fd) noexcept {
+  if (!fd.IsValid() || fd.IsDirect()) return fd;
+
+  if (direct_fds_.empty()) return fd;
+
+  const auto it =
+      std::find(direct_fds_.begin() + next_free_direct_idx_, direct_fds_.end(), -1);
+  if (it == direct_fds_.end()) {
+    ALOG_WARN("register_file: direct FD table full ({}/{}), fd {} will use indirect path",
+              direct_fds_cnt_, direct_fds_.size(), fd.Get());
+    return fd;
+  }
+
+  const int idx = std::distance(direct_fds_.begin(), it);
+  int raw_fd = fd.Get();
+
+  if (const int ret = io_uring_register_files_update(&ring_, idx, &raw_fd, 1); ret < 0) {
+    ALOG_WARN("register_file: io_uring_register_files_update failed for fd {}: {}",
+              raw_fd, std::strerror(-ret));
+    return fd;
+  }
+
+  direct_fds_[idx] = raw_fd;
+  next_free_direct_idx_ = idx + 1;
+  direct_fds_cnt_++;
+
+  ::close(fd.Release());  // raw kernel fd is consumed
+
+  Fd direct_fd(idx);
+  direct_fd.direct = true;
+  direct_fd.io_ptr = this;
+  return direct_fd;
+}
+
+void IO::UnregisterDirectFd(const int direct_idx) noexcept {
+  if (direct_idx < 0 || static_cast<size_t>(direct_idx) >= direct_fds_.size()) {
+    return;
+  }
+
+  constexpr int empty_fd = -1;
+  if (const int ret = io_uring_register_files_update(&ring_, direct_idx, &empty_fd, 1);
+      ret >= 0) {
+    direct_fds_[direct_idx] = -1;
+    direct_fds_cnt_--;
+    if (std::cmp_less(direct_idx, next_free_direct_idx_)) {
+      next_free_direct_idx_ = direct_idx;
     }
+  }
+}
 
-    wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (wake_fd_ < 0)
-    {
-        io_uring_queue_exit(&ring_);
-        return fail(errno, "eventfd");
-    }
+Result<void> IO::Close(const int fd) noexcept {
+  return Syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd); });
+}
 
-    // register pool if not empty
-    if (buffer_pool_.bucket_count() != 0)
-    {
-        TRY(register_buffers(buffer_pool_));
-        ALOG_INFO("the buffer pool have been registered to io_uring");
-    }
+Result<void> IO::Close(Fd fd) noexcept {
+  if (!fd.IsValid()) return {};
 
-    if (opts_.direct_fd_table_size > 0)
-    {
-        direct_fds_.resize(opts_.direct_fd_table_size, -1);
-        if (const int ret = io_uring_register_files(&ring_, direct_fds_.data(), direct_fds_.size()); ret < 0)
-        {
-            return fail(-ret, "io_uring_register_files");
-        }
-        ALOG_INFO("registered direct fd table of size {}", opts_.direct_fd_table_size);
-    }
-
-    ALOG_INFO("Initialized IO context with {} submission entries (SQPOLL: {})", opts_.sq_entries,
-              (opts_.additional_uring_flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
-
+  if (fd.IsDirect()) {
+    UnregisterDirectFd(fd.Get());
+    (void)fd.Release();
     return {};
+  }
+
+  return Syscall<void>(
+      "close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd.Release()); });
 }
-
-Result<void> IO::register_buffers(FixedBufferPool& pool) noexcept
-{
-    if (pool.is_registered())
-    {
-        return fail(EALREADY, "register_buffers: pool already registered");
-    }
-
-    if (const int ret = io_uring_register_buffers(&ring_, pool.iovecs_ptr(), pool.total_capacity()); ret < 0)
-    {
-        return fail(-ret, "io_uring_register_buffers");
-    }
-
-    pool.set_registered();
-
-    return {};
-}
-
-Result<void> IO::unregister_buffers() noexcept
-{
-    if (const int ret = io_uring_unregister_buffers(&ring_); ret < 0)
-    {
-        return fail(-ret, "io_uring_unregister_buffers");
-    }
-    return {};
-}
-
-void Fd::close_impl() noexcept
-{
-    if (fd < 0) return;
-    if (direct && io_ptr)
-    {
-        io_ptr->unregister_direct_fd(fd);
-    }
-    else if (!direct)
-    {
-        ::close(fd);
-    }
-    fd = -1;
-    direct = false;
-    io_ptr = nullptr;
-}
-
-
-Result<Fd> IO::register_file(Fd fd) noexcept
-{
-    if (!fd.is_valid() || fd.is_direct()) return fd;
-
-    if (direct_fds_.empty()) return fd;
-
-    auto it = std::find(direct_fds_.begin() + next_free_direct_idx_, direct_fds_.end(), -1);
-    if (it == direct_fds_.end())
-    {
-        ALOG_WARN("register_file: direct FD table full ({}/{}), fd {} will use indirect path",
-                  direct_fds_cnt_, direct_fds_.size(), fd.get());
-        return fd;
-    }
-
-    int idx = std::distance(direct_fds_.begin(), it);
-    int raw_fd = fd.get();
-    
-    if (const int ret = io_uring_register_files_update(&ring_, idx, &raw_fd, 1); ret < 0)
-    {
-        ALOG_WARN("register_file: io_uring_register_files_update failed for fd {}: {}",
-                  raw_fd, std::strerror(-ret));
-        return fd;
-    }
-
-    direct_fds_[idx] = raw_fd;
-    next_free_direct_idx_ = idx + 1;
-    direct_fds_cnt_++;
-
-    ::close(fd.release()); // raw kernel fd is consumed
-
-    Fd direct_fd(idx);
-    direct_fd.direct = true;
-    direct_fd.io_ptr = this;
-    return direct_fd;
-}
-
-void IO::unregister_direct_fd(int direct_idx) noexcept
-{
-    if (direct_idx < 0 || static_cast<size_t>(direct_idx) >= direct_fds_.size()) return;
-    
-    int empty_fd = -1;
-    if (const int ret = io_uring_register_files_update(&ring_, direct_idx, &empty_fd, 1); ret >= 0)
-    {
-        direct_fds_[direct_idx] = -1;
-        direct_fds_cnt_--;
-        if (static_cast<uint32_t>(direct_idx) < next_free_direct_idx_)
-        {
-            next_free_direct_idx_ = direct_idx;
-        }
-    }
-}
-
-Result<void> IO::close(int fd) noexcept
-{
-    return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd); });
-}
-
-Result<void> IO::close(Fd fd) noexcept
-{
-    if (!fd.is_valid()) return {};
-
-    if (fd.is_direct())
-    {
-        unregister_direct_fd(fd.get());
-        (void)fd.release();
-        return {};
-    }
-    else
-    {
-        return syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd.release()); });
-    }
-}
-
 
 //
 // Fiber management
 //
-void IO::push_ready(detail::fiber::Fiber* fiber) noexcept
-{
-    if (fiber == nullptr || fiber->state == detail::fiber::FiberState::done)
-    {
-        return;
-    }
+void IO::PushReady(detail::fiber::Fiber* fiber) noexcept {
+  if (fiber == nullptr || fiber->state == detail::fiber::FiberState::done) {
+    return;
+  }
 
-    // Ask the specific hook if it is already in a list
-    auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
-    if (hook->is_linked())
-    {
-        return;
-    }
+  // Ask the specific hook if it is already in a list
+  if (const auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
+      hook->IsLinked()) {
+    return;
+  }
 
-    fiber->state = detail::fiber::FiberState::ready;
-    ready_queue_.push_back(fiber);
+  fiber->state = detail::fiber::FiberState::ready;
+  ready_queue_.PushBack(fiber);
 }
 
-void IO::remove_ready(detail::fiber::Fiber* fiber) noexcept
-{
-    if (fiber != nullptr)
-    {
-        // We don't even need to check if it's in the queue here!
-        // IntrusiveList::remove() already safely checks `is_linked()` internally
-        // and does nothing if the fiber isn't in the list.
-        ready_queue_.remove(fiber);
-    }
+void IO::RemoveReady(detail::fiber::Fiber* fiber) noexcept {
+  if (fiber != nullptr) {
+    // We don't even need to check if it's in the queue here!
+    // IntrusiveList::remove() already safely checks `is_linked()` internally
+    // and does nothing if the fiber isn't in the list.
+    ready_queue_.Remove(fiber);
+  }
 }
 
-[[nodiscard]] detail::fiber::Fiber* IO::pop_ready() noexcept
-{
-    return ready_queue_.pop_front();
+[[nodiscard]] detail::fiber::Fiber* IO::PopReady() noexcept {
+  return ready_queue_.PopFront();
 }
 
-void IO::destroy_fiber(detail::fiber::Fiber* fiber) noexcept
-{
-    if (fiber == nullptr)
-    {
-        return;
-    }
+void IO::DestroyFiber(detail::fiber::Fiber* fiber) noexcept {
+  if (fiber == nullptr) {
+    return;
+  }
 
-    ready_queue_.remove(fiber);
-    timer_wheel_.disarm(fiber);
-    fiber->task = nullptr;
+  ready_queue_.Remove(fiber);
+  timer_wheel_.Disarm(fiber);
+  fiber->task = nullptr;
 
-    detail::tools_destroy_fiber(fiber->tools);
+  detail::ToolsDestroyFiber(fiber->tools);
 
-    // Enforce the High-Water Mark!
-    if (idle_fibers_.size() >= opts_.max_idle_fibers)
-    {
-        // only remove from all_fibers_ when we are returning memory to the OS!
-        all_fibers_.remove(fiber);
+  // Enforce the High-Water Mark!
+  if (idle_fibers_.Size() >= opts_.max_idle_fibers) {
+    // only remove from all_fibers_ when we are returning memory to the OS!
+    all_fibers_.Remove(fiber);
 
-        //  unmap the stack memory to prevent leaks
-        detail::stack::release_stack(fiber->stack);
-        delete fiber;
-    }
-    else
-    {
-        // Cache it for later. It remains in all_fibers_!
-        idle_fibers_.push_back(fiber);
-    }
+    //  unmap the stack memory to prevent leaks
+    detail::stack::ReleaseStack(fiber->stack);
+    delete fiber;
+  } else {
+    // Cache it for later. It remains in all_fibers_!
+    idle_fibers_.PushBack(fiber);
+  }
 
-    --live_fibers_;
+  --live_fibers_;
 }
 
-void IO::destroy_all_fibers() noexcept
-{
-    // Iterate the master list. We are guaranteed to catch every reused/idle fiber.
-    while (detail::fiber::Fiber* fiber = all_fibers_.pop_front())
-    {
-        ready_queue_.remove(fiber);
-        idle_fibers_.remove(fiber);
+void IO::DestroyAllFibers() noexcept {
+  // Iterate the master list. We are guaranteed to catch every reused/idle fiber.
+  while (detail::fiber::Fiber* fiber = all_fibers_.PopFront()) {
+    ready_queue_.Remove(fiber);
+    idle_fibers_.Remove(fiber);
 
-        detail::tools_destroy_fiber(fiber->tools);
-        detail::stack::release_stack(fiber->stack);
-        delete fiber;
+    detail::ToolsDestroyFiber(fiber->tools);
+    detail::stack::ReleaseStack(fiber->stack);
+    delete fiber;
+  }
+}
+
+Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) noexcept {
+  if (!IsOwnerThread()) {
+    return Fail(EPERM, "spawn");
+  }
+
+  auto* fiber = idle_fibers_.PopFront();
+
+  if (fiber == nullptr) {
+    // Use unique_ptr so the Fiber is freed if allocate_stack fails below.
+    // We do NOT add to all_fibers_ until the stack is successfully allocated.
+    std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow)
+                                                    detail::fiber::Fiber());
+    if (!owned) {
+      return Fail(ENOMEM, "spawn");
     }
+    owned->runtime = this;
+
+    const auto stack =
+        TRY(detail::stack::AllocateStack(opts_.stack_size, opts_.guard_size));
+    owned->stack = stack;
+
+    // Only push to all_fibers_ once all allocations have succeeded.
+    all_fibers_.PushFront(owned.get());
+    fiber = owned.release();
+  }
+
+  ++live_fibers_;
+
+  fiber->runtime = this;
+
+  //  Reset state  for all fibers
+  // give every execution a unique ID for logging!
+  fiber->id = next_fiber_id_++;
+  fiber->task = std::move(task);
+  fiber->state = detail::fiber::FiberState::ready;
+  detail::tools_create_fiber(fiber->tools);
+
+  fiber->context.fctx = boost::context::detail::make_fcontext(
+      fiber->stack.high, fiber->stack.usable_size, &TinyioFiberEntry);
+
+  // push to active list
+  PushReady(fiber);
+
+  return fiber->id;
 }
 
-Result<FiberId> IO::spawn_task(std::move_only_function<void(IO&) noexcept> task) noexcept
-{
-    if (!is_owner_thread())
-    {
-        return fail(EPERM, "spawn");
-    }
+TIO_NO_SANITIZE_ADDRESS void IO::ResumeFiber(detail::fiber::Fiber* fiber) noexcept {
+  // Mark this fiber as the currently running one
+  current_fiber_ = fiber;
 
-    auto* fiber = idle_fibers_.pop_front();
+  fiber->state = detail::fiber::FiberState::running;
 
-    if (fiber == nullptr)
-    {
-        // Use unique_ptr so the Fiber is freed if allocate_stack fails below.
-        // We do NOT add to all_fibers_ until the stack is successfully allocated.
-        std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow) detail::fiber::Fiber());
-        if (!owned)
-        {
-            return fail(ENOMEM, "spawn");
-        }
-        owned->runtime = this;
+  detail::ToolsBeforeSwitch(scheduler_tools_, &fiber->tools, &fiber->stack);
+  boost::context::detail::transfer_t t =
+      boost::context::detail::jump_fcontext(fiber->context.fctx, fiber);
+  fiber->context.fctx = t.fctx;
+  detail::ToolsAfterSwitch(scheduler_tools_);
 
-        const auto stack = TRY(detail::stack::allocate_stack(opts_.stack_size, opts_.guard_size));
-        owned->stack = stack;
-
-        // Only push to all_fibers_ once all allocations have succeeded.
-        all_fibers_.push_front(owned.get());
-        fiber = owned.release();
-    }
-
-    ++live_fibers_;
-
-    fiber->runtime = this;
-
-    //  Reset state  for all fibers
-    // give every execution a unique ID for logging!
-    fiber->id = next_fiber_id_++;
-    fiber->task = std::move(task);
-    fiber->state = detail::fiber::FiberState::ready;
-    detail::tools_create_fiber(fiber->tools);
-
-    fiber->context.fctx =
-        boost::context::detail::make_fcontext(fiber->stack.high, fiber->stack.usable_size, &tinyio_fiber_entry);
-
-    // push to active list
-    push_ready(fiber);
-
-    return fiber->id;
+  // Clear it when we jump back to the scheduler
+  current_fiber_ = nullptr;
 }
 
-TIO_NO_SANITIZE_ADDRESS void IO::resume_fiber(detail::fiber::Fiber* fiber) noexcept
-{
-    // Mark this fiber as the currently running one
-    current_fiber_ = fiber;
+TIO_NO_SANITIZE_ADDRESS void IO::SuspendFiber(detail::fiber::Fiber* fiber) noexcept {
+  detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr);
 
-    fiber->state = detail::fiber::FiberState::running;
+  boost::context::detail::transfer_t t =
+      boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
+  scheduler_context_.fctx = t.fctx;
 
-    detail::tools_before_switch(scheduler_tools_, &fiber->tools, &fiber->stack);
-    boost::context::detail::transfer_t t = boost::context::detail::jump_fcontext(fiber->context.fctx, fiber);
-    fiber->context.fctx = t.fctx;
-    detail::tools_after_switch(scheduler_tools_);
-
-    // Clear it when we jump back to the scheduler
-    current_fiber_ = nullptr;
+  detail::ToolsAfterSwitch(fiber->tools);
 }
 
-TIO_NO_SANITIZE_ADDRESS void IO::suspend_fiber(detail::fiber::Fiber* fiber) noexcept
-{
-    detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
+[[nodiscard]] Result<void> IO::Yield() noexcept {
+  // Check 1: Did the user try to cheat and call this from a different OS thread?
+  // Check 2: Did the user call this from main() instead of inside a fiber?
+  if (!IsOwnerThread() || current_fiber_ == nullptr) {
+    return Fail(EPERM, "yield");
+  }
 
-    boost::context::detail::transfer_t t = boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
-    scheduler_context_.fctx = t.fctx;
+  assert(current_fiber_->runtime == this);
+  assert(current_fiber_->state == detail::fiber::FiberState::running);
 
-    detail::tools_after_switch(fiber->tools);
+  if (stopping_) {
+    return Fail(ECANCELED, "yield");
+  }
+
+  PushReady(current_fiber_);
+  SuspendFiber(current_fiber_);
+
+  return {};
 }
 
-[[nodiscard]] Result<void> IO::yield() noexcept
-{
-    // Check 1: Did the user try to cheat and call this from a different OS thread?
-    // Check 2: Did the user call this from main() instead of inside a fiber?
-    if (!is_owner_thread() || current_fiber_ == nullptr)
-    {
-        return fail(EPERM, "yield");
-    }
+bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
 
-    assert(current_fiber_->runtime == this);
-    assert(current_fiber_->state == detail::fiber::FiberState::running);
+[[noreturn]] TIO_NO_SANITIZE_ADDRESS void IO::FinishCurrentFiber(
+    detail::fiber::Fiber* fiber) noexcept {
+  fiber->state = detail::fiber::FiberState::done;
 
-    if (stopping_)
-    {
-        return fail(ECANCELED, "yield");
-    }
+  detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr);
+  boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
 
-    push_ready(current_fiber_);
-    suspend_fiber(current_fiber_);
-
-    return {};
-}
-
-bool IO::has_live_fibers() const noexcept
-{
-    return live_fibers_ > 0;
-}
-
-[[noreturn]] TIO_NO_SANITIZE_ADDRESS void IO::finish_current_fiber(detail::fiber::Fiber* fiber) noexcept
-{
-    fiber->state = detail::fiber::FiberState::done;
-
-    detail::tools_before_switch(fiber->tools, &scheduler_tools_, nullptr);
-    boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
-
-    std::terminate();
+  std::terminate();
 }
 
 //
 // IO Uring methods
 //
 
-void IO::cancel_and_drain() noexcept
-{
-    bool issued_cancels = false;
-    all_fibers_.for_each(
-        [&](const detail::fiber::Fiber& fiber) noexcept
-        {
-            if (fiber.state != detail::fiber::FiberState::waiting)
-            {
-                return;
-            }
-            auto res = get_sqe();
-            if (!res)
-            {
-                ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
-                return;
-            }
-            io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber.operation), 0);
-            io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
-            ++inflight_ops_;
-            issued_cancels = true;
-        });
-
-    for (uint64_t tagged_ptr : active_multishots_)
-    {
-        auto res = get_sqe();
-        if (!res)
-        {
-            ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op, res.error().error_code().message());
-            continue;
-        }
-        io_uring_prep_cancel64(res.value(), tagged_ptr, 0);
-        io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
-        ++inflight_ops_;
-        issued_cancels = true;
+void IO::CancelAndDrain() noexcept {
+  bool issued_cancels = false;
+  all_fibers_.ForEach([&](const detail::fiber::Fiber& fiber) noexcept {
+    if (fiber.state != detail::fiber::FiberState::waiting) {
+      return;
     }
-    active_multishots_.clear();
-
-    if (issued_cancels)
-    {
-        io_uring_submit(&ring_);
+    auto res = GetSqe();
+    if (!res) {
+      ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op,
+                 res.error().ErrorCode().message());
+      return;
     }
+    io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber.operation), 0);
+    io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
+    ++inflight_ops_;
+    issued_cancels = true;
+  });
 
-    while (inflight_ops_ > 0 || !ready_queue_.empty())
-    {
-        if (auto res = tick(); !res)
-        {
-            ALOG_ERROR("tick failed during cancel_and_drain: [{}] {}", res.error().op,
-                       res.error().error_code().message());
-            break;
-        }
+  for (uint64_t tagged_ptr : active_multishots_) {
+    auto res = GetSqe();
+    if (!res) {
+      ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op,
+                 res.error().ErrorCode().message());
+      continue;
     }
+    io_uring_prep_cancel64(res.value(), tagged_ptr, 0);
+    io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
+    ++inflight_ops_;
+    issued_cancels = true;
+  }
+  active_multishots_.clear();
+
+  if (issued_cancels) {
+    io_uring_submit(&ring_);
+  }
+
+  while (inflight_ops_ > 0 || !ready_queue_.Empty()) {
+    if (auto res = Tick(); !res) {
+      ALOG_ERROR("tick failed during cancel_and_drain: [{}] {}", res.error().op,
+                 res.error().ErrorCode().message());
+      break;
+    }
+  }
 }
 
 }  // namespace tinyio
@@ -543,677 +489,599 @@ void IO::cancel_and_drain() noexcept
 // Note: extern "C" with a C++ parameter type (transfer_t) is technically
 // non-conforming but required by Boost.Context's API. transfer_t is trivial,
 // so this works correctly on all targeted compilers (GCC/Clang).
-extern "C" [[noreturn]] void tinyio_fiber_entry(boost::context::detail::transfer_t t) noexcept
-{
-    auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(t.data);
-    if (fiber == nullptr || fiber->runtime == nullptr)
-    {
-        std::terminate();
-    }
-
-    auto& rt = *fiber->runtime;
-    rt.scheduler_context_.fctx = t.fctx;
-
-    // Complete the ASAN fiber switch.  We pass scheduler_tools_ (not
-    // fiber->tools) because resume_fiber() stored the fake-stack handle
-    // into scheduler_tools_.asan_fake_stack via tools_before_switch(), and
-    // __sanitizer_finish_switch_fiber() needs that same handle to finalise
-    // the transition from the scheduler's stack to ours.
-    tinyio::detail::tools_after_switch(fiber->tools);
-    fiber->task(rt);
-    rt.finish_current_fiber(fiber);
-
+extern "C" [[noreturn]] void TinyioFiberEntry(
+    boost::context::detail::transfer_t t) noexcept {
+  auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(t.data);
+  if (fiber == nullptr || fiber->runtime == nullptr) {
     std::terminate();
+  }
+
+  auto& rt = *fiber->runtime;
+  rt.scheduler_context_.fctx = t.fctx;
+
+  // Complete the ASAN fiber switch.  We pass scheduler_tools_ (not
+  // fiber->tools) because resume_fiber() stored the fake-stack handle
+  // into scheduler_tools_.asan_fake_stack via tools_before_switch(), and
+  // __sanitizer_finish_switch_fiber() needs that same handle to finalise
+  // the transition from the scheduler's stack to ours.
+  tinyio::detail::ToolsAfterSwitch(fiber->tools);
+  fiber->task(rt);
+  rt.FinishCurrentFiber(fiber);
+
+  std::terminate();
 }
 
-namespace tinyio
-{
-Result<void> IO::submit_or_wait_for() noexcept
-{
-    // Only block if we have no local work to do.
-    if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.empty() || !post_queue_.empty())
-    {
-        int ret = 0;
-        if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN)
-        {
-            ret = io_uring_submit_and_get_events(&ring_);
-        }
-        else
-        {
-            ret = io_uring_submit(&ring_);
-        }
-
-        if (ret < 0 && ret != -EINTR)
-        {
-            return fail(-ret, "submit_or_wait_for.io_uring_submit");
-        }
+namespace tinyio {
+Result<void> IO::SubmitOrWaitFor() noexcept {
+  // Only block if we have no local work to do.
+  if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || !post_queue_.Empty()) {
+    int ret = 0;
+    if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN) {
+      ret = io_uring_submit_and_get_events(&ring_);
+    } else {
+      ret = io_uring_submit(&ring_);
     }
-    else
-    {
+
+    if (ret < 0 && ret != -EINTR) {
+      return Fail(-ret, "submit_or_wait_for.io_uring_submit");
+    }
+  } else {
     // Sleep until a CQE arrives, the eventfd is written, or the nearest
     // armed wheel deadline passes. The bound is a syscall argument
     // (IORING_ENTER_EXT_ARG) - no timeout SQE exists anywhere.
-        __kernel_timespec ts{};
-        __kernel_timespec* tsp = nullptr;
-        if (const auto ns = timer_wheel_.ns_until_next(detail::monotonic_now_ns()); ns.has_value())
-        {
-            ts.tv_sec = static_cast<long long>(*ns / 1'000'000'000ULL);
-            ts.tv_nsec = static_cast<long long>(*ns % 1'000'000'000ULL);
-            tsp = &ts;
-        }
-
-        io_uring_cqe* cqe = nullptr;
-        if (const auto ret = io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
-            ret < 0 && ret != -EINTR && ret != -ETIME)
-        {
-            return fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait_timeout");
-        }
+    __kernel_timespec ts{};
+    __kernel_timespec* tsp = nullptr;
+    if (const auto ns = timer_wheel_.NsUntilNext(detail::MonotonicNowNs());
+        ns.has_value()) {
+      ts.tv_sec = static_cast<long long>(*ns / 1'000'000'000ULL);
+      ts.tv_nsec = static_cast<long long>(*ns % 1'000'000'000ULL);
+      tsp = &ts;
     }
 
-    return {};
-}
-
-Result<io_uring_sqe*> IO::get_sqe() noexcept
-{
-    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-    if (sqe == nullptr)
-    {
-        // SQ is full. Try one submit to clear space.
-        io_uring_submit(&ring_);
-        sqe = io_uring_get_sqe(&ring_);
-    }
-
-    // its a fatal error if its null again
-    if (sqe == nullptr)
-    {
-        return fail(ENOSPC, "get_sqe");
-    }
-    return sqe;
-}
-
-void IO::wake() const noexcept
-{
-    constexpr uint64_t one = 1;
-    for (;;)
-    {
-        const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
-        if (n == sizeof(one) || (n == -1 && errno == EAGAIN))
-        {
-            return;
-        }
-        if (n == -1 && errno == EINTR)
-        {
-            continue;
-        }
-        ALOG_WARN("failed to wake io context with eventfd: {}", std::strerror(errno));
-        return;
-    }
-}
-
-Result<void> IO::arm_wake_read() noexcept
-{
-    io_uring_sqe* sqe = TRY(get_sqe());
-    io_uring_prep_read(sqe, wake_fd_, &wake_value_, sizeof(wake_value_), 0);
-    io_uring_sqe_set_data64(sqe, kWakeupSentinel);
-    io_uring_submit(&ring_);
-    return {};
-}
-
-Result<void> IO::activate() noexcept
-{
-    if (is_activated_)
-    {
-        ALOG_DEBUG("IO is already activated, this is a noop");
-        return {};
-    }
-
-    // Register the scheduler (this OS thread) with the sanitizer runtimes
-    // BEFORE the first context switch. Under TSAN, every fiber-to-scheduler
-    // switch targets scheduler_tools_.tsan_fiber; if it was never captured,
-    // tools_before_switch() silently skips __tsan_switch_to_fiber and TSAN's
-    // shadow state diverges from reality on the first suspend - SEGV.
-    detail::tools_capture_current_thread(scheduler_tools_);
-
-    if (const int ret = io_uring_register(ring_.ring_fd, IORING_REGISTER_ENABLE_RINGS, nullptr, 0); ret < 0)
-    {
-        return fail(-ret, "io_uring_register");
-    }
-
-    // we need to submit a first read, and this is a good place
-    if (auto res = arm_wake_read(); !res)
-    {
-        const auto err = res.error();
-        ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
-    }
-    is_activated_ = true;
-
-    return {};
-}
-
-Result<std::size_t> IO::drain_completions() noexcept
-{
     io_uring_cqe* cqe = nullptr;
-    unsigned head = 0;
-    unsigned count = 0;
-    bool needs_rearm = false;
-
-    io_uring_for_each_cqe(&ring_, head, cqe)
-    {
-        const uint64_t raw_data = io_uring_cqe_get_data64(cqe);
-
-        if (__builtin_expect(!!(raw_data & 1ULL), 0))
-        {
-            auto* state = reinterpret_cast<MultishotAcceptState*>(raw_data & ~1ULL);
-
-            Result<Fd> client_res;
-            if (cqe->res >= 0)
-            {
-                client_res = Fd{cqe->res};
-            }
-            else
-            {
-                client_res = fail(-cqe->res, "multishot_accept");
-            }
-
-            // Always invoke the handler: on success, on transient errors (MORE set),
-            // and on terminal errors (MORE unset) so the application learns the
-            // accept loop ended and can restart or abort.
-            state->handler(*this, std::move(client_res));
-
-            if (!(cqe->flags & IORING_CQE_F_MORE))
-            {
-                // Erase from active list
-                std::erase(active_multishots_, raw_data);
-                delete state;
-                --inflight_ops_;
-            }
-        }
-        else if (raw_data == kWakeupSentinel)
-        {
-            // Defer re-arm until after cq_advance to avoid submitting a new SQE
-            // while the CQ ring is still being iterated.
-            needs_rearm = true;
-        }
-        else if (raw_data == kFiberCancelSentinel)
-        {
-            --inflight_ops_;
-        }
-        else if (raw_data != 0)
-        {
-            auto* op = static_cast<detail::fiber::Operation*>(io_uring_cqe_get_data(cqe));
-
-            op->cqe_res = cqe->res;
-            op->cqe_flags = cqe->flags;
-
-            if (op->fiber)
-            {
-                // If a timeout was armed for this op, retire it: this is the
-                // common case where the op beat its deadline. O(1) unlink.
-                if (op->deadline_ns != 0)
-                {
-                    timer_wheel_.disarm(op->fiber);
-                }
-                push_ready(op->fiber);
-                --inflight_ops_;
-            }
-        }
-
-        count++;
+    if (const auto ret = io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
+        ret < 0 && ret != -EINTR && ret != -ETIME) {
+      return Fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait_timeout");
     }
+  }
 
-    if (count > 0)
-    {
-        io_uring_cq_advance(&ring_, count);
-    }
-
-    // Re-arm the wakeup read after advancing the CQ, not mid-iteration.
-    if (needs_rearm)
-    {
-        if (auto res = arm_wake_read(); !res)
-        {
-            const auto err = res.error();
-            ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op, err.error_code().message());
-        }
-    }
-
-    return count;
+  return {};
 }
 
-void IO::drain_remote()
-{
-    constexpr size_t kMaxBulk = 64;
-    std::move_only_function<void(IO&) noexcept> fns[kMaxBulk];
-    size_t dequeued = 0;
-    size_t total_processed = 0;
+Result<io_uring_sqe*> IO::GetSqe() noexcept {
+  io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+  if (sqe == nullptr) {
+    // SQ is full. Try one submit to clear space.
+    io_uring_submit(&ring_);
+    sqe = io_uring_get_sqe(&ring_);
+  }
 
-    while (total_processed < opts_.batch_max_size)
-    {
-        const size_t to_dequeue = std::min(kMaxBulk, opts_.batch_max_size - total_processed);
-        dequeued = post_queue_.try_dequeue_bulk(fns, to_dequeue);
-
-        if (dequeued == 0)
-        {
-            break;
-        }
-
-        for (size_t i = 0; i < dequeued; ++i)
-        {
-            if (auto res = spawn_task(std::move(fns[i])); !res)
-            {
-                ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op, res.error().error_code().message());
-            }
-        }
-        total_processed += dequeued;
-    }
+  // its a fatal error if its null again
+  if (sqe == nullptr) {
+    return Fail(ENOSPC, "get_sqe");
+  }
+  return sqe;
 }
 
-void IO::resume_ready_fibers()
-{
-    size_t processed = 0;
-    while (processed < opts_.batch_max_size)
-    {
-        auto* fiber = pop_ready();
-        if (!fiber)
-        {
-            break;  // empty queue
-        }
-
-        // Jump into the user's code
-        resume_fiber(fiber);
-
-        // State Machine Cleanup
-        if (fiber->state == detail::fiber::FiberState::done)
-        {
-            destroy_fiber(fiber);
-        }
-
-        processed++;
+void IO::Wake() const noexcept {
+  constexpr uint64_t one = 1;
+  for (;;) {
+    const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
+    if (n == sizeof(one) || (n == -1 && errno == EAGAIN)) {
+      return;
     }
+    if (n == -1 && errno == EINTR) {
+      continue;
+    }
+    ALOG_WARN("failed to wake io context with eventfd: {}", std::strerror(errno));
+    return;
+  }
 }
-Result<void> IO::tick() noexcept
-{
-    // Flush SQEs and/or wait for CQEs.
-    // If ready_queue_ is empty, this safely drops the CPU to 0% and
-    // sleeps the thread until the kernel wakes us via a CQE.
-    if (auto ret = submit_or_wait_for(); !ret)
-    {
-        auto err = ret.error();
-        ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op, err.error_code().message());
-    }
 
-    auto count = TRY_LOG_ERR(drain_completions(), "current tick run failed to drain completions");
+Result<void> IO::ArmWakeRead() noexcept {
+  io_uring_sqe* sqe = TRY(GetSqe());
+  io_uring_prep_read(sqe, wake_fd_, &wake_value_, sizeof(wake_value_), 0);
+  io_uring_sqe_set_data64(sqe, k_wakeup_sentinel);
+  io_uring_submit(&ring_);
+  return {};
+}
 
-    ALOG_DEBUG("drained {} io completions", count);
-
-    // Cancel overdue timed ops. Runs after drain_completions() on purpose:
-    // ops that completed in this batch have already been disarmed, so we
-    // never cancel an op whose result the fiber is about to consume.
-    process_expired_timers();
-
-    // Drain tasks posted from remote threads and spawn them as fibers.
-    // Done here, after drain_completions(), so newly spawned tasks join the
-    // ready queue alongside any fibers that were just woken by CQEs.
-    // We use try_dequeue_bulk to grab multiple tasks at once efficiently,
-    // and limit the total processed per tick to prevent I/O starvation.
-
-    drain_remote();
-
-    resume_ready_fibers();
-
+Result<void> IO::Activate() noexcept {
+  if (is_activated_) {
+    ALOG_DEBUG("IO is already activated, this is a noop");
     return {};
+  }
+
+  // Register the scheduler (this OS thread) with the sanitizer runtimes
+  // BEFORE the first context switch. Under TSAN, every fiber-to-scheduler
+  // switch targets scheduler_tools_.tsan_fiber; if it was never captured,
+  // tools_before_switch() silently skips __tsan_switch_to_fiber and TSAN's
+  // shadow state diverges from reality on the first suspend - SEGV.
+  detail::tools_capture_current_thread(scheduler_tools_);
+
+  if (const int ret =
+          io_uring_register(ring_.ring_fd, IORING_REGISTER_ENABLE_RINGS, nullptr, 0);
+      ret < 0) {
+    return Fail(-ret, "io_uring_register");
+  }
+
+  // we need to submit a first read, and this is a good place
+  if (auto res = ArmWakeRead(); !res) {
+    const auto err = res.error();
+    ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op,
+              err.ErrorCode().message());
+  }
+  is_activated_ = true;
+
+  return {};
+}
+
+Result<std::size_t> IO::DrainCompletions() noexcept {
+  io_uring_cqe* cqe = nullptr;
+  unsigned head = 0;
+  unsigned count = 0;
+  bool needs_rearm = false;
+
+  io_uring_for_each_cqe(&ring_, head, cqe) {
+    const uint64_t raw_data = io_uring_cqe_get_data64(cqe);
+
+    if (__builtin_expect(!!(raw_data & 1ULL), 0)) {
+      auto* state = reinterpret_cast<MultishotAcceptState*>(raw_data & ~1ULL);
+
+      Result<Fd> client_res;
+      if (cqe->res >= 0) {
+        client_res = Fd{cqe->res};
+      } else {
+        client_res = Fail(-cqe->res, "multishot_accept");
+      }
+
+      // Always invoke the handler: on success, on transient errors (MORE set),
+      // and on terminal errors (MORE unset) so the application learns the
+      // accept loop ended and can restart or abort.
+      state->handler(*this, std::move(client_res));
+
+      if (!(cqe->flags & IORING_CQE_F_MORE)) {
+        // Erase from active list
+        std::erase(active_multishots_, raw_data);
+        delete state;
+        --inflight_ops_;
+      }
+    } else if (raw_data == k_wakeup_sentinel) {
+      // Defer re-arm until after cq_advance to avoid submitting a new SQE
+      // while the CQ ring is still being iterated.
+      needs_rearm = true;
+    } else if (raw_data == k_fiber_cancel_sentinel) {
+      --inflight_ops_;
+    } else if (raw_data != 0) {
+      auto* op = static_cast<detail::fiber::Operation*>(io_uring_cqe_get_data(cqe));
+
+      op->cqe_res = cqe->res;
+      op->cqe_flags = cqe->flags;
+
+      if (op->fiber) {
+        // If a timeout was armed for this op, retire it: this is the
+        // common case where the op beat its deadline. O(1) unlink.
+        if (op->deadline_ns != 0) {
+          timer_wheel_.Disarm(op->fiber);
+        }
+        PushReady(op->fiber);
+        --inflight_ops_;
+      }
+    }
+
+    count++;
+  }
+
+  if (count > 0) {
+    io_uring_cq_advance(&ring_, count);
+  }
+
+  // Re-arm the wakeup read after advancing the CQ, not mid-iteration.
+  if (needs_rearm) {
+    if (auto res = ArmWakeRead(); !res) {
+      const auto err = res.error();
+      ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op,
+                err.ErrorCode().message());
+    }
+  }
+
+  return count;
+}
+
+void IO::DrainRemote() {
+  constexpr size_t k_max_bulk = 64;
+  std::move_only_function<void(IO&) noexcept> fns[k_max_bulk];
+  size_t dequeued = 0;
+  size_t total_processed = 0;
+
+  while (total_processed < opts_.batch_max_size) {
+    const size_t to_dequeue =
+        std::min(k_max_bulk, opts_.batch_max_size - total_processed);
+    dequeued = post_queue_.TryDequeueBulk(fns, to_dequeue);
+
+    if (dequeued == 0) {
+      break;
+    }
+
+    for (size_t i = 0; i < dequeued; ++i) {
+      if (auto res = SpawnTask(std::move(fns[i])); !res) {
+        ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op,
+                   res.error().ErrorCode().message());
+      }
+    }
+    total_processed += dequeued;
+  }
+}
+
+void IO::ResumeReadyFibers() {
+  size_t processed = 0;
+  while (processed < opts_.batch_max_size) {
+    auto* fiber = PopReady();
+    if (!fiber) {
+      break;  // empty queue
+    }
+
+    // Jump into the user's code
+    ResumeFiber(fiber);
+
+    // State Machine Cleanup
+    if (fiber->state == detail::fiber::FiberState::done) {
+      DestroyFiber(fiber);
+    }
+
+    processed++;
+  }
+}
+Result<void> IO::Tick() noexcept {
+  // Flush SQEs and/or wait for CQEs.
+  // If ready_queue_ is empty, this safely drops the CPU to 0% and
+  // sleeps the thread until the kernel wakes us via a CQE.
+  if (auto ret = SubmitOrWaitFor(); !ret) {
+    auto err = ret.error();
+    ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op,
+               err.ErrorCode().message());
+  }
+
+  auto count =
+      TRY_LOG_ERR(DrainCompletions(), "current tick run failed to drain completions");
+
+  ALOG_DEBUG("drained {} io completions", count);
+
+  // Cancel overdue timed ops. Runs after drain_completions() on purpose:
+  // ops that completed in this batch have already been disarmed, so we
+  // never cancel an op whose result the fiber is about to consume.
+  ProcessExpiredTimers();
+
+  // Drain tasks posted from remote threads and spawn them as fibers.
+  // Done here, after drain_completions(), so newly spawned tasks join the
+  // ready queue alongside any fibers that were just woken by CQEs.
+  // We use try_dequeue_bulk to grab multiple tasks at once efficiently,
+  // and limit the total processed per tick to prevent I/O starvation.
+
+  DrainRemote();
+
+  ResumeReadyFibers();
+
+  return {};
 }
 
 //
 // ======================= Helpers ==========================================
 //
-void IO::pin_to_cpu() const
-{
-    const auto size = opts_.worker_cpu_affinity.size();
+void IO::PinToCpu() const {
+  const auto size = opts_.worker_cpu_affinity.size();
 
-    if (empty(opts_.worker_cpu_affinity))
-    {
-        return;
-    }
+  if (empty(opts_.worker_cpu_affinity)) {
+    return;
+  }
 
-    int physical_core_id = opts_.worker_cpu_affinity[id_ % size];
+  int physical_core_id = opts_.worker_cpu_affinity[id_ % size];
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(physical_core_id, &cpuset);
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(physical_core_id, &cpuset);
 
-    if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset); rc != 0)
-    {
-        ALOG_INFO("Warning: Failed to pin to physical CPU {}: {}", physical_core_id,
-                  std::generic_category().message(rc));
-    }
+  if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      rc != 0) {
+    ALOG_INFO("Warning: Failed to pin to physical CPU {}: {}", physical_core_id,
+              std::generic_category().message(rc));
+  }
 }
 
-void IO::run(const std::stop_token& st) noexcept
-{
-    is_running_ = true;
+void IO::Run(const std::stop_token& st) noexcept {
+  is_running_ = true;
 
-    pin_to_cpu();
+  PinToCpu();
 
-    if (auto res = activate(); !res.has_value())
-    {
-        auto err = res.error();
-        ALOG_ERROR("failed to activate io uring: [{}] {}", err.op, err.error_code().message());
-        return;
+  if (auto res = Activate(); !res.has_value()) {
+    auto err = res.error();
+    ALOG_ERROR("failed to activate io uring: [{}] {}", err.op, err.ErrorCode().message());
+    return;
+  }
+
+  std::stop_callback wake_on_stop{st, [this] { Wake(); }};
+  while (!st.stop_requested()) {
+    if (auto res = Tick(); !res) {
+      const auto err = res.error();
+      ALOG_ERROR("tick failed: [{}] {}", err.op, err.ErrorCode().message());
     }
+  }
 
-    std::stop_callback wake_on_stop{st, [this] { wake(); }};
-    while (!st.stop_requested())
-    {
-        if (auto res = tick(); !res)
-        {
-            const auto err = res.error();
-            ALOG_ERROR("tick failed: [{}] {}", err.op, err.error_code().message());
-        }
-    }
+  stopping_ = true;
+  ALOG_INFO("Worker {} quiescing...", id_);
+  CancelAndDrain();
 
-    stopping_ = true;
-    ALOG_INFO("Worker {} quiescing...", id_);
-    cancel_and_drain();
+  is_running_ = false;
 
-    is_running_ = false;
-
-    if (live_fibers_ > 0)
-    {
-        ALOG_WARN("Worker {} stopped with {} live fibers (stuck in app logic?)", id_, live_fibers_);
-    }
+  if (live_fibers_ > 0) {
+    ALOG_WARN("Worker {} stopped with {} live fibers (stuck in app logic?)", id_,
+              live_fibers_);
+  }
 }
 
-void IO::run_until_done() noexcept
-{
-    is_running_ = true;
+void IO::RunUntilDone() noexcept {
+  is_running_ = true;
 
-    pin_to_cpu();
+  PinToCpu();
 
-    if (auto res = activate(); !res)
-    {
-        const auto err = res.error();
-        ALOG_ERROR("failed to activate io worker: [{}] {}", err.op, err.error_code().message());
-        is_running_ = false;
-        return;
-    }
-
-    // Also drain the cross-thread post queue: tasks posted before run_until_done()
-    // is called would be silently dropped if we only checked live_fibers_.
-    // Note: inflight_ops_ is always at least 1 because the cross-thread wake_fd_
-    // is constantly armed for reading. We check for > 1 to ensure there are
-    // no active user I/O operations pending.
-    while (has_live_fibers() || inflight_ops_ > 1 || !ready_queue_.empty() || !post_queue_.empty())
-    {
-        if (auto res = tick(); !res)
-        {
-            const auto err = res.error();
-            ALOG_ERROR("io tick failed: [{}] {}", err.op, err.error_code().message());
-            break;
-        }
-    }
-
+  if (auto res = Activate(); !res) {
+    const auto err = res.error();
+    ALOG_ERROR("failed to activate io worker: [{}] {}", err.op,
+               err.ErrorCode().message());
     is_running_ = false;
+    return;
+  }
+
+  // Also drain the cross-thread post queue: tasks posted before run_until_done()
+  // is called would be silently dropped if we only checked live_fibers_.
+  // Note: inflight_ops_ is always at least 1 because the cross-thread wake_fd_
+  // is constantly armed for reading. We check for > 1 to ensure there are
+  // no active user I/O operations pending.
+  while (HasLiveFibers() || inflight_ops_ > 1 || !ready_queue_.Empty() ||
+         !post_queue_.Empty()) {
+    if (auto res = Tick(); !res) {
+      const auto err = res.error();
+      ALOG_ERROR("io tick failed: [{}] {}", err.op, err.ErrorCode().message());
+      break;
+    }
+  }
+
+  is_running_ = false;
 }
 //
 // ======================= IO Methods ==========================================
 //
 
-Result<uint32_t> IO::read(const Fd& fd, const std::span<std::byte> buf, const off_t offset) noexcept
-{
-    return syscall("read", [&](io_uring_sqe* sqe) { 
-        io_uring_prep_read(sqe, fd.get(), buf.data(), buf.size(), offset); 
-        if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-    });
+Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
+                          const off_t offset) noexcept {
+  return Syscall("read", [&](io_uring_sqe* sqe) {
+    io_uring_prep_read(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const size_t len, const off_t offset) noexcept
-{
-    return syscall("read_fixed", [&](io_uring_sqe* sqe)
-                   { 
-                       io_uring_prep_read_fixed(sqe, fd.get(), buf.ptr(), len, offset, buf.index()); 
-                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                   });
+Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf, const size_t len,
+                               const off_t offset) noexcept {
+  return Syscall("read_fixed", [&](io_uring_sqe* sqe) {
+    io_uring_prep_read_fixed(sqe, fd.Get(), buf.Ptr(), len, offset, buf.Index());
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::read_fixed(const Fd& fd, FixedBuffer& buf, const off_t offset) noexcept
-{
-    return read_fixed(fd, buf, buf.size(), offset);
+Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf,
+                               const off_t offset) noexcept {
+  return ReadFixed(fd, buf, buf.Size(), offset);
 }
 
-Result<uint32_t> IO::writev(const Fd& fd, std::span<const iovec> iovecs, const off_t offset) noexcept
-{
-    return syscall("writev",
-                   [&](io_uring_sqe* sqe) { 
-                       io_uring_prep_writev(sqe, fd.get(), iovecs.data(), iovecs.size(), offset); 
-                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                   });
+Result<uint32_t> IO::Writev(const Fd& fd, std::span<const iovec> iovecs,
+                            const off_t offset) noexcept {
+  return Syscall("writev", [&](io_uring_sqe* sqe) {
+    io_uring_prep_writev(sqe, fd.Get(), iovecs.data(), iovecs.size(), offset);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<void> IO::fsync(const Fd& fd, const bool datasync) noexcept
-{
-    return syscall<void>(
-        "fsync", [&](io_uring_sqe* sqe) { 
-            io_uring_prep_fsync(sqe, fd.get(), datasync ? IORING_FSYNC_DATASYNC : 0); 
-            if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-        });
+Result<void> IO::Fsync(const Fd& fd, const bool datasync) noexcept {
+  return Syscall<void>("fsync", [&](io_uring_sqe* sqe) {
+    io_uring_prep_fsync(sqe, fd.Get(), datasync ? IORING_FSYNC_DATASYNC : 0);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<Fd> IO::open(const std::filesystem::path& path, const int flags, const mode_t mode) noexcept
-{
-    return syscall<Fd>("open",
-                       [&](io_uring_sqe* sqe) { io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode); });
+Result<Fd> IO::Open(const std::filesystem::path& path, const int flags,
+                    const mode_t mode) noexcept {
+  return Syscall<Fd>("open", [&](io_uring_sqe* sqe) {
+    io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode);
+  });
 }
 
-Result<void> IO::fallocate(const Fd& fd, const int mode, const off_t offset, const off_t len) noexcept
-{
-    return syscall<void>("fallocate",
-                         [&](io_uring_sqe* sqe) { 
-                             io_uring_prep_fallocate(sqe, fd.get(), mode, offset, len); 
-                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                         });
+Result<void> IO::Fallocate(const Fd& fd, const int mode, const off_t offset,
+                           const off_t len) noexcept {
+  return Syscall<void>("fallocate", [&](io_uring_sqe* sqe) {
+    io_uring_prep_fallocate(sqe, fd.Get(), mode, offset, len);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<void> IO::ftruncate(const Fd& fd, const off_t len) noexcept
-{
-    return syscall<void>("ftruncate", [&](io_uring_sqe* sqe) { 
-        io_uring_prep_ftruncate(sqe, fd.get(), len); 
-        if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-    });
+Result<void> IO::Ftruncate(const Fd& fd, const off_t len) noexcept {
+  return Syscall<void>("ftruncate", [&](io_uring_sqe* sqe) {
+    io_uring_prep_ftruncate(sqe, fd.Get(), len);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<Fd> IO::accept(const Fd& server_fd, SocketAddress& client_addr, int flags) noexcept
-{
-    return syscall<Fd>("accept",
-                       [&](io_uring_sqe* sqe)
-                       {
-                           client_addr.addrlen = sizeof(sockaddr_storage);
-                           io_uring_prep_accept(sqe, server_fd.get(), client_addr.get_mutable(), &client_addr.addrlen,
-                                                flags);
-                           if (server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                       });
+Result<Fd> IO::Accept(const Fd& server_fd, SocketAddress& client_addr,
+                      int flags) noexcept {
+  return Syscall<Fd>("accept", [&](io_uring_sqe* sqe) {
+    client_addr.addrlen = sizeof(sockaddr_storage);
+    io_uring_prep_accept(sqe, server_fd.Get(), client_addr.GetMutable(),
+                         &client_addr.addrlen, flags);
+    if (server_fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<Fd> IO::accept(const Fd& server_fd, const int flags) noexcept
-{
-    return syscall<Fd>("accept",
-                       [&](io_uring_sqe* sqe) { 
-                           io_uring_prep_accept(sqe, server_fd.get(), nullptr, nullptr, flags); 
-                           if (server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                       });
+Result<Fd> IO::Accept(const Fd& server_fd, const int flags) noexcept {
+  return Syscall<Fd>("accept", [&](io_uring_sqe* sqe) {
+    io_uring_prep_accept(sqe, server_fd.Get(), nullptr, nullptr, flags);
+    if (server_fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::write(const Fd& fd, std::span<const std::byte> buf, const off_t offset) noexcept
-{
-    return syscall("write",
-                   [&](io_uring_sqe* sqe) { 
-                       io_uring_prep_write(sqe, fd.get(), buf.data(), buf.size(), offset); 
-                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                   });
+Result<uint32_t> IO::Write(const Fd& fd, std::span<const std::byte> buf,
+                           const off_t offset) noexcept {
+  return Syscall("write", [&](io_uring_sqe* sqe) {
+    io_uring_prep_write(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const size_t len, const off_t offset) noexcept
-{
-    return syscall("write_fixed", [&](io_uring_sqe* sqe)
-                   { 
-                       io_uring_prep_write_fixed(sqe, fd.get(), buf.ptr(), len, offset, buf.index()); 
-                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                   });
+Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf, const size_t len,
+                                const off_t offset) noexcept {
+  return Syscall("write_fixed", [&](io_uring_sqe* sqe) {
+    io_uring_prep_write_fixed(sqe, fd.Get(), buf.Ptr(), len, offset, buf.Index());
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::write_fixed(const Fd& fd, const FixedBuffer& buf, const off_t offset) noexcept
-{
-    return write_fixed(fd, buf, buf.size(), offset);
+Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf,
+                                const off_t offset) noexcept {
+  return WriteFixed(fd, buf, buf.Size(), offset);
 }
 
-Result<uint32_t> IO::readv(const Fd& fd, std::span<const iovec> iovecs, const off_t offset) noexcept
-{
-    return syscall("readv",
-                   [&](io_uring_sqe* sqe) { 
-                       io_uring_prep_readv(sqe, fd.get(), iovecs.data(), iovecs.size(), offset); 
-                       if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                   });
+Result<uint32_t> IO::Readv(const Fd& fd, std::span<const iovec> iovecs,
+                           const off_t offset) noexcept {
+  return Syscall("readv", [&](io_uring_sqe* sqe) {
+    io_uring_prep_readv(sqe, fd.Get(), iovecs.data(), iovecs.size(), offset);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<void> IO::remove(const std::filesystem::path& path) noexcept
-{
-    return syscall<void>("remove", [&](io_uring_sqe* sqe) { io_uring_prep_unlinkat(sqe, AT_FDCWD, path.c_str(), 0); });
+Result<void> IO::Remove(const std::filesystem::path& path) noexcept {
+  return Syscall<void>("remove", [&](io_uring_sqe* sqe) {
+    io_uring_prep_unlinkat(sqe, AT_FDCWD, path.c_str(), 0);
+  });
 }
 
-Result<void> IO::rename(const std::filesystem::path& from, const std::filesystem::path& to) noexcept
-{
-    return syscall<void>("rename", [&](io_uring_sqe* sqe)
-                         { io_uring_prep_renameat(sqe, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), 0); });
+Result<void> IO::Rename(const std::filesystem::path& from,
+                        const std::filesystem::path& to) noexcept {
+  return Syscall<void>("rename", [&](io_uring_sqe* sqe) {
+    io_uring_prep_renameat(sqe, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), 0);
+  });
 }
 
-Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask) noexcept
-{
-    return syscall("poll", [&](io_uring_sqe* sqe) { 
-        io_uring_prep_poll_add(sqe, fd.get(), poll_mask); 
-        if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-    });
+Result<uint32_t> IO::Poll(const Fd& fd, const unsigned poll_mask) noexcept {
+  return Syscall("poll", [&](io_uring_sqe* sqe) {
+    io_uring_prep_poll_add(sqe, fd.Get(), poll_mask);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<void> IO::connect(const Fd& fd, const SocketAddress& addr) noexcept
-{
-    return syscall<void>("connect",
-                         [&](io_uring_sqe* sqe) { 
-                             io_uring_prep_connect(sqe, fd.get(), addr.get(), addr.addrlen); 
-                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                         });
+Result<void> IO::Connect(const Fd& fd, const SocketAddress& addr) noexcept {
+  return Syscall<void>("connect", [&](io_uring_sqe* sqe) {
+    io_uring_prep_connect(sqe, fd.Get(), addr.Get(), addr.addrlen);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-void IO::process_expired_timers() noexcept
-{
-    if (!timer_wheel_.has_armed())
-    {
-        return;
-    }
+void IO::ProcessExpiredTimers() noexcept {
+  if (!timer_wheel_.HasArmed()) {
+    return;
+  }
 
-    bool issued = false;
-    timer_wheel_.expire(detail::monotonic_now_ns(),
-                        [&](detail::fiber::Fiber* fiber) noexcept
-                        {
-                            auto res = get_sqe();
-                            if (!res)
-                            {
-                                // Could not cancel now: re-arm one tick out and retry.
-                                ALOG_ERROR("timeout cancel SQE alloc failed: [{}] {}", res.error().op,
-                                           res.error().error_code().message());
-                                timer_wheel_.arm(fiber, detail::monotonic_now_ns() + detail::TimerWheel::kTickNs);
-                                return;
-                            }
-                            fiber->operation.timed_out = true;
-                            io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber->operation), 0);
-                            io_uring_sqe_set_data64(res.value(), kFiberCancelSentinel);
-                            ++inflight_ops_;
-                            issued = true;
-                        });
+  bool issued = false;
+  timer_wheel_.Expire(
+      detail::MonotonicNowNs(), [&](detail::fiber::Fiber* fiber) noexcept {
+        auto res = GetSqe();
+        if (!res) {
+          // Could not cancel now: re-arm one tick out and retry.
+          ALOG_ERROR("timeout cancel SQE alloc failed: [{}] {}", res.error().op,
+                     res.error());
+          timer_wheel_.Arm(fiber,
+                           detail::MonotonicNowNs() + detail::TimerWheel::k_tick_ns);
+          return;
+        }
+        fiber->operation.timed_out = true;
+        io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber->operation),
+                               0);
+        io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
+        ++inflight_ops_;
+        issued = true;
+      });
 
-    if (issued)
-    {
-        // Submit immediately (rare path, cheap insurance): the cancel must
-        // reach the kernel before any future SQE that reuses this fiber's
-        // &Operation as user_data, so it can never match a successor op.
-        io_uring_submit(&ring_);
-    }
+  if (issued) {
+    // Submit immediately (rare path, cheap insurance): the cancel must
+    // reach the kernel before any future SQE that reuses this fiber's
+    // &Operation as user_data, so it can never match a successor op.
+    io_uring_submit(&ring_);
+  }
 }
 
-Result<uint32_t> IO::read(const Fd& fd, const std::span<std::byte> buf, const std::chrono::nanoseconds timeout,
-                          const off_t offset) noexcept
-{
-    return syscall_timed("read_timed", timeout,
-                         [&](io_uring_sqe* sqe) { 
-                             io_uring_prep_read(sqe, fd.get(), buf.data(), buf.size(), offset); 
-                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                         });
+Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
+                          const std::chrono::nanoseconds timeout,
+                          const off_t offset) noexcept {
+  return SyscallTimed("read_timed", timeout, [&](io_uring_sqe* sqe) {
+    io_uring_prep_read(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::write(const Fd& fd, const std::span<const std::byte> buf, const std::chrono::nanoseconds timeout,
-                           const off_t offset) noexcept
-{
-    return syscall_timed("write_timed", timeout,
-                         [&](io_uring_sqe* sqe) { 
-                             io_uring_prep_write(sqe, fd.get(), buf.data(), buf.size(), offset); 
-                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                         });
+Result<uint32_t> IO::Write(const Fd& fd, const std::span<const std::byte> buf,
+                           const std::chrono::nanoseconds timeout,
+                           const off_t offset) noexcept {
+  return SyscallTimed("write_timed", timeout, [&](io_uring_sqe* sqe) {
+    io_uring_prep_write(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<Fd> IO::accept(const Fd& server_fd, const std::chrono::nanoseconds timeout, const int flags) noexcept
-{
-    return syscall_timed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe)
-                             { 
-                                 io_uring_prep_accept(sqe, server_fd.get(), nullptr, nullptr, flags); 
-                                 if (server_fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                             });
+Result<Fd> IO::Accept(const Fd& server_fd, const std::chrono::nanoseconds timeout,
+                      const int flags) noexcept {
+  return SyscallTimed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe) {
+    io_uring_prep_accept(sqe, server_fd.Get(), nullptr, nullptr, flags);
+    if (server_fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<void> IO::connect(const Fd& fd, const SocketAddress& addr, const std::chrono::nanoseconds timeout) noexcept
-{
-    return syscall_timed<void>("connect_timed", timeout,
-                               [&](io_uring_sqe* sqe) { 
-                                   io_uring_prep_connect(sqe, fd.get(), addr.get(), addr.addrlen); 
-                                   if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                               });
+Result<void> IO::Connect(const Fd& fd, const SocketAddress& addr,
+                         const std::chrono::nanoseconds timeout) noexcept {
+  return SyscallTimed<void>("connect_timed", timeout, [&](io_uring_sqe* sqe) {
+    io_uring_prep_connect(sqe, fd.Get(), addr.Get(), addr.addrlen);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<uint32_t> IO::poll(const Fd& fd, const unsigned poll_mask, const std::chrono::nanoseconds timeout) noexcept
-{
-    return syscall_timed("poll_timed", timeout,
-                         [&](io_uring_sqe* sqe) { 
-                             io_uring_prep_poll_add(sqe, fd.get(), poll_mask); 
-                             if (fd.is_direct()) sqe->flags |= IOSQE_FIXED_FILE;
-                         });
+Result<uint32_t> IO::Poll(const Fd& fd, const unsigned poll_mask,
+                          const std::chrono::nanoseconds timeout) noexcept {
+  return SyscallTimed("poll_timed", timeout, [&](io_uring_sqe* sqe) {
+    io_uring_prep_poll_add(sqe, fd.Get(), poll_mask);
+    if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
+  });
 }
 
-Result<void> IO::sleep_for_ns(const std::chrono::nanoseconds duration) noexcept
-{
-    if (duration.count() <= 0)
-    {
-        return {};
-    }
+Result<void> IO::SleepForNs(const std::chrono::nanoseconds duration) noexcept {
+  if (duration.count() <= 0) {
+    return {};
+  }
 
-    auto r = syscall<void>("sleep_for",
-                           [&](io_uring_sqe* sqe)
-                           {
-                               const auto ns = duration.count();
-                               auto& ts = current_fiber_->operation.timeout_ts;
-                               ts.tv_sec = ns / 1'000'000'000LL;
-                               ts.tv_nsec = ns % 1'000'000'000LL;
+  auto r = Syscall<void>("sleep_for", [&](io_uring_sqe* sqe) {
+    const auto ns = duration.count();
+    auto& ts = current_fiber_->operation.timeout_ts;
+    ts.tv_sec = ns / 1'000'000'000LL;
+    ts.tv_nsec = ns % 1'000'000'000LL;
 
-                               // Both structs have two 64-bit signed integers (tv_sec, tv_nsec) on 64-bit systems.
-                               static_assert(sizeof(struct timespec) == sizeof(__kernel_timespec),
-                                             "POSIX timespec and __kernel_timespec size mismatch");
+    // Both structs have two 64-bit signed integers (tv_sec, tv_nsec) on 64-bit systems.
+    static_assert(sizeof(struct timespec) == sizeof(__kernel_timespec),
+                  "POSIX timespec and __kernel_timespec size mismatch");
 
-                               const auto* kts = reinterpret_cast<__kernel_timespec*>(&ts);
+    const auto* kts = reinterpret_cast<__kernel_timespec*>(&ts);
 
-                               io_uring_prep_timeout(sqe, kts, 0U, 0U);
-                           });
+    io_uring_prep_timeout(sqe, kts, 0U, 0U);
+  });
 
-    if (!r && r.error().code == ETIME)
-    {
-        return {};
-    }
+  if (!r && r.error().code == ETIME) {
+    return {};
+  }
 
-    return r;
+  return r;
 }
 }  // namespace tinyio

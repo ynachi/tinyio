@@ -28,7 +28,7 @@ Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> data)
         const auto written = TRY_LOG_ERR(fio.write(fd, data), "failed to write to client");
         if (written == 0)
         {
-            return tinyio::fail(EIO, "write");
+            return tinyio::Fail(EIO, "write");
         }
         data = data.subspan(written);
     }
@@ -74,7 +74,7 @@ void server_loop(IO& io) noexcept
 {
     // closed by the destructor.
     // Need to better handle shutdown
-    const auto listener = tinyio::TcpListener::bind(FLAGS_port, FLAGS_ip.c_str());
+    const auto listener = tinyio::TcpListener::Bind(FLAGS_port, FLAGS_ip.c_str());
     if (!listener)
     {
         ALOG_ERROR("failed to bind tcp listener: {}", FLAGS_port);

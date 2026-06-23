@@ -1,23 +1,19 @@
 #pragma once
 
-#include "tinyio/intrusive_list.hpp"
-
 #include <array>
-#include <cstdint>
-#include <ctime>
 #include <optional>
 
 #include "fiber.hpp"
+#include "tinyio/intrusive_list.hpp"
 
-namespace tinyio::detail
-{
+namespace tinyio::detail {
 
 /// Monotonic clock in nanoseconds (immune to wall-clock adjustments).
-[[nodiscard]] inline uint64_t monotonic_now_ns() noexcept
-{
-    timespec ts{};
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
+[[nodiscard]] inline uint64_t MonotonicNowNs() noexcept {
+  timespec ts{};
+  ::clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
+         static_cast<uint64_t>(ts.tv_nsec);
 }
 
 /// \brief Hashed timing wheel for per-operation I/O timeouts.
@@ -40,113 +36,98 @@ namespace tinyio::detail
 /// horizon — bounded and harmless.
 ///
 /// Single-threaded: owner-thread only, like the rest of the runtime.
-class TimerWheel
-{
-public:
-    static constexpr uint64_t kTickNs = 64ULL * 1000 * 1000;  ///< 64ms slot granularity
-    static constexpr size_t kSlots = 512;                     ///< horizon ~32.7s (power of two)
-    static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be a power of two");
+class TimerWheel {
+ public:
+  static constexpr uint64_t k_tick_ns = 64ULL * 1000 * 1000;  ///< 64ms slot granularity
+  static constexpr size_t k_slots = 512;  ///< horizon ~32.7s (power of two)
+  static_assert((k_slots & (k_slots - 1)) == 0, "kSlots must be a power of two");
 
-    using Queue = IntrusiveList<fiber::Fiber, TimerTag, false>;
+  using Queue = IntrusiveList<fiber::Fiber, TimerTag, false>;
 
-    /// Arm a timeout for @p f. Pre: f is not currently armed.
-    void arm(fiber::Fiber* f, const uint64_t deadline_ns) noexcept
-    {
-        f->operation.deadline_ns = deadline_ns;
-        slots_[slot_of(deadline_ns)].push_back(f);
-        ++armed_;
+  /// Arm a timeout for @p f. Pre: f is not currently armed.
+  void Arm(fiber::Fiber* f, const uint64_t deadline_ns) noexcept {
+    f->operation.deadline_ns = deadline_ns;
+    slots_[SlotOf(deadline_ns)].PushBack(f);
+    ++armed_;
+  }
+
+  /// Disarm @p f if armed. O(1), idempotent. Called when the guarded op
+  /// completes before its deadline (the overwhelmingly common case).
+  void Disarm(fiber::Fiber* f) noexcept {
+    if (const auto* hook = static_cast<IntrusiveHook<TimerTag>*>(f); !hook->IsLinked()) {
+      return;
+    }
+    slots_[SlotOf(f->operation.deadline_ns)].Remove(f);
+    f->operation.deadline_ns = 0;
+    --armed_;
+  }
+
+  [[nodiscard]] bool HasArmed() const noexcept { return armed_ != 0; }
+
+  /// Pop every fiber whose deadline has passed and hand it to @p on_expired.
+  /// Entries whose true deadline is still in the future (same-slot
+  /// neighbours, horizon aliases) are left armed.
+  template <class Fn>
+  void Expire(const uint64_t now_ns, Fn&& on_expired) noexcept {
+    const uint64_t cur = now_ns / k_tick_ns;
+    if (armed_ == 0) {
+      last_tick_ = cur;
+      return;
     }
 
-    /// Disarm @p f if armed. O(1), idempotent. Called when the guarded op
-    /// completes before its deadline (the overwhelmingly common case).
-    void disarm(fiber::Fiber* f) noexcept
-    {
-        if (const auto* hook = static_cast<IntrusiveHook<TimerTag>*>(f); !hook->is_linked())
-        {
-            return;
-        }
-        slots_[slot_of(f->operation.deadline_ns)].remove(f);
-        f->operation.deadline_ns = 0;
-        --armed_;
+    // If we lagged more than one full wrap, visiting each slot once covers everything.
+    uint64_t from = last_tick_;
+    if (cur - from >= k_slots) {
+      from = cur - (k_slots - 1);
     }
 
-    [[nodiscard]] bool has_armed() const noexcept { return armed_ != 0; }
-
-    /// Pop every fiber whose deadline has passed and hand it to @p on_expired.
-    /// Entries whose true deadline is still in the future (same-slot
-    /// neighbours, horizon aliases) are left armed.
-    template <class Fn>
-    void expire(const uint64_t now_ns, Fn&& on_expired) noexcept
-    {
-        const uint64_t cur = now_ns / kTickNs;
-        if (armed_ == 0)
-        {
-            last_tick_ = cur;
-            return;
+    for (uint64_t t = from; t <= cur; ++t) {
+      Queue& q = slots_[t & (k_slots - 1)];
+      // for_each captures `next` before invoking fn, so removing the
+      // current node inside the callback is safe.
+      q.ForEach([&](fiber::Fiber& f) noexcept {
+        if (f.operation.deadline_ns <= now_ns) {
+          q.Remove(&f);
+          f.operation.deadline_ns = 0;
+          --armed_;
+          on_expired(&f);
         }
+      });
+    }
+    last_tick_ = cur;
+  }
 
-        // If we lagged more than one full wrap, visiting each slot once covers everything.
-        uint64_t from = last_tick_;
-        if (cur - from >= kSlots)
-        {
-            from = cur - (kSlots - 1);
-        }
-
-        for (uint64_t t = from; t <= cur; ++t)
-        {
-            Queue& q = slots_[t & (kSlots - 1)];
-            // for_each captures `next` before invoking fn, so removing the
-            // current node inside the callback is safe.
-            q.for_each(
-                [&](fiber::Fiber& f) noexcept
-                {
-                    if (f.operation.deadline_ns <= now_ns)
-                    {
-                        q.remove(&f);
-                        f.operation.deadline_ns = 0;
-                        --armed_;
-                        on_expired(&f);
-                    }
-                });
-        }
-        last_tick_ = cur;
+  /// Nanoseconds until the next candidate deadline, or nullopt when nothing
+  /// is armed (== sleep indefinitely). May return early-wake values for
+  /// horizon-aliased entries; expire() then finds nothing due, which is fine.
+  [[nodiscard]] std::optional<uint64_t> NsUntilNext(
+      const uint64_t now_ns) const noexcept {
+    if (armed_ == 0) {
+      return std::nullopt;
     }
 
-    /// Nanoseconds until the next candidate deadline, or nullopt when nothing
-    /// is armed (== sleep indefinitely). May return early-wake values for
-    /// horizon-aliased entries; expire() then finds nothing due, which is fine.
-    [[nodiscard]] std::optional<uint64_t> ns_until_next(const uint64_t now_ns) const noexcept
-    {
-        if (armed_ == 0)
-        {
-            return std::nullopt;
-        }
-
-        const uint64_t cur = now_ns / kTickNs;
-        for (uint64_t off = 0; off < kSlots; ++off)
-        {
-            if (!slots_[(cur + off) & (kSlots - 1)].empty())
-            {
-                // Wake at the END of the candidate slot so every deadline
-                // inside it has passed when we process it.
-                const uint64_t target = (cur + off + 1) * kTickNs;
-                return target > now_ns ? target - now_ns : 0;
-            }
-        }
-
-        // unreachable while armed_ > 0
-        return std::nullopt;
+    const uint64_t cur = now_ns / k_tick_ns;
+    for (uint64_t off = 0; off < k_slots; ++off) {
+      if (!slots_[(cur + off) & (k_slots - 1)].Empty()) {
+        // Wake at the END of the candidate slot so every deadline
+        // inside it has passed when we process it.
+        const uint64_t target = (cur + off + 1) * k_tick_ns;
+        return target > now_ns ? target - now_ns : 0;
+      }
     }
 
-private:
-    [[nodiscard]] static size_t slot_of(const uint64_t deadline_ns) noexcept
-    {
-        return (deadline_ns / kTickNs) & (kSlots - 1);
-    }
+    // unreachable while armed_ > 0
+    return std::nullopt;
+  }
 
-    std::array<Queue, kSlots> slots_{};
-    uint64_t last_tick_ = 0;
-    size_t armed_ = 0;
+ private:
+  [[nodiscard]] static size_t SlotOf(const uint64_t deadline_ns) noexcept {
+    return (deadline_ns / k_tick_ns) & (k_slots - 1);
+  }
+
+  std::array<Queue, k_slots> slots_{};
+  uint64_t last_tick_ = 0;
+  size_t armed_ = 0;
 };
 
 }  // namespace tinyio::detail

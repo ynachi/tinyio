@@ -25,5 +25,21 @@ CheckOptions:
     value: '_'
   - key: modernize-use-scoped-lock.WarnOnSingleLocks
     value: 'false'
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.MethodCase
+    value: CamelCase
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
 
-HeaderFilterRegex: 'src/fastlog|example'
+HeaderFilterRegex: '^(src|include|tests|examples|benchmarks)/.*'

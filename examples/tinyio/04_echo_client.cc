@@ -31,11 +31,11 @@ std::atomic<uint64_t> total_errors{0};
 
 Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_id)
 {
-    const auto addr = SocketAddress::v4(FLAGS_port, FLAGS_ip.c_str());
+    const auto addr = SocketAddress::V4(FLAGS_port, FLAGS_ip.c_str());
     Fd sock{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
-    if (!sock.is_valid())
+    if (!sock.IsValid())
     {
-        return tinyio::fail(errno, "socket");
+        return tinyio::Fail(errno, "socket");
     }
 
     if (auto err = io.connect(sock, addr); !err.has_value())
@@ -53,7 +53,7 @@ Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_
         {
             const auto written = TRY_LOG_ERR(io.write(sock, to_write), "write to server");
             if (written == 0)
-                return tinyio::fail(EIO, "write closed");
+                return tinyio::Fail(EIO, "write closed");
             to_write = to_write.subspan(written);
         }
 
@@ -64,14 +64,14 @@ Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_
             std::span<std::byte> read_buf(buf);
             const auto n = TRY_LOG_ERR(io.read(sock, read_buf.subspan(received)), "read from server");
             if (n == 0)
-                return tinyio::fail(EIO, "read closed");
+                return tinyio::Fail(EIO, "read closed");
             received += n;
         }
 
         std::string_view rec_msg(reinterpret_cast<const char*>(buf), received);
         if (rec_msg != msg)
         {
-            return tinyio::fail(EBADMSG, "corrupted message");
+            return tinyio::Fail(EBADMSG, "corrupted message");
         }
     }
 

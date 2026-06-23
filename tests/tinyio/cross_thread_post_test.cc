@@ -19,10 +19,10 @@ TEST(CrossThreadPostTest, PostBeforeRun)
 
     bool task_ran = false;
 
-    bool posted = io.post([&](IO&) noexcept { task_ran = true; });
+    bool posted = io.Post([&](IO&) noexcept { task_ran = true; });
 
     ASSERT_TRUE(posted);
-    io.run_until_done();
+    io.RunUntilDone();
 
     EXPECT_TRUE(task_ran);
 }
@@ -45,7 +45,7 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread)
             io_ptr = &io;
             thread_started = true;
             // Since there are no fibers, run() will just wait for eventfd wakeup.
-            io.run(ss.get_token());
+            io.Run(ss.get_token());
         });
 
     while (!thread_started)
@@ -57,7 +57,7 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     const auto start = std::chrono::steady_clock::now();
-    const bool posted = io_ptr->post(
+    const bool posted = io_ptr->Post(
         [&](IO&) noexcept
         {
             task_ran = true;
@@ -99,7 +99,7 @@ TEST(CrossThreadPostTest, PostConcurrentCorrectness)
                 }
                 for (int j = 0; j < tasks_per_thread; ++j)
                 {
-                    while (!io.post([&](IO&) noexcept { counter.fetch_add(1, std::memory_order_relaxed); }))
+                    while (!io.Post([&](IO&) noexcept { counter.fetch_add(1, std::memory_order_relaxed); }))
                     {
                         // spin if queue is full
                         std::this_thread::yield();
@@ -113,16 +113,16 @@ TEST(CrossThreadPostTest, PostConcurrentCorrectness)
 
     // Also post a task that waits for completion, so the event loop doesn't exit early
     // before the threads are done enqueuing.
-    (void)io.spawn(
+    (void)io.Spawn(
         [&](IO& rt) noexcept
         {
             while (counter.load(std::memory_order_relaxed) < num_threads * tasks_per_thread)
             {
-                (void)rt.sleep_for_ns(std::chrono::nanoseconds(1'000'000ULL));  // 1ms
+                (void)rt.SleepForNs(std::chrono::nanoseconds(1'000'000ULL));  // 1ms
             }
         });
 
-    io.run_until_done();
+    io.RunUntilDone();
 
     for (auto& t : threads)
     {
@@ -145,12 +145,12 @@ TEST(CrossThreadPostTest, PostWhileFibersActive)
 
     for (int i = 0; i < 10; ++i)
     {
-        (void)io.spawn(
+        (void)io.Spawn(
             [&](IO& rt) noexcept
             {
                 for (int j = 0; j < 100; ++j)
                 {
-                    (void)rt.yield();
+                    (void)rt.Yield();
                     ++fiber_yields;
                 }
             });
@@ -164,7 +164,7 @@ TEST(CrossThreadPostTest, PostWhileFibersActive)
             {
                 for (int j = 0; j < 100; ++j)
                 {
-                    while (!io.post([&](IO&) noexcept { tasks_ran++; }))
+                    while (!io.Post([&](IO&) noexcept { tasks_ran++; }))
                     {
                         std::this_thread::yield();
                     }
@@ -176,17 +176,17 @@ TEST(CrossThreadPostTest, PostWhileFibersActive)
     std::stop_source ss;
 
     // Create a watchdog fiber to stop the loop when everything is done
-    (void)io.spawn(
+    (void)io.Spawn(
         [&](IO& rt) noexcept
         {
             while (tasks_ran.load() < 400 || fiber_yields.load() < 1000)
             {
-                (void)rt.sleep_for_ns(std::chrono::milliseconds(1));
+                (void)rt.SleepForNs(std::chrono::milliseconds(1));
             }
             (void)ss.request_stop();
         });
 
-    io.run(ss.get_token());
+    io.Run(ss.get_token());
 
     for (auto& t : threads)
     {
@@ -207,9 +207,9 @@ TEST(CrossThreadPostTest, PostAfterStop)
         IO io(0, opts, {});
         std::stop_source ss;
         (void)ss.request_stop();
-        io.run(ss.get_token());
+        io.Run(ss.get_token());
 
-        bool posted = io.post(
+        bool posted = io.Post(
             [&](IO&) noexcept
             {
                 // Task logic doesn't run, but its captured state should be destructed
@@ -224,7 +224,7 @@ TEST(CrossThreadPostTest, PostAfterStop)
                                                 delete p;
                                             });
 
-        posted = io.post([](IO&) noexcept {});
+        posted = io.Post([](IO&) noexcept {});
         EXPECT_TRUE(posted);
         // Let IO destruct
     }
@@ -243,7 +243,7 @@ TEST(CrossThreadPostTest, PostQueueFull)
     int success_count = 0;
     for (int i = 0; i < 17; ++i)
     {
-        if (io.post([](IO&) noexcept {}))
+        if (io.Post([](IO&) noexcept {}))
         {
             success_count++;
         }

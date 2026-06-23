@@ -71,7 +71,7 @@ static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> 
         const auto written = TRY(fio.write(fd, data));
         if (written == 0)
         {
-            return fail(EIO, "write");
+            return Fail(EIO, "write");
         }
         data = data.subspan(written);
     }
@@ -80,7 +80,7 @@ static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> 
 // Accept incoming connections on a single worker
 static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 {
-    auto server_fd = TRY_LOG_ERR(TcpListener::bind(port, "0.0.0.0", 4096), "failed to bind");
+    auto server_fd = TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
 
     ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
 
@@ -104,7 +104,7 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st)
 int main()
 {
     // Update ALOG namespace based on new logging
-    tinyio::log::set_level(log::Level::Disabled);
+    tinyio::log::SetLevel(log::Level::Disabled);
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);

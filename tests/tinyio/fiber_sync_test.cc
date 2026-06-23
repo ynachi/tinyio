@@ -24,21 +24,21 @@ TEST_F(FiberSyncTest, LatchBasic)
 {
     int count = 0;
 
-    (void)io.spawn([&count](IO& rt) noexcept {
+    (void)io.Spawn([&count](IO& rt) noexcept {
         Latch latch(rt, 3);
 
         for (int i = 0; i < 3; ++i) {
-            (void)rt.spawn([&latch, &count](IO&) noexcept {
+            (void)rt.Spawn([&latch, &count](IO&) noexcept {
                 count++;
-                latch.count_down();
+                latch.CountDown();
             });
         }
 
-        (void)latch.wait();
+        (void)latch.Wait();
         EXPECT_EQ(count, 3);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_EQ(count, 3);
 }
 
@@ -47,13 +47,13 @@ TEST_F(FiberSyncTest, LatchWaitReturnsImmediatelyWhenCountIsZero)
 {
     bool reached_after_wait = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Latch latch(rt, 0);
-        (void)latch.wait();
+        (void)latch.Wait();
         reached_after_wait = true;
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_TRUE(reached_after_wait);
 }
 
@@ -62,18 +62,18 @@ TEST_F(FiberSyncTest, LatchCountDownByN)
 {
     bool reached = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Latch latch(rt, 3);
 
-        (void)rt.spawn([&](IO&) noexcept {
-            latch.count_down(3);
+        (void)rt.Spawn([&](IO&) noexcept {
+            latch.CountDown(3);
         });
 
-        (void)latch.wait();
+        (void)latch.Wait();
         reached = true;
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_TRUE(reached);
 }
 
@@ -82,30 +82,30 @@ TEST_F(FiberSyncTest, LatchMultipleWaiters)
 {
     int waiters_done = 0;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Latch gate(rt, 1);
         Latch done(rt, 3);
 
         for (int i = 0; i < 3; ++i) {
-            (void)rt.spawn([&](IO&) noexcept {
-                (void)gate.wait();
+            (void)rt.Spawn([&](IO&) noexcept {
+                (void)gate.Wait();
                 waiters_done++;
-                done.count_down();
+                done.CountDown();
             });
         }
 
         // Yield once per spawned child so each reaches gate.wait() and suspends
         // before we fire the gate.
-        (void)rt.yield();
-        (void)rt.yield();
-        (void)rt.yield();
+        (void)rt.Yield();
+        (void)rt.Yield();
+        (void)rt.Yield();
 
-        gate.count_down();  // wakes all 3 simultaneously
-        (void)done.wait();
+        gate.CountDown();  // wakes all 3 simultaneously
+        (void)done.Wait();
         EXPECT_EQ(waiters_done, 3);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_EQ(waiters_done, 3);
 }
 
@@ -117,31 +117,31 @@ TEST_F(FiberSyncTest, SemaphoreBasic)
     int active = 0;
     int max_active = 0;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Semaphore sem(rt, 2);
         Latch done(rt, 5);
 
         for (int i = 0; i < 5; ++i) {
-            (void)rt.spawn([&](IO& inner) noexcept {
-                (void)sem.acquire();
+            (void)rt.Spawn([&](IO& inner) noexcept {
+                (void)sem.Acquire();
 
                 active++;
                 if (active > max_active)
                     max_active = active;
 
-                (void)inner.yield();
+                (void)inner.Yield();
 
                 active--;
-                sem.release();
-                done.count_down();
+                sem.Release();
+                done.CountDown();
             });
         }
 
-        (void)done.wait();
+        (void)done.Wait();
         EXPECT_LE(max_active, 2);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
 }
 
 // try_acquire succeeds (and decrements count) when slots are available.
@@ -149,12 +149,12 @@ TEST_F(FiberSyncTest, SemaphoreTryAcquireSucceedsWhenAvailable)
 {
     bool acquired = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Semaphore sem(rt, 1);
-        acquired = sem.try_acquire();
+        acquired = sem.TryAcquire();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_TRUE(acquired);
 }
 
@@ -163,13 +163,13 @@ TEST_F(FiberSyncTest, SemaphoreTryAcquireFailsWhenExhausted)
 {
     bool second = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Semaphore sem(rt, 1);
-        EXPECT_TRUE(sem.try_acquire());  // drains the slot
-        second = sem.try_acquire();      // nothing left
+        EXPECT_TRUE(sem.TryAcquire());  // drains the slot
+        second = sem.TryAcquire();      // nothing left
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_FALSE(second);
 }
 
@@ -178,30 +178,30 @@ TEST_F(FiberSyncTest, SemaphoreWaitersWokenFifo)
 {
     std::vector<int> order;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Semaphore sem(rt, 0);  // start exhausted so every acquire blocks
         Latch done(rt, 3);
 
         for (int i = 1; i <= 3; ++i) {
-            (void)rt.spawn([&, i](IO&) noexcept {
-                (void)sem.acquire();
+            (void)rt.Spawn([&, i](IO&) noexcept {
+                (void)sem.Acquire();
                 order.push_back(i);
-                done.count_down();
+                done.CountDown();
             });
         }
 
         // Let all 3 reach acquire() and enqueue as waiters before releasing.
-        (void)rt.yield();
-        (void)rt.yield();
-        (void)rt.yield();
+        (void)rt.Yield();
+        (void)rt.Yield();
+        (void)rt.Yield();
 
-        sem.release();
-        sem.release();
-        sem.release();
-        (void)done.wait();
+        sem.Release();
+        sem.Release();
+        sem.Release();
+        (void)done.Wait();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
 }
 
@@ -212,25 +212,25 @@ TEST_F(FiberSyncTest, MutexBasic)
 {
     int shared = 0;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Mutex m(rt);
         Latch done(rt, 5);
 
         for (int i = 0; i < 5; ++i) {
-            (void)rt.spawn([&](IO& inner) noexcept {
-                auto guard = m.scoped_lock().value();
+            (void)rt.Spawn([&](IO& inner) noexcept {
+                auto guard = m.ScopedLock().value();
                 int local = shared;
-                (void)inner.yield();  // try to induce a race
+                (void)inner.Yield();  // try to induce a race
                 shared = local + 1;
-                done.count_down();
+                done.CountDown();
             });
         }
 
-        (void)done.wait();
+        (void)done.Wait();
         EXPECT_EQ(shared, 5);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
 }
 
 // try_lock succeeds and sets the held flag when the mutex is free.
@@ -238,14 +238,14 @@ TEST_F(FiberSyncTest, MutexTryLockSucceedsWhenFree)
 {
     bool locked = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Mutex m(rt);
-        locked = m.try_lock();
+        locked = m.TryLock();
         if (locked)
             m.unlock();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_TRUE(locked);
 }
 
@@ -254,14 +254,14 @@ TEST_F(FiberSyncTest, MutexTryLockFailsWhenHeld)
 {
     bool second = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Mutex m(rt);
-        EXPECT_TRUE(m.try_lock());
-        second = m.try_lock();  // already held
+        EXPECT_TRUE(m.TryLock());
+        second = m.TryLock();  // already held
         m.unlock();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_FALSE(second);
 }
 
@@ -270,18 +270,18 @@ TEST_F(FiberSyncTest, MutexScopedLockReleasesOnDestruct)
 {
     bool relocked = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Mutex m(rt);
         {
-            auto g = m.scoped_lock().value();
-            EXPECT_FALSE(m.try_lock());  // held by g
+            auto g = m.ScopedLock().value();
+            EXPECT_FALSE(m.TryLock());  // held by g
         }  // g destructs → unlock()
-        relocked = m.try_lock();         // now free again
+        relocked = m.TryLock();         // now free again
         if (relocked)
             m.unlock();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_TRUE(relocked);
 }
 
@@ -290,31 +290,31 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo)
 {
     std::vector<int> order;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         Mutex m(rt);
         Latch done(rt, 3);
 
         (void)m.lock();  // outer fiber holds the lock
 
         for (int i = 1; i <= 3; ++i) {
-            (void)rt.spawn([&, i](IO&) noexcept {
+            (void)rt.Spawn([&, i](IO&) noexcept {
                 (void)m.lock();  // blocks — mutex is held by outer
                 order.push_back(i);
                 m.unlock();
-                done.count_down();
+                done.CountDown();
             });
         }
 
         // Let all 3 fibers enqueue as waiters before we release.
-        (void)rt.yield();
-        (void)rt.yield();
-        (void)rt.yield();
+        (void)rt.Yield();
+        (void)rt.Yield();
+        (void)rt.Yield();
 
         m.unlock();  // transfers ownership to fiber 1
-        (void)done.wait();
+        (void)done.Wait();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
 }
 
@@ -323,14 +323,14 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo)
 // All tasks run and their return values are accessible via results() after wait().
 TEST_F(FiberSyncTest, ResultGroupBasic)
 {
-    (void)io.spawn([](IO& rt) noexcept {
+    (void)io.Spawn([](IO& rt) noexcept {
         ResultGroup<int> group(rt, 3);
 
         group.spawn([](IO&) noexcept -> Result<int> { return 10; });
         group.spawn([](IO&) noexcept -> Result<int> { return 20; });
         group.spawn([](IO&) noexcept -> Result<int> { return 30; });
 
-        (void)group.wait();
+        (void)group.Wait();
 
         auto& r = group.results();
         ASSERT_TRUE(r[0].has_value() && r[0]->has_value()); EXPECT_EQ(r[0]->value(), 10);
@@ -338,13 +338,13 @@ TEST_F(FiberSyncTest, ResultGroupBasic)
         ASSERT_TRUE(r[2].has_value() && r[2]->has_value()); EXPECT_EQ(r[2]->value(), 30);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
 }
 
 // A task that returns an error populates its slot with that error.
 TEST_F(FiberSyncTest, ResultGroupTaskError)
 {
-    (void)io.spawn([](IO& rt) noexcept {
+    (void)io.Spawn([](IO& rt) noexcept {
         ResultGroup<int> group(rt, 2);
 
         group.spawn([](IO&) noexcept -> Result<int> { return 42; });
@@ -352,7 +352,7 @@ TEST_F(FiberSyncTest, ResultGroupTaskError)
             return std::unexpected(Error{EINVAL, "test-op"});
         });
 
-        (void)group.wait();
+        (void)group.Wait();
 
         auto& r = group.results();
         ASSERT_TRUE(r[0].has_value() && r[0]->has_value());
@@ -362,19 +362,19 @@ TEST_F(FiberSyncTest, ResultGroupTaskError)
         EXPECT_EQ(r[1]->error().code, EINVAL);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
 }
 
 // Slots that were never spawned remain std::nullopt.
 TEST_F(FiberSyncTest, ResultGroupUnspawnedSlotIsNullopt)
 {
-    (void)io.spawn([](IO& rt) noexcept {
+    (void)io.Spawn([](IO& rt) noexcept {
         ResultGroup<int> group(rt, 3);
 
         group.spawn([](IO&) noexcept -> Result<int> { return 1; });
         // slots 1 and 2 are never spawned
 
-        (void)group.wait();
+        (void)group.Wait();
 
         auto& r = group.results();
         EXPECT_TRUE(r[0].has_value());
@@ -382,7 +382,7 @@ TEST_F(FiberSyncTest, ResultGroupUnspawnedSlotIsNullopt)
         EXPECT_FALSE(r[2].has_value());  // nullopt
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
 }
 
 // ── TaskGroup ───────────────────────────────────────────────────────────────
@@ -392,17 +392,17 @@ TEST_F(FiberSyncTest, TaskGroupBasic)
 {
     int count = 0;
 
-    (void)io.spawn([&count](IO& rt) noexcept {
+    (void)io.Spawn([&count](IO& rt) noexcept {
         TaskGroup group(rt);
 
-        ASSERT_TRUE(group.spawn([&count](IO&) noexcept { count += 1; }).has_value());
-        ASSERT_TRUE(group.spawn([&count](IO&) noexcept { count += 2; }).has_value());
+        ASSERT_TRUE(group.Spawn([&count](IO&) noexcept { count += 1; }).has_value());
+        ASSERT_TRUE(group.Spawn([&count](IO&) noexcept { count += 2; }).has_value());
 
-        (void)group.wait();
+        (void)group.Wait();
         EXPECT_EQ(count, 3);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_EQ(count, 3);
 }
 
@@ -419,26 +419,26 @@ TEST_F(FiberSyncTest, TaskGroupConcurrentSleepsFasterThanSequential)
     nanoseconds concurrent_elapsed{};
 
     // Sequential: each sleep must complete before the next one starts.
-    (void)io.spawn([&, sleep_dur](IO& rt) noexcept {
+    (void)io.Spawn([&, sleep_dur](IO& rt) noexcept {
         auto t0 = steady_clock::now();
         for (int i = 0; i < 3; ++i)
-            (void)rt.sleep_for_ns(sleep_dur);
+            (void)rt.SleepForNs(sleep_dur);
         sequential_elapsed = steady_clock::now() - t0;
     });
-    io.run_until_done();
+    io.RunUntilDone();
 
     // Concurrent: all 3 sleeps are in flight simultaneously.
-    (void)io.spawn([&, sleep_dur](IO& rt) noexcept {
+    (void)io.Spawn([&, sleep_dur](IO& rt) noexcept {
         TaskGroup group(rt);
             const auto t0 = steady_clock::now();
         for (int i = 0; i < 3; ++i)
-            (void)group.spawn([sleep_dur](IO& inner) noexcept {
-                (void)inner.sleep_for_ns(sleep_dur);
+            (void)group.Spawn([sleep_dur](IO& inner) noexcept {
+                (void)inner.SleepForNs(sleep_dur);
             });
-        (void)group.wait();
+        (void)group.Wait();
         concurrent_elapsed = steady_clock::now() - t0;
     });
-    io.run_until_done();
+    io.RunUntilDone();
 
     // Sequential ≈ 3 × sleep_dur, concurrent ≈ 1 × sleep_dur.
     // Require concurrent < sequential / 2 to tolerate scheduler jitter.
@@ -452,12 +452,12 @@ TEST_F(FiberSyncTest, TaskGroupWaitWithNoTasksReturnsImmediately)
 {
     bool reached = false;
 
-    (void)io.spawn([&](IO& rt) noexcept {
+    (void)io.Spawn([&](IO& rt) noexcept {
         TaskGroup group(rt);
-        (void)group.wait();
+        (void)group.Wait();
         reached = true;
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     EXPECT_TRUE(reached);
 }

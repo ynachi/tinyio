@@ -39,10 +39,10 @@ Result<double> probe_target(IO& io, const Target& t, Semaphore& gate) noexcept
     const auto t0 = std::chrono::steady_clock::now();
     const Fd sock{::socket(t.addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0)};
 
-    if (!sock.is_valid())
+    if (!sock.IsValid())
     {
         gate.release();
-        return tinyio::fail(errno, "socket");
+        return tinyio::Fail(errno, "socket");
     }
 
     const auto r = io.connect(sock, t.addr, 2s);
@@ -101,7 +101,7 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i)
     {
         std::string host = argv[i];
-        auto a = tinyio::resolve_ip(host, static_cast<uint16_t>(FLAGS_port));
+        auto a = tinyio::ResolveIp(host, static_cast<uint16_t>(FLAGS_port));
         if (!a)
         {
             ALOG_ERROR("{:<24} resolve failed ({})", host, a.error().code);

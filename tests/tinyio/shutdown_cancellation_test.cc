@@ -26,11 +26,11 @@ TEST(ShutdownCancellationTest, StopTokenCancelsWaiting)
     bool fiber_ran = false;
     Error fiber_err;
 
-    auto res = io.spawn(
+    auto res = io.Spawn(
         [&](IO& rt) noexcept
         {
             fiber_ran = true;
-            auto sleep_res = rt.sleep_for_ns(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
+            auto sleep_res = rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
             if (!sleep_res)
             {
                 fiber_err = sleep_res.error();
@@ -47,7 +47,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsWaiting)
             ss.request_stop();
         });
 
-    io.run(ss.get_token());
+    io.Run(ss.get_token());
     t.join();
 
     auto end = std::chrono::steady_clock::now();
@@ -69,13 +69,13 @@ TEST(ShutdownCancellationTest, StopTokenCancelsReady)
     bool fiber_finished = false;
     tinyio::Error yield_err;
 
-    auto res = io.spawn(
+    auto res = io.Spawn(
         [&](IO& rt) noexcept
         {
             fiber_started = true;
             while (true)
             {
-                auto yield_res = rt.yield();
+                auto yield_res = rt.Yield();
                 if (!yield_res)
                 {
                     yield_err = yield_res.error();
@@ -93,7 +93,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsReady)
             ss.request_stop();
         });
 
-    io.run(ss.get_token());
+    io.Run(ss.get_token());
     t.join();
 
     EXPECT_TRUE(fiber_started);
@@ -107,10 +107,10 @@ TEST(ShutdownCancellationTest, DestructorCancelsLiveWork)
     IoOptions opts;
     {
         IO io(0, opts, {});
-        auto res = io.spawn(
+        auto res = io.Spawn(
             [](IO& rt) noexcept
             {
-                (void)rt.sleep_for_ns(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
+                (void)rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
             });
         ASSERT_TRUE(res.has_value());
     }
@@ -121,7 +121,7 @@ struct ActivateTag
 {
     using type = Result<void> (IO::*)() noexcept;
 };
-template struct Accessor<ActivateTag, &IO::activate>;
+template struct Accessor<ActivateTag, &IO::Activate>;
 Result<void> (IO::* get(ActivateTag))() noexcept;
 
 // 4. destructor_aborts_wrong_thread
@@ -135,8 +135,8 @@ TEST(ShutdownCancellationTest, DestructorAbortsWrongThread)
             auto activate_ptr = get(ActivateTag{});
             (void)(io.get()->*activate_ptr)();
 
-            (void)io->spawn([](IO& rt) noexcept
-                            { (void)rt.sleep_for_ns(std::chrono::nanoseconds(10'000'000'000ULL)); });
+            (void)io->Spawn([](IO& rt) noexcept
+                            { (void)rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL)); });
 
             std::thread t([io_ptr = io.release()]() { delete io_ptr; });
             t.join();
@@ -155,16 +155,16 @@ TEST(ShutdownCancellationTest, SyscallReturnsEcanceled)
     Error yield_err;
     Error sleep_err;
 
-    auto res = io.spawn(
+    auto res = io.Spawn(
         [&](IO& rt) noexcept
         {
-            auto y_res = rt.sleep_for_ns(std::chrono::nanoseconds(100'000'000ULL));  // 100ms
+            auto y_res = rt.SleepForNs(std::chrono::nanoseconds(100'000'000ULL));  // 100ms
             if (!y_res)
             {
                 yield_err = y_res.error();
             }
 
-            auto s_res = rt.sleep_for_ns(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
+            auto s_res = rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
             if (!s_res)
             {
                 sleep_err = s_res.error();
@@ -181,7 +181,7 @@ TEST(ShutdownCancellationTest, SyscallReturnsEcanceled)
             ss.request_stop();
         });
 
-    io.run(ss.get_token());
+    io.Run(ss.get_token());
     t.join();
 
     EXPECT_TRUE(fiber_finished);
@@ -196,12 +196,12 @@ TEST(ShutdownCancellationTest, DoubleRun)
     IO io(0, opts, {});
 
     bool pass1 = false;
-    (void)io.spawn([&](IO&) noexcept { pass1 = true; });
-    io.run_until_done();
+    (void)io.Spawn([&](IO&) noexcept { pass1 = true; });
+    io.RunUntilDone();
     EXPECT_TRUE(pass1);
 
     bool pass2 = false;
-    (void)io.spawn([&](IO&) noexcept { pass2 = true; });
-    io.run_until_done();
+    (void)io.Spawn([&](IO&) noexcept { pass2 = true; });
+    io.RunUntilDone();
     EXPECT_TRUE(pass2);
 }

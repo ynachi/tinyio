@@ -20,10 +20,10 @@ TEST_F(FiberTest, SpawnAndComplete)
 {
     bool done = false;
 
-    const auto res = io.spawn([&done](IO&) noexcept { done = true; });
+    const auto res = io.Spawn([&done](IO&) noexcept { done = true; });
 
     ASSERT_TRUE(res.has_value()) << "spawning one fiber failed";
-    io.run_until_done();
+    io.RunUntilDone();
 
     EXPECT_TRUE(done);
 }
@@ -34,9 +34,9 @@ TEST_F(FiberTest, SpawnManySequential)
 
     for (int i = 0; i < 1000; ++i)
     {
-        auto res = io.spawn([&count](IO&) noexcept { count++; });
+        auto res = io.Spawn([&count](IO&) noexcept { count++; });
         ASSERT_TRUE(res.has_value());
-        io.run_until_done();
+        io.RunUntilDone();
     }
 
     EXPECT_EQ(count, 1000);
@@ -48,13 +48,13 @@ TEST_F(FiberTest, YieldRoundRobin)
 
     for (int i = 1; i <= 3; ++i)
     {
-        auto res = io.spawn(
+        auto res = io.Spawn(
             [i, &exec_order](IO& rt) noexcept
             {
                 for (int j = 0; j < 3; ++j)
                 {
                     exec_order.push_back(i);
-                    auto yres = rt.yield();
+                    auto yres = rt.Yield();
                     if (!yres)
                     {
                         break;
@@ -64,7 +64,7 @@ TEST_F(FiberTest, YieldRoundRobin)
         ASSERT_TRUE(res.has_value());
     }
 
-    io.run_until_done();
+    io.RunUntilDone();
 
     const std::vector expected = {1, 2, 3, 1, 2, 3, 1, 2, 3};
     EXPECT_EQ(exec_order, expected);
@@ -75,16 +75,16 @@ TEST_F(FiberTest, NestedSpawn)
     bool outer_done = false;
     bool inner_done = false;
 
-    const auto res = io.spawn(
+    const auto res = io.Spawn(
         [&outer_done, &inner_done](IO& rt) noexcept
         {
-            const auto inner_res = rt.spawn([&inner_done](IO&) noexcept { inner_done = true; });
+            const auto inner_res = rt.Spawn([&inner_done](IO&) noexcept { inner_done = true; });
             EXPECT_TRUE(inner_res.has_value());
             outer_done = true;
         });
 
     ASSERT_TRUE(res.has_value());
-    io.run_until_done();
+    io.RunUntilDone();
 
     EXPECT_TRUE(outer_done);
     EXPECT_TRUE(inner_done);
