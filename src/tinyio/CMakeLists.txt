@@ -48,3 +48,8 @@ add_tinyio_lib(tinyio
         SHARED_INSTALL_INTERFACE_LIBS ${TINYIO_SHARED_INSTALL_INTERFACE_LIBS}
         STATIC_INSTALL_INTERFACE_LIBS ${TINYIO_STATIC_INSTALL_INTERFACE_LIBS}
 )
+if(TINYIO_BUILD_SHARED)
+    add_library(Tinyio::tinyio ALIAS tinyio_shared)
+elseif(TINYIO_BUILD_STATIC)
+    add_library(Tinyio::tinyio ALIAS tinyio_static)
+endif()

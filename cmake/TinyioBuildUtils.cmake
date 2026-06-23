@@ -139,6 +139,7 @@ function(add_tinyio_lib LIB_NAME)
                 PROPERTIES C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET
                 hidden
                 VISIBILITY_INLINES_HIDDEN 1)
+        target_compile_features(options INTERFACE cxx_std_23)
 
         if(MSVC_TOOLCHAIN)
             target_compile_options(${LIB_NAME}_shared PRIVATE /bigobj)

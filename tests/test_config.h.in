@@ -1,0 +1,3 @@
+#pragma once
+
+#define TINYIO_TEST_RESOURCES "@TINYIO_TEST_RESOURCES@"

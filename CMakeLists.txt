@@ -13,6 +13,7 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/tinyio/version.h.in"
 # Cmake find modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
+
 #
 # CMAKE GENERAL VARIABLES
 #
@@ -38,6 +39,7 @@ option(TINYIO_ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
 
 include(GNUInstallDirs)
 include(FetchContent)
+include(CTest)
 
 set(TINYIO_INSTALL_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
 set(TINYIO_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
@@ -59,12 +61,6 @@ pkg_check_modules(LibUring REQUIRED IMPORTED_TARGET liburing)
 #abseil
 find_package(Abseil REQUIRED)
 
-# gtest
-if (TINYIO_BUILD_TESTS)
-    find_package(GTest REQUIRED)
-    enable_testing()
-endif ()
-
 # mimalloc
 find_package(mimalloc REQUIRED)
 
@@ -77,6 +73,11 @@ message(STATUS "OpenSSL: ${OPENSSL_VERSION}")
 find_package(Threads REQUIRED)
 
 add_subdirectory(src)
+
+if (TINYIO_BUILD_TESTS)
+    add_subdirectory(tests)
+endif ()
+
 install(FILES LICENSE NOTICE DESTINATION ${TINYIO_INSTALL_DOCDIR})
 
 ##-----------------------------------------------
