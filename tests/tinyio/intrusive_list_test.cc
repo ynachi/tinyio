@@ -1,4 +1,4 @@
-#include "../../src/tinyio/intrusive_list.hpp"
+#include "tinyio/intrusive_list.hpp"
 
 #include <vector>
 
