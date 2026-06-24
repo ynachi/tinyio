@@ -8,8 +8,20 @@ set(TINYIO_SOURCES
         stack.cc
         tcp_listener.cc)
 
-set(TINYIO_STATIC_BUILD_INTERFACE_LIBS)
-set(TINYIO_SHARED_BUILD_INTERFACE_LIBS)
+set(TINYIO_STATIC_BUILD_INTERFACE_LIBS
+        PkgConfig::LibUring
+        Boost::context
+        mimalloc-static
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads)
+set(TINYIO_SHARED_BUILD_INTERFACE_LIBS
+        PkgConfig::LibUring
+        Boost::context
+        mimalloc
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads)
 set(TINYIO_STATIC_INSTALL_INTERFACE_LIBS)
 set(TINYIO_SHARED_INSTALL_INTERFACE_LIBS)
 

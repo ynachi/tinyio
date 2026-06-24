@@ -59,8 +59,8 @@ struct Latch {
 
  private:
   void DrainWaiters() noexcept {
-    while (!waiters_.empty()) {
-      io_.Unpark(waiters_.pop_front());
+    while (!waiters_.Empty()) {
+      io_.Unpark(waiters_.PopFront());
     }
   }
 
@@ -105,8 +105,8 @@ struct Semaphore {
 
   // Increments count. Wakes one waiter if any.
   void Release() noexcept {
-    if (!waiters_.empty()) {
-      io_.Unpark(waiters_.pop_front());
+    if (!waiters_.Empty()) {
+      io_.Unpark(waiters_.PopFront());
     } else {
       ++count_;
     }
@@ -161,10 +161,10 @@ struct Mutex {
   }
 
   void Unlock() noexcept {
-    if (!waiters_.empty()) {
+    if (!waiters_.Empty()) {
       // Ownership transfers directly to the woken fiber, so held_
       // intentionally stays true.
-      io_.Unpark(waiters_.pop_front());
+      io_.Unpark(waiters_.PopFront());
     } else {
       held_ = false;
     }
@@ -240,7 +240,7 @@ struct TaskGroup {
   template <class Fn>
     requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
   [[nodiscard]] Result<void> Spawn(Fn&& task) noexcept {
-    auto res = io_.spawn([this, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
+    auto res = io_.Spawn([this, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
       t(io);
       this->OnTaskDone();
     });
@@ -280,8 +280,8 @@ struct TaskGroup {
   void OnTaskDone() noexcept {
     --active_tasks_;
     if (active_tasks_ == 0) {
-      while (!waiters_.empty()) {
-        io_.Unpark(waiters_.pop_front());
+      while (!waiters_.Empty()) {
+        io_.Unpark(waiters_.PopFront());
       }
     }
   }
