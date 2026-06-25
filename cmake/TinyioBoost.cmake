@@ -1,4 +1,4 @@
-# tinyio/cmake/KioBoost.cmake
+# tinyio/cmake/TinyioBoost.cmake
 #
 # Do not provide a project-local FindBoost.cmake.
 #
@@ -17,46 +17,46 @@
 
 include_guard(GLOBAL)
 
-function(kio_find_boost)
+function(tinyio_find_boost)
     set(options REQUIRED)
     set(oneValueArgs VERSION)
     set(multiValueArgs COMPONENTS)
-    cmake_parse_arguments(KIO_BOOST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+    cmake_parse_arguments(TINYIO_BOOST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    if (NOT KIO_BOOST_COMPONENTS)
-        set(KIO_BOOST_COMPONENTS context)
+    if (NOT TINYIO_BOOST_COMPONENTS)
+        set(TINYIO_BOOST_COMPONENTS context)
     endif ()
 
     set(_version_arg "")
-    if (KIO_BOOST_VERSION)
-        set(_version_arg "${KIO_BOOST_VERSION}")
+    if (TINYIO_BOOST_VERSION)
+        set(_version_arg "${TINYIO_BOOST_VERSION}")
     endif ()
 
-    find_package(Boost ${_version_arg} CONFIG QUIET COMPONENTS ${KIO_BOOST_COMPONENTS})
+    find_package(Boost ${_version_arg} CONFIG QUIET COMPONENTS ${TINYIO_BOOST_COMPONENTS})
 
     set(_missing_targets "")
-    foreach (_component IN LISTS KIO_BOOST_COMPONENTS)
+    foreach (_component IN LISTS TINYIO_BOOST_COMPONENTS)
         if (NOT TARGET Boost::${_component})
             list(APPEND _missing_targets Boost::${_component})
         endif ()
     endforeach ()
 
     if ((NOT Boost_FOUND) OR _missing_targets)
-        find_package(Boost ${_version_arg} MODULE QUIET COMPONENTS ${KIO_BOOST_COMPONENTS})
+        find_package(Boost ${_version_arg} MODULE QUIET COMPONENTS ${TINYIO_BOOST_COMPONENTS})
     endif ()
 
     set(_missing_targets "")
-    foreach (_component IN LISTS KIO_BOOST_COMPONENTS)
+    foreach (_component IN LISTS TINYIO_BOOST_COMPONENTS)
         if (NOT TARGET Boost::${_component})
             list(APPEND _missing_targets Boost::${_component})
         endif ()
     endforeach ()
 
     if ((NOT Boost_FOUND) OR _missing_targets)
-        string(REPLACE ";" ", " _components "${KIO_BOOST_COMPONENTS}")
+        string(REPLACE ";" ", " _components "${TINYIO_BOOST_COMPONENTS}")
         string(REPLACE ";" ", " _targets "${_missing_targets}")
 
-        if (KIO_BOOST_REQUIRED)
+        if (TINYIO_BOOST_REQUIRED)
             message(FATAL_ERROR
                     "Boost discovery failed for components: ${_components}. "
                     "Missing imported targets: ${_targets}. "

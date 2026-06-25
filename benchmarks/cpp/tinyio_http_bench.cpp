@@ -96,10 +96,10 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd, std::span<const 
 {
     while (!data.empty())
     {
-        auto written = TRY(fio.write(fd, data));
+        auto written = TRY(fio.Write(fd, data));
         if (written == 0)
         {
-            return tinyio::fail(EIO, "write");
+            return tinyio::Fail(EIO, "write");
         }
         data = data.subspan(written);
     }
@@ -114,7 +114,7 @@ void handle_client(tinyio::IO& fio, int raw_fd)
 
     while (!g_stop_requested.load(std::memory_order_relaxed))
     {
-        auto read_res = fio.read(client_fd, std::span{buf});
+        auto read_res = fio.Read(client_fd, std::span{buf});
         if (!read_res || *read_res == 0)
         {
             return;
@@ -130,28 +130,28 @@ void handle_client(tinyio::IO& fio, int raw_fd)
 
 void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size)
 {
-    auto listener = tinyio::TcpListener::bind(port, "0.0.0.0", 4096);
+    auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
-        std::cerr << "bind failed: " << listener.error().error_code().message() << '\n';
+        std::cerr << "bind failed: " << listener.error().ErrorCode().message() << '\n';
         return;
     }
 
     tinyio::Fd server_fd = std::move(*listener);
     while (!g_stop_requested.load(std::memory_order_relaxed))
     {
-        auto client_res = worker.accept(server_fd);
+        auto client_res = worker.Accept(server_fd);
         if (!client_res)
         {
             if (!g_stop_requested.load(std::memory_order_relaxed))
             {
-                std::cerr << "accept failed: " << client_res.error().error_code().message() << '\n';
+                std::cerr << "accept failed: " << client_res.error().ErrorCode().message() << '\n';
             }
             return;
         }
 
-        const int raw_fd = client_res->release();
-        (void)worker.spawn([raw_fd](tinyio::IO& fio) noexcept { handle_client(fio, raw_fd); });
+        const int raw_fd = client_res->Release();
+        (void)worker.Spawn([raw_fd](tinyio::IO& fio) noexcept { handle_client(fio, raw_fd); });
     }
 }
 }  // namespace
@@ -165,7 +165,7 @@ int main(int argc, char** argv)
         std::signal(SIGTERM, signal_handler);
         std::signal(SIGPIPE, SIG_IGN);
 
-        tinyio::log::set_level(tinyio::log::Level::Disabled);
+        tinyio::log::SetLevel(tinyio::log::Level::Disabled);
 
         std::vector<std::jthread> threads;
         std::vector<std::stop_source> stop_sources;
@@ -184,10 +184,10 @@ int main(int argc, char** argv)
                     io_opts.stack_size = opts.stack_size;
                     tinyio::IO worker(i, io_opts, {});
 
-                    (void)worker.spawn([opts](tinyio::IO& io) noexcept
+                    (void)worker.Spawn([opts](tinyio::IO& io) noexcept
                                        { accept_loop(io, opts.port, opts.stack_size); });
 
-                    worker.run(st);
+                    worker.Run(st);
                 });
         }
 

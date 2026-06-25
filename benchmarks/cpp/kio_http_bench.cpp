@@ -90,7 +90,7 @@ URing::Task<void> write_all(URing::IO& io, URing::Fd& fd, std::span<const std::b
 {
     while (!data.empty())
     {
-        auto write_res = co_await io.write(fd, data);
+        auto write_res = co_await io.Write(fd, data);
         if (!write_res)
         {
             co_return std::unexpected(write_res.error());
@@ -111,7 +111,7 @@ URing::Task<void> handle_client(URing::IO& worker, URing::Fd client_fd)
 
     while (!g_stop_requested.load(std::memory_order_relaxed))
     {
-        auto read_res = co_await worker.read(client_fd, std::span{buf});
+        auto read_res = co_await worker.Read(client_fd, std::span{buf});
         if (!read_res)
         {
             co_return {};
@@ -144,7 +144,7 @@ URing::Task<void> dispatch_accept_loop(URing::IoContext& ctx, URing::IO& dispatc
     size_t next_worker = 1;
     while (!st.stop_requested())
     {
-        auto client_res = co_await dispatcher.accept(server_fd);
+        auto client_res = co_await dispatcher.Accept(server_fd);
         if (!client_res)
         {
             if (!st.stop_requested())
@@ -173,7 +173,7 @@ URing::Task<void> reuseport_accept_loop(URing::IO& worker, uint16_t port, std::s
     URing::Fd server_fd = std::move(*listener);
     while (!st.stop_requested())
     {
-        auto client_res = co_await worker.accept(server_fd);
+        auto client_res = co_await worker.Accept(server_fd);
         if (!client_res)
         {
             if (!st.stop_requested())

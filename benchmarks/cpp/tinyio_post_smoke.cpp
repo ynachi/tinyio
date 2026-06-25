@@ -54,7 +54,7 @@ static bool test_post_before_run()
         }
     }  // all producers joined here
 
-    io.run_until_done();
+    io.RunUntilDone();
 
     const int final_count = counter.load(std::memory_order_seq_cst);
     if (final_count != kTotal)
@@ -84,7 +84,7 @@ static bool test_post_while_running()
         tinyio::IoOptions opts;
         tinyio::IO io(0, opts, {});
         io_ptr.store(&io, std::memory_order_release);
-        io.run(st);
+        io.Run(st);
         io_ptr.store(nullptr, std::memory_order_release);
     });
 
@@ -144,7 +144,7 @@ static bool test_post_while_running()
 
 int main()
 {
-    tinyio::log::set_level(tinyio::log::Level::Disabled);
+    tinyio::log::SetLevel(tinyio::log::Level::Disabled);
 
     bool ok = true;
     ok &= test_post_before_run();

@@ -139,7 +139,7 @@ URing::Task<void> kio_write_all(URing::IO& io, URing::Fd& fd, std::span<const st
     while (offset < bytes)
     {
         const auto len = std::min<std::uint64_t>(block.size(), bytes - offset);
-        const auto res = co_await io.write(fd, block.first(static_cast<std::size_t>(len)), static_cast<off_t>(offset));
+        const auto res = co_await io.Write(fd, block.first(static_cast<std::size_t>(len)), static_cast<off_t>(offset));
         if (!res)
         {
             throw std::runtime_error("tinyio write failed: " + res.error().message());
@@ -187,7 +187,7 @@ URing::Result<void> kio_fiber_write_all(URing::FiberIO& fio, URing::Fd& fd, std:
     {
         const auto len = std::min<std::uint64_t>(block.size(), bytes - offset);
         iovec iov{.iov_base = const_cast<std::byte*>(block.data()), .iov_len = static_cast<std::size_t>(len)};
-        FIBER_TRY(auto written, fio.writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
+        FIBER_TRY(auto written, fio.Writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
         if (written != static_cast<int32_t>(len))
         {
             return URing::error_from_errc(std::errc::io_error);
@@ -258,7 +258,7 @@ BenchResult bench_asio(const Options& opts, const std::vector<std::byte>& block)
 
     asio::io_context io;
     auto guard = asio::make_work_guard(io);
-    std::jthread runner([&] { io.run(); });
+    std::jthread runner([&] { io.Run(); });
 
     asio::random_access_file file(io);
     file.open(path, asio::file_base::write_only);
@@ -280,7 +280,7 @@ BenchResult bench_asio(const Options& opts, const std::vector<std::byte>& block)
     const auto end = Clock::now();
 
     boost::system::error_code ec;
-    file.close(ec);
+    file.Close(ec);
     guard.reset();
     io.stop();
     runner.join();

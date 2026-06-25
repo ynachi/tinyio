@@ -169,7 +169,7 @@ void bench_segment_manager(const Options& opts)
             }
         });
 
-    auto close_res = URing::sync_wait(io, manager.close(io));
+    auto close_res = URing::sync_wait(io, manager.Close(io));
     if (!close_res.has_value())
     {
         throw std::system_error(close_res.error());

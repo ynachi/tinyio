@@ -1,7 +1,9 @@
+find_package(gflags REQUIRED)
+
 add_executable(fiber_vs_coro_bench fiber_vs_coro_bench.cpp)
-target_link_libraries(fiber_vs_coro_bench PRIVATE tinyio gflags::gflags)
-#add_executable(net_perf net_perf.cpp)
-#target_link_libraries(net_perf PRIVATE kio_lib gflags::gflags)
+target_link_libraries(fiber_vs_coro_bench PRIVATE Tinyio::tinyio gflags)
+add_executable(net_perf net_perf.cpp)
+target_link_libraries(net_perf PRIVATE Tinyio::tinyio gflags)
 
 function(add_sanitizers target_name)
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -11,7 +13,7 @@ function(add_sanitizers target_name)
 endfunction()
 
 add_executable(net_perf_photon net_perf_photon.cpp)
-target_link_libraries(net_perf_photon PRIVATE gflags::gflags photon_static)
+target_link_libraries(net_perf_photon PRIVATE gflags photon_static)
 
 add_executable(photon_disk_bench photon_disk_bench.cpp)
 target_link_libraries(photon_disk_bench PRIVATE photon_static)
@@ -22,19 +24,19 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif ()
 
 add_executable(tinyio_disk_bench tinyio_disk_bench.cpp)
-target_link_libraries(tinyio_disk_bench PRIVATE tinyio gflags::gflags)
+target_link_libraries(tinyio_disk_bench PRIVATE Tinyio::tinyio gflags)
 add_sanitizers(tinyio_disk_bench)
 
 add_executable(tinyio_http_bench tinyio_http_bench.cpp)
-target_link_libraries(tinyio_http_bench PRIVATE tinyio gflags::gflags)
+target_link_libraries(tinyio_http_bench PRIVATE Tinyio::tinyio gflags)
 add_sanitizers(tinyio_http_bench)
 
 add_executable(tinyio_post_smoke tinyio_post_smoke.cpp)
-target_link_libraries(tinyio_post_smoke PRIVATE tinyio gflags::gflags)
+target_link_libraries(tinyio_post_smoke PRIVATE Tinyio::tinyio gflags)
 add_sanitizers(tinyio_post_smoke)
 
 add_executable(tinyio_dispatch_bench tinyio_dispatch_bench.cpp)
-target_link_libraries(tinyio_dispatch_bench PRIVATE tinyio gflags::gflags)
+target_link_libraries(tinyio_dispatch_bench PRIVATE Tinyio::tinyio gflags)
 add_sanitizers(tinyio_dispatch_bench)
 
 add_executable(context_switch_bench context_switch_bench.cpp)

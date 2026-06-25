@@ -1,7 +1,7 @@
 set(PHOTON_ENABLE_URING ON CACHE INTERNAL "Enable iouring")
 set(PHOTON_CXX_STANDARD 14 CACHE INTERNAL "C++ standard")
 
-add_compile_options(-Wno-everything)
+add_compile_options(-Wno-everything -include cstdint)
 
 # Use my own fork, with io_uring dependency fixes
 include(FetchContent)
@@ -15,11 +15,11 @@ FetchContent_MakeAvailable(photon)
 # Specifically for Photon targets, suppress all warnings
 if (TARGET photon_static)
     target_compile_options(photon_static PRIVATE
-            -w  # Disable all warnings for GCC/Clang
+            -w -include cstdint # Disable all warnings and include cstdint for GCC 15
     )
 endif ()
 if (TARGET photon_shared)
     target_compile_options(photon_shared PRIVATE
-            -w
+            -w -include cstdint
     )
 endif ()

@@ -180,7 +180,7 @@ int main(int argc, char** argv)
         threads.reserve(opts.workers);
         for (size_t i = 0; i < opts.workers; ++i)
         {
-            threads.emplace_back([&] { io.run(); });
+            threads.emplace_back([&] { io.Run(); });
         }
 
         std::cout << "asio_http_bench listening on port " << opts.port << " workers=" << opts.workers << '\n';

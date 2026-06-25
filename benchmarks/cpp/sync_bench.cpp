@@ -42,8 +42,8 @@ void bench_taskgroup(tinyio::IO& io, size_t iterations) {
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < iterations; ++i) {
         tinyio::TaskGroup tg(io);
-        (void)tg.spawn([](tinyio::IO&) noexcept {});
-        (void)tg.wait();
+        (void)tg.Spawn([](tinyio::IO&) noexcept {});
+        (void)tg.Wait();
     }
     auto end = std::chrono::steady_clock::now();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -55,7 +55,7 @@ void bench_mutex_contended(tinyio::IO& io, size_t iterations) {
     tinyio::TaskGroup tg(io);
     auto start = std::chrono::steady_clock::now();
     
-    (void)tg.spawn([&](tinyio::IO& rt) noexcept {
+    (void)tg.Spawn([&](tinyio::IO& rt) noexcept {
         for (size_t i = 0; i < iterations; ++i) {
             (void)mutex.lock();
             mutex.unlock();
@@ -68,7 +68,7 @@ void bench_mutex_contended(tinyio::IO& io, size_t iterations) {
         mutex.unlock();
         (void)io.yield();
     }
-    (void)tg.wait();
+    (void)tg.Wait();
     
     auto end = std::chrono::steady_clock::now();
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -82,7 +82,7 @@ int main() {
     constexpr size_t iterations = 10000000; // 10 million
     std::stop_source st;
     
-    (void)io.spawn([&](tinyio::IO& rt) noexcept {
+    (void)io.Spawn([&](tinyio::IO& rt) noexcept {
         std::cout << "--- Fiber Sync Primitives Benchmark ---\n";
         bench_mutex(rt, iterations);
         bench_semaphore(rt, iterations);
@@ -93,6 +93,6 @@ int main() {
         st.request_stop();
     });
     
-    io.run(st.get_token());
+    io.Run(st.get_token());
     return 0;
 }

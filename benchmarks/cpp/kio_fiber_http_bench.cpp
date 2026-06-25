@@ -97,7 +97,7 @@ URing::Result<void> write_all(URing::FiberIO& fio, URing::Fd& fd, std::span<cons
     while (!data.empty())
     {
         iovec iov{.iov_base = const_cast<std::byte*>(data.data()), .iov_len = data.size()};
-        FIBER_TRY(const auto written, fio.writev(fd, std::span<const iovec>{&iov, 1}));
+        FIBER_TRY(const auto written, fio.Writev(fd, std::span<const iovec>{&iov, 1}));
         if (written <= 0)
         {
             return URing::error_from_errc(std::errc::io_error);
@@ -115,7 +115,7 @@ URing::Result<void> handle_client(URing::FiberIO& fio, int raw_fd)
 
     while (!g_stop_requested.load(std::memory_order_relaxed))
     {
-        auto read_res = fio.read(client_fd, std::span{buf});
+        auto read_res = fio.Read(client_fd, std::span{buf});
         if (!read_res || *read_res == 0)
         {
             return {};
@@ -143,7 +143,7 @@ URing::Task<void> accept_loop(URing::IO& worker, uint16_t port, size_t stack_siz
     URing::Fd server_fd = std::move(*listener);
     while (!st.stop_requested())
     {
-        auto client_res = co_await worker.accept(server_fd);
+        auto client_res = co_await worker.Accept(server_fd);
         if (!client_res)
         {
             if (!st.stop_requested())
@@ -153,7 +153,7 @@ URing::Task<void> accept_loop(URing::IO& worker, uint16_t port, size_t stack_siz
             co_return {};
         }
 
-        const int raw_fd = client_res->release();
+        const int raw_fd = client_res->Release();
         worker.spawn_fiber([raw_fd](URing::FiberIO& fio) { return handle_client(fio, raw_fd); }, stack_size);
     }
 

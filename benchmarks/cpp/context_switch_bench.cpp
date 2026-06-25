@@ -8,7 +8,7 @@ int main() {
     
     constexpr size_t iterations = 10000000;
     
-    io.spawn([&](tinyio::IO& rt) noexcept {
+    io.Spawn([&](tinyio::IO& rt) noexcept {
         auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < iterations; ++i) {
             auto res = rt.yield();
@@ -32,6 +32,6 @@ int main() {
     });
     
     std::stop_source st;
-    io.run(st.get_token());
+    io.Run(st.get_token());
     return 0;
 }

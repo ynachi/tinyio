@@ -98,9 +98,9 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd, std::span<const 
 {
     while (!data.empty())
     {
-        auto written = TRY(fio.write(fd, data));
+        auto written = TRY(fio.Write(fd, data));
         if (written == 0)
-            return tinyio::fail(EIO, "write");
+            return tinyio::Fail(EIO, "write");
         data = data.subspan(static_cast<size_t>(written));
     }
     return {};
@@ -114,7 +114,7 @@ void handle_client(tinyio::IO& fio, int raw_fd) noexcept
 
     while (!g_stop_requested.load(std::memory_order_relaxed))
     {
-        auto read_res = fio.read(client_fd, std::span{buf});
+        auto read_res = fio.Read(client_fd, std::span{buf});
         if (!read_res || *read_res == 0)
             return;
 
@@ -135,10 +135,10 @@ void accept_and_dispatch(tinyio::IO& acceptor,
                          std::vector<tinyio::IO*> handlers,
                          uint16_t port) noexcept
 {
-    auto listener = tinyio::TcpListener::bind(port, "0.0.0.0", 4096);
+    auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
     if (!listener)
     {
-        std::cerr << "[acceptor] bind failed: " << listener.error().error_code().message() << '\n';
+        std::cerr << "[acceptor] bind failed: " << listener.error().ErrorCode().message() << '\n';
         return;
     }
 
@@ -147,20 +147,20 @@ void accept_and_dispatch(tinyio::IO& acceptor,
 
     while (!g_stop_requested.load(std::memory_order_relaxed))
     {
-        auto client = acceptor.accept(server_fd);
+        auto client = acceptor.Accept(server_fd);
         if (!client)
         {
             if (!g_stop_requested.load(std::memory_order_relaxed))
-                std::cerr << "[acceptor] accept failed: " << client.error().error_code().message() << '\n';
+                std::cerr << "[acceptor] accept failed: " << client.error().ErrorCode().message() << '\n';
             return;
         }
 
-        const int raw_fd = client->release();
+        const int raw_fd = client->Release();
 
         if (handlers.empty())
         {
             // Single-worker mode: no cross-thread dispatch, handle locally.
-            (void)acceptor.spawn([raw_fd](tinyio::IO& io) noexcept { handle_client(io, raw_fd); });
+            (void)acceptor.Spawn([raw_fd](tinyio::IO& io) noexcept { handle_client(io, raw_fd); });
         }
         else
         {
@@ -190,7 +190,7 @@ int main(int argc, char** argv)
         std::signal(SIGTERM, signal_handler);
         std::signal(SIGPIPE, SIG_IGN);
 
-        tinyio::log::set_level(tinyio::log::Level::Disabled);
+        tinyio::log::SetLevel(tinyio::log::Level::Disabled);
 
         const size_t n = opts.workers;
         std::cout << "tinyio_dispatch_bench port=" << opts.port
@@ -224,7 +224,7 @@ int main(int argc, char** argv)
                     // main thread can post() the accept fiber into the queue.
                     promise.set_value(&worker);
 
-                    worker.run(st);
+                    worker.Run(st);
                     // worker destroyed here — safe because stop has been requested
                     // before threads.clear() in main, so no post() can arrive late.
                 });

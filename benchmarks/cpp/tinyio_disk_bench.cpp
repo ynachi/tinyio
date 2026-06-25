@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include <../../src/tinyio/error.hpp>
+#include <tinyio/error.hpp>
 #include <tinyio/fd.hpp>
 #include <tinyio/fiber_sync.hpp>
 #include <tinyio/runtime.hpp>
@@ -130,10 +130,10 @@ tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::Fd& fd, std
     {
         const auto len = std::min<std::uint64_t>(block.size(), bytes - offset);
         iovec iov{.iov_base = const_cast<std::byte*>(block.data()), .iov_len = static_cast<std::size_t>(len)};
-        auto written = TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
+        auto written = TRY(fio.Writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
         if (written != static_cast<int32_t>(len))
         {
-            return tinyio::fail(EIO, "writev");
+            return tinyio::Fail(EIO, "writev");
         }
         offset += len;
     }
@@ -158,16 +158,16 @@ BenchResult bench_tinyio_fiber(const Options& opts, std::span<const std::byte> b
     std::optional<tinyio::Result<void>> result;
 
     const auto start = Clock::now();
-    (void)io.spawn([&](tinyio::IO& fio) noexcept {
+    (void)io.Spawn([&](tinyio::IO& fio) noexcept {
         result = tinyio_fiber_write_all(fio, fd, block, opts.bytes);
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     const auto end = Clock::now();
 
     if (!result.value())
     {
-        throw std::runtime_error("tinyio write failed: " + result.value().error().error_code().message());
+        throw std::runtime_error("tinyio write failed: " + result.value().error().ErrorCode().message());
     }
 
     const double seconds = std::chrono::duration<double>(end - start).count();
@@ -203,7 +203,7 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
 
     const auto start = Clock::now();
 
-    (void)io.spawn([&](tinyio::IO& fio) noexcept {
+    (void)io.Spawn([&](tinyio::IO& fio) noexcept {
         tinyio::ResultGroup<std::uint64_t> group(fio, n_fibers);
 
         for (std::size_t i = 0; i < n_fibers; ++i)
@@ -213,7 +213,7 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
 
             // Each fiber writes its own region; all use the same read-only
             // block buffer (safe: single thread, buffer is never modified).
-            (void)group.spawn([&fio, &fd, &block, seg_start, seg_end](tinyio::IO&) noexcept
+            (void)group.Spawn([&fio, &fd, &block, seg_start, seg_end](tinyio::IO&) noexcept
                               -> tinyio::Result<std::uint64_t> {
                 std::uint64_t offset = seg_start;
                 while (offset < seg_end)
@@ -221,17 +221,17 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
                     const auto len = std::min<std::uint64_t>(block.size(), seg_end - offset);
                     iovec iov{.iov_base = const_cast<std::byte*>(block.data()),
                               .iov_len  = static_cast<std::size_t>(len)};
-                    TRY(fio.writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
+                    TRY(fio.Writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
                     offset += len;
                 }
                 return seg_end - seg_start;
             });
         }
 
-        (void)group.wait();
+        (void)group.Wait();
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
     const auto end = Clock::now();
 
     const double seconds = std::chrono::duration<double>(end - start).count();
@@ -253,7 +253,7 @@ int main(int argc, char** argv)
         std::memset(ptr, 0x42, opts.block);
         std::span<const std::byte> block(static_cast<const std::byte*>(ptr), opts.block);
         
-        tinyio::log::set_level(tinyio::log::Level::Disabled);
+        tinyio::log::SetLevel(tinyio::log::Level::Disabled);
 
         std::cout << "Benchmarking disk write (O_DIRECT, sequential per fiber):\n"
                   << "  Total bytes : " << opts.bytes << '\n'
