@@ -1,11 +1,11 @@
-#include "../../src/tinyio/fiber_sync.hpp"
+#include "tinyio/fiber_sync.hpp"
 
 #include <chrono>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include "../../src/tinyio/error.hpp"
+#include "tinyio/error.hpp"
 
 using namespace tinyio;
 
