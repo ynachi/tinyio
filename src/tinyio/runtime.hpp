@@ -542,8 +542,7 @@ class IO final {
 
   // Direct FD Table Management
   std::vector<int> direct_fds_;
-  uint32_t direct_fds_cnt_ = 0;
-  uint32_t next_free_direct_idx_ = 0;
+  std::vector<uint32_t> direct_free_;  ///< LIFO free-list of available table indices
 
   //
   // Lifecycle

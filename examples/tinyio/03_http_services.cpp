@@ -41,7 +41,7 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
 
   while (true) {
     auto r_n =
-        TRY_LOG_ERR(fio.read(client_fd, std::span{buf}), "failed to read from client");
+        TRY_LOG_ERR(fio.Read(client_fd, std::span{buf}), "failed to read from client");
 
     if (r_n == 0) {
       break;
@@ -51,7 +51,7 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
                             kHttpResponse.size());
 
     if (const auto w_n =
-            TRY_LOG_ERR(fio.write(client_fd, out_buf), "failed to write to client");
+            TRY_LOG_ERR(fio.Write(client_fd, out_buf), "failed to write to client");
         w_n == 0) {
       break;
     }
@@ -62,7 +62,7 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
 
 static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> data) {
   while (!data.empty()) {
-    const auto written = TRY(fio.write(fd, data));
+    const auto written = TRY(fio.Write(fd, data));
     if (written == 0) {
       return Fail(EIO, "write");
     }
@@ -75,21 +75,21 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st) {
   auto server_fd =
       TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
 
-  ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
+  ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.Id(), port);
 
-  return fio.accept_loop(
+  return fio.AcceptLoop(
       std::move(server_fd), [](IO& worker_fio, Result<Fd> client_fd_res) noexcept {
         if (!client_fd_res) {
-          ALOG_ERROR("Accept failed: {}", client_fd_res.error().error_code().message());
+          ALOG_ERROR("Accept failed: {}", client_fd_res.error());
           return;
         }
 
-        (void)worker_fio.spawn([client_fd = std::move(*client_fd_res)](
-                                   IO& worker_fio) mutable noexcept {
-          if (auto res = handle_client(worker_fio, std::move(client_fd)); !res) {
-            ALOG_ERROR("Client handler failed: {}", res.error().error_code().message());
-          }
-        });
+        (void)worker_fio.Spawn(
+            [client_fd = std::move(*client_fd_res)](IO& worker_fio) mutable noexcept {
+              if (auto res = handle_client(worker_fio, std::move(client_fd)); !res) {
+                ALOG_ERROR("Client handler failed: {}", res.error());
+              }
+            });
       });
 }
 
@@ -117,19 +117,19 @@ int main() {
     auto st = stop_sources.back().get_token();
 
     // Launch a new OS thread for each worker
-    threads.emplace_back([i, port, st] {
+    threads.emplace_back([i, st] {
       IoOptions opts{.sq_entries = 4096};
       IO worker(i, opts, {});
 
       // Spawn the initial accept loop fiber onto this worker
-      (void)worker.spawn([port, st](IO& fio) noexcept {
+      (void)worker.Spawn([st](IO& fio) noexcept {
         if (auto res = server_loop(fio, port, st); !res) {
-          ALOG_ERROR("Server loop failed: {}", res.error().error_code().message());
+          ALOG_ERROR("Server loop failed: {}", res.error());
         }
       });
 
       // Start the I/O event loop (blocks until the stop token is triggered)
-      worker.run(st);
+      worker.Run(st);
     });
   }
 

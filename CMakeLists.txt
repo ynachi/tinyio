@@ -18,9 +18,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 # CMAKE GENERAL VARIABLES
 #
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS ON CACHE INTERNAL "Suppress dev warnings from dependencies")
-if(POLICY CMP0167)
+if (POLICY CMP0167)
     cmake_policy(SET CMP0167 OLD)
-endif()
+endif ()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -76,6 +76,10 @@ add_subdirectory(src)
 
 if (TINYIO_BUILD_TESTS)
     add_subdirectory(tests)
+endif ()
+
+if (TINYIO_BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif ()
 
 install(FILES LICENSE NOTICE DESTINATION ${TINYIO_INSTALL_DOCDIR})

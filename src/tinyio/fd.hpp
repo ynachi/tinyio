@@ -14,6 +14,13 @@ struct Fd {
 
   Fd() = default;
   explicit Fd(const int f) : fd(f) {}
+  /// Destructor closes the fd synchronously via ::close() (or unregisters
+  /// a direct fd). This bypasses io_uring, so it can block if SO_LINGER is
+  /// set or the socket has pending data with a slow peer. In normal code
+  /// paths, prefer calling io.Close(std::move(fd)) for an async close
+  /// through io_uring. The sync destructor is a safety net for early
+  /// returns (e.g. TRY propagation) — for non-blocking sockets without
+  /// SO_LINGER it completes in sub-microsecond time.
   ~Fd() { CloseImpl(); }
 
   Fd(Fd&& other) noexcept : fd(other.fd), direct(other.direct), io_ptr(other.io_ptr) {

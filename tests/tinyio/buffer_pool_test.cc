@@ -62,7 +62,7 @@ TEST_F(SingleBucketPoolTest, BufferSizeMatchesBucketSlotSize) {
   auto buf = pool_.Take(kSlotSize);
   ASSERT_TRUE(buf.has_value());
   EXPECT_EQ(buf->Size(), kSlotSize);
-  EXPECT_EQ(buf->data().size(), kSlotSize);
+  EXPECT_EQ(buf->Data().size(), kSlotSize);
 }
 
 TEST_F(SingleBucketPoolTest, TakeDecrementsAvailableSlots) {

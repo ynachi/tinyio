@@ -149,6 +149,11 @@ Result<void> IO::Initialize() noexcept {
         ret < 0) {
       return Fail(-ret, "io_uring_register_files");
     }
+    // Populate the LIFO free-list in reverse so index 0 is popped first.
+    direct_free_.reserve(opts_.direct_fd_table_size);
+    for (uint32_t i = opts_.direct_fd_table_size; i-- > 0;) {
+      direct_free_.push_back(i);
+    }
     ALOG_INFO("registered direct fd table of size {}", opts_.direct_fd_table_size);
   }
 
@@ -197,17 +202,15 @@ void Fd::CloseImpl() noexcept {
 Result<Fd> IO::RegisterFile(Fd fd) noexcept {
   if (!fd.IsValid() || fd.IsDirect()) return fd;
 
-  if (direct_fds_.empty()) return fd;
-
-  const auto it =
-      std::find(direct_fds_.begin() + next_free_direct_idx_, direct_fds_.end(), -1);
-  if (it == direct_fds_.end()) {
-    ALOG_WARN("register_file: direct FD table full ({}/{}), fd {} will use indirect path",
-              direct_fds_cnt_, direct_fds_.size(), fd.Get());
+  if (direct_free_.empty()) {
+    if (!direct_fds_.empty()) {
+      ALOG_WARN("register_file: direct FD table full ({}/{}), fd {} will use indirect path",
+                direct_fds_.size() - direct_free_.size(), direct_fds_.size(), fd.Get());
+    }
     return fd;
   }
 
-  const int idx = std::distance(direct_fds_.begin(), it);
+  const uint32_t idx = direct_free_.back();
   int raw_fd = fd.Get();
 
   if (const int ret = io_uring_register_files_update(&ring_, idx, &raw_fd, 1); ret < 0) {
@@ -216,9 +219,8 @@ Result<Fd> IO::RegisterFile(Fd fd) noexcept {
     return fd;
   }
 
+  direct_free_.pop_back();
   direct_fds_[idx] = raw_fd;
-  next_free_direct_idx_ = idx + 1;
-  direct_fds_cnt_++;
 
   ::close(fd.Release());  // raw kernel fd is consumed
 
@@ -237,10 +239,7 @@ void IO::UnregisterDirectFd(const int direct_idx) noexcept {
   if (const int ret = io_uring_register_files_update(&ring_, direct_idx, &empty_fd, 1);
       ret >= 0) {
     direct_fds_[direct_idx] = -1;
-    direct_fds_cnt_--;
-    if (std::cmp_less(direct_idx, next_free_direct_idx_)) {
-      next_free_direct_idx_ = direct_idx;
-    }
+    direct_free_.push_back(static_cast<uint32_t>(direct_idx));
   }
 }
 
@@ -834,10 +833,11 @@ void IO::RunUntilDone() noexcept {
 
   // Also drain the cross-thread post queue: tasks posted before run_until_done()
   // is called would be silently dropped if we only checked live_fibers_.
-  // Note: inflight_ops_ is always at least 1 because the cross-thread wake_fd_
-  // is constantly armed for reading. We check for > 1 to ensure there are
-  // no active user I/O operations pending.
-  while (HasLiveFibers() || inflight_ops_ > 1 || !ready_queue_.Empty() ||
+  // inflight_ops_ tracks user I/O ops and cancel SQEs only (the wake_fd_
+  // read is not counted). HasLiveFibers() already covers waiting fibers,
+  // but the > 0 check defends against future code paths where an op is
+  // in-flight without a corresponding live fiber.
+  while (HasLiveFibers() || inflight_ops_ > 0 || !ready_queue_.Empty() ||
          !post_queue_.Empty()) {
     if (auto res = Tick(); !res) {
       const auto err = res.error();
