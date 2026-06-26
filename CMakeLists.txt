@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2)
+cmake_minimum_required(VERSION 3.30)
 
 project(Tinyio
         VERSION 0.1.0
@@ -34,6 +34,7 @@ option(TINYIO_BUILD_STATIC "Build static library" ON)
 option(TINYIO_BUILD_SHARED "Build shared library" OFF)
 option(TINYIO_BUILD_TESTS "Build tests" ON)
 option(TINYIO_BUILD_EXAMPLES "Build the examples" OFF)
+option(TINYIO_BUILD_BENCHMARKS "Build the benchmarks" OFF)
 option(TINYIO_ENABLE_ASAN "Enable Address Sanitizer" OFF)
 option(TINYIO_ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
 
@@ -64,8 +65,8 @@ find_package(Abseil REQUIRED)
 # mimalloc
 find_package(mimalloc REQUIRED)
 
-include(KioBoost)
-kio_find_boost(REQUIRED COMPONENTS context)
+include(TinyioBoost)
+tinyio_find_boost(REQUIRED COMPONENTS context)
 
 # openssl, min 3 required
 find_package(OpenSSL 3 REQUIRED)
@@ -151,11 +152,11 @@ install(FILES LICENSE NOTICE DESTINATION ${TINYIO_INSTALL_DOCDIR})
 #    add_subdirectory(examples)
 #endif ()
 #
-## for benchmarks
-#if (TIO_BUILD_BENCHMARK)
-#    add_subdirectory(benchmarks/cpp)
-#endif ()
-#
+# for benchmarks
+if (TINYIO_BUILD_BENCHMARKS)
+    include(FindPhotonLibOS)
+    add_subdirectory(benchmarks/cpp)
+endif ()
 #if (TIO_BUILD_TESTS)
 #    include(CTest)
 #    enable_testing()

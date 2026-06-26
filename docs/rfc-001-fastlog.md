@@ -1,953 +1,749 @@
-# RFC-001: FastLog — A FasterLog-Inspired Append-Only Log for tinyio
+# RFC: A Single-Threaded, Fiber-Based Durable Log
 
-**Status**: Draft **Author**: tinyio contributors **Created**: 2026-06-18 **Updated**: 2026-06-18 (revised after reading
-Microsoft FasterLog source)
-**Related**: `docs/faster-sigmod18.pdf`, https://github.com/microsoft/FASTER/tree/main/cs/src/core/FasterLog
-
----
-
-## Table of Contents
-
-1. [Abstract](#1-abstract)
-2. [Background: How FasterLog Works](#2-background-how-fasterlog-works)
-    - 2.1 [The FASTER Project](#21-the-faster-project)
-    - 2.2 [The Epoch Protection Framework](#22-the-epoch-protection-framework)
-    - 2.3 [The Hybrid Log](#23-the-hybrid-log)
-    - 2.4 [Append Protocol](#24-append-protocol)
-    - 2.5 [Commit Protocol](#25-commit-protocol)
-    - 2.6 [Fast Commit Mode](#26-fast-commit-mode)
-    - 2.7 [Named / Persisted Iterators](#27-named--persisted-iterators)
-    - 2.8 [Read and Scan](#28-read-and-scan)
-    - 2.9 [Truncation](#29-truncation)
-    - 2.10 [Summary of Complexity Sources](#210-summary-of-complexity-sources)
-3. [Motivation](#3-motivation)
-4. [Design](#4-design)
-    - 4.1 [Scope and Non-Goals](#41-scope-and-non-goals)
-    - 4.2 [Address Space](#42-address-space)
-    - 4.3 [Record Format and Alignment](#43-record-format-and-alignment)
-    - 4.4 [Page](#44-page)
-    - 4.5 [Segment Files](#45-segment-files)
-    - 4.6 [Append Path](#46-append-path)
-    - 4.7 [Page Flusher Fiber](#47-page-flusher-fiber)
-    - 4.8 [Commit Waiting and Commit Cookie](#48-commit-waiting-and-commit-cookie)
-    - 4.9 [Read Path](#49-read-path)
-    - 4.10 [Read Cache](#410-read-cache)
-    - 4.11 [Tail Follower and Scan Modes](#411-tail-follower-and-scan-modes)
-    - 4.12 [Named / Persisted Iterators](#412-named--persisted-iterators)
-    - 4.13 [Truncation](#413-truncation)
-    - 4.14 [Recovery](#414-recovery)
-5. [Integration with tinyio](#5-integration-with-tinyio)
-6. [Configuration Reference](#6-configuration-reference)
-7. [Open Questions](#7-open-questions)
+**Status:** Draft
+**Target:** C++17/20, single OS thread, cooperative fibers, fiber-blocking I/O
+**Interface model:** Microsoft FasterLog (`Enqueue` / `Commit` / `WaitForCommit` / `Scan` / `TruncateUntil`)
+**Storage model:** HybridLog allocator + segmented log device + separate commit files
 
 ---
 
-## 1. Abstract
+## Abstract
 
-This RFC specifies FastLog: an append-only, tiered, page-based log designed to run as a first-class component on top of
-the tinyio runtime. FastLog is inspired by Microsoft FasterLog but sheds the bulk of FasterLog's complexity by relying
-on tinyio's share-nothing, single-threaded-per-shard execution model. The result is a simpler system that provides the
-same core guarantees — durable sequential append, logical addressing, forward scan, group commit, efficient tail
-following, and named iterator checkpointing — without epoch protection, lock-free data structures, or cross-thread
-memory hazards.
+This document specifies the design of a persistent, recoverable, append-only log
+for a single-threaded runtime that uses cooperative fibers for concurrency and
+fiber-blocking I/O. It follows the public interface of Microsoft's FasterLog and
+the durability model (prefix recovery) introduced by the FASTER / CPR line of
+work, but deliberately strips out the multi-threaded machinery (epoch protection,
+the safe-read-only/fuzzy region, latch-free CAS paths) that single-threaded
+execution makes unnecessary.
 
-FastLog's primary intended use cases are:
-
-- Per-shard write-ahead log (WAL) for a storage engine
-- Durable event/commit log for pub-sub consumers
-- Replication log shipped to replica nodes
+The core claim, inherited from FASTER, is that **flushing data to disk and
+committing it are two distinct events**, separated by a small metadata write. The
+design makes that separation explicit and builds recovery on top of it.
 
 ---
 
-## 2. Background: How FasterLog Works
+## 1. Scope and non-goals
 
-This chapter is a self-contained introduction to FasterLog for readers without prior exposure to the FASTER project.
-Familiarity with the original paper (`faster-sigmod18.pdf`) is not assumed. The descriptions in this chapter are
-grounded in the actual C# source at `microsoft/FASTER/cs/src/core/FasterLog`.
+**In scope:** append (`Enqueue`), durable commit, blocking on commit, scan /
+tailing iteration, head truncation, crash recovery to a consistent prefix.
 
-### 2.1 The FASTER Project
-
-FASTER is a research system from Microsoft Research (SIGMOD 2018, Chandramouli et al.). It addresses a specific problem:
-how do you build a key-value store that runs at hundreds of millions of operations per second on a single machine,
-across many CPU cores, without becoming bottlenecked on synchronization?
-
-The two headline innovations in FASTER are:
-
-1. **The epoch protection framework** — a replacement for locks and RCU that lets threads operate on shared data
-   structures without ever acquiring a lock on the common path.
-2. **The hybrid log** — a tiered storage structure that keeps hot data in DRAM and cold data on disk, with a design that
-   avoids random I/O even for updates.
-
-FasterLog is the log component of FASTER. It was designed as a general-purpose append-only log that reuses the epoch
-framework and the same tiered storage model. It is used internally as FASTER KV's on-disk log and is also exposed as a
-standalone library (`FasterLog.cs`).
-
-### 2.2 The Epoch Protection Framework
-
-This is the core piece of intellectual machinery behind all of FASTER. Understanding it is essential to understanding
-why FasterLog is designed the way it is — and why we can drop it entirely.
-
-**The problem it solves**: multiple threads operating on shared mutable state. The classic solution is a mutex. Mutexes
-are slow because they serialize access and cause context switches. RCU (Read-Copy-Update) is faster for read-heavy
-workloads but complex. FASTER introduces epochs as a simpler, faster alternative suited to the specific access patterns
-of a log and KV store.
-
-**How it works**:
-
-Every thread that wants to access shared state calls `Protect()` before doing so and `Unprotect()` afterward. These are
-cheap operations (essentially a store and a load of an integer).
-
-The system maintains a global epoch counter `E`. Each call to `Protect()` records the current epoch in a thread-local
-slot. An epoch "drains" when all threads have called `Protect()` with a value ≥ that epoch (i.e., no thread is still
-inside an old epoch).
-
-Actions that would be unsafe to perform while some thread is still in an old epoch are **deferred**: they are placed in
-a trigger table and executed only once the epoch they depend on has drained. A thread that calls `BumpEpoch()`
-increments the global counter and optionally registers a deferred action.
-
-Example of how this replaces a lock in FasterLog's page flusher:
-
-- Before starting a page flush, the flusher bumps the epoch and registers: "when this epoch drains, advance
-  `CommittedUntilAddress`."
-- Threads that were mid-append in the old epoch will finish and call `Unprotect()`.
-- Once all threads have left the old epoch, the deferred action fires and `CommittedUntilAddress` advances.
-- No lock was ever held during any append or during the epoch drain check.
-
-The cost of `Protect()` / `Unprotect()` is roughly one atomic store each — much cheaper than a mutex acquire/release,
-and it never blocks.
-
-**The complexity cost**: the epoch framework is not trivial to implement correctly. It requires careful cache-line
-alignment of per-thread epoch slots (to avoid false sharing), correct ordering of deferred triggers, and correct
-handling of threads that join or leave the thread pool. It is also deeply entangled with every data structure that
-FASTER exposes — you cannot use a FASTER data structure from a thread that has not called `Protect()`.
-
-### 2.3 The Hybrid Log
-
-FasterLog's storage is divided into regions along the logical address space, controlled by three monotonically advancing
-cursors:
-
-```
-  BeginAddress    CommittedUntilAddress   SafeTailAddress   TailAddress
-       │                  │                    │                │
-       ▼                  ▼                    ▼                ▼
-───────┼──────────────────┼────────────────────┼────────────────┼──▶
-       │   immutable      │   fuzzy / flushing │  in memory     │
-       │   (on disk)      │   (in transition)  │  (mutable)     │
-```
-
-- **`TailAddress`**: next byte to reserve. Advanced by `fetch_add` on every enqueue. Records may not be fully written
-  yet after advancing.
-- **`SafeTailAddress`**: highest address up to which all records are fully written to memory (no in-flight writes from
-  other threads). Always ≤ `TailAddress`. Maintained by `AutoRefreshSafeTailAddress` or explicit calls. Consumers
-  scanning uncommitted data can safely read up to this address.
-- **`CommittedUntilAddress`**: highest address known to be durable on disk. Advances in page-sized steps after
-  successful flushes.
-- **`BeginAddress`**: lowest valid address. Advances on truncation.
-
-All four are 64-bit logical addresses that only move forward. The in-memory region is backed by a circular buffer of
-page-sized slots, indexed by `(page_number % BUFFER_CAPACITY)`.
-
-### 2.4 Append Protocol
-
-Multiple threads can append to FasterLog concurrently. The actual C# API is `Enqueue` / `TryEnqueue`.
-
-1. Thread calls `Protect()` to enter an epoch.
-2. Thread does an atomic `fetch_add` on `TailAddress` by `headerSize + Align(payloadLength)`. This is the only
-   synchronization point on the append fast path.
-3. The returned old value is the logical address. The thread writes its record header then payload into the page buffer
-   at that address.
-4. Thread calls `Unprotect()`.
-
-**Record alignment**: every record is padded to a 4-byte boundary. `Align(n) = (n + 3) & ~3`. The scanner uses the same
-formula to advance its cursor, skipping any padding bytes.
-
-**Header format**: FasterLog uses two header sizes depending on `LogChecksumType`:
-
-- `LogChecksumType.None` → 4-byte header (payload length only)
-- `LogChecksumType.PerEntry` → 12-byte header (4 bytes length + 8 bytes checksum)
-
-Because multiple threads can be mid-write simultaneously, a sealed page may still have in-flight writes from threads
-that reserved space before the seal but have not finished writing. The epoch framework resolves this: the flusher bumps
-the epoch before reading a page for flushing, so by the time the old epoch drains all in-flight writes to that page are
-complete.
-
-### 2.5 Commit Protocol
-
-FasterLog uses **group commit**: many appends are made durable in one I/O operation (a page write).
-
-Commit is an explicit operation (`Commit()` / `CommitAsync()`). It is controlled by a pluggable `LogCommitPolicy`:
-
-- **Default**: admits a commit if the tail has advanced since the last committed address or if metadata (iterators,
-  cookie) changed. Drops redundant commits.
-- **MaxParallel (k)**: at most `k` commits in flight simultaneously; extra calls are auto-retried.
-- **RateLimit (thresholdMs, thresholdBytes)**: admits a commit only if at least `thresholdBytes` bytes have accumulated
-  or `thresholdMs` milliseconds have elapsed since the last commit. Useful for capping I/O rate.
-
-The commit protocol itself:
-
-1. Snapshot `TailAddress` as the commit target (`CommitTail`).
-2. Serialize a `FasterLogRecoveryInfo` containing: `BeginAddress`, `UntilAddress` (= `CommitTail`), `CommitNum`
-   (monotone counter), persisted iterator positions, and an optional user cookie.
-3. Flush all pages up to `CommitTail` to disk via the I/O device.
-4. Once flush completes, call `ILogCommitManager.Commit(beginAddress, untilAddress, metadata, commitNum)` which persists
-   the `FasterLogRecoveryInfo` to a separate commit metadata file.
-5. Advance `CommittedUntilAddress` to `CommitTail`.
-6. Wake all `WaitForCommit` callers.
-
-Callers can `WaitForCommit(untilAddress)` or `WaitForCommitAsync(untilAddress)` to block until
-`CommittedUntilAddress ≥ untilAddress`.
-
-The `FasterLogRecoveryInfo` serialized to disk contains a checksum
-(`BeginAddress ^ UntilAddress ^ CommitNum ^ iteratorCount ^ cookieLength ^ cookieChecksum`) to detect corruption.
-
-### 2.6 Fast Commit Mode
-
-In standard mode, commit metadata is written to a separate file managed by `ILogCommitManager` (by default, a
-`DeviceLogCommitCheckpointManager`). This requires two I/Os per commit: the page write plus the metadata write.
-
-**Fast commit mode** (`FastCommitMode = true`) eliminates the separate metadata write by embedding commit records
-directly inline in the log stream. A special "commit record" is written as an ordinary record with a flag in the header;
-its payload is the serialized `FasterLogRecoveryInfo`.
-
-Tradeoffs:
-
-- **Faster commits**: one fewer I/O, lower latency.
-- **Slower recovery**: on restart, FasterLog must scan forward through the log to find the last commit record, rather
-  than reading a known metadata file. Recovery time is O (data written since last truncation) instead of O (1).
-- **Requires checksums**: `LogChecksumType.PerEntry` must be enabled so the scanner can detect real records vs commit
-  records vs padding.
-
-Scanners must recognize and skip commit records (`isCommitRecord` flag in the internal `GetNextInternal` method).
-
-### 2.7 Named / Persisted Iterators
-
-FasterLog supports **named iterators**: scan iterators registered with a string name whose read position is checkpointed
-as part of every `Commit()`.
-
-```csharp
-// Create a named iterator — position is persisted with each commit
-using var iter = log.Scan(beginAddress, long.MaxValue, name: "consumer-1");
-```
-
-The `FasterLog` instance maintains a `ConcurrentDictionary<string, FasterLogScanIterator> PersistedIterators`. On every
-commit, `FasterLogRecoveryInfo.SnapshotIterators()` records the current `CompletedUntilAddress` of each named iterator
-in the `Iterators` dictionary of the commit record.
-
-On recovery, `RecoveredIterators` is populated from the last commit record. When a named iterator is re-created via
-`Scan(name: "consumer-1", recover: true)`, it resumes from its checkpointed position rather than from `beginAddress`.
-
-This enables **exactly-once consumer semantics**: if the consumer crashes between reads, on restart it picks up from the
-last position it explicitly advanced via `CompleteUntil(address)`.
-
-The consumer is responsible for calling `CompleteUntil(address)` after successfully processing each record. This is
-deliberately separate from just advancing the scan cursor, allowing the consumer to do its own processing (e.g., writing
-to a downstream system) before declaring a record consumed.
-
-### 2.8 Read and Scan
-
-Reading a record at a known logical address:
-
-- If `address ≥ CommittedUntilAddress` (and `address < SafeTailAddress`): record is in the uncommitted in-memory region.
-  Accessible only if `scanUncommitted = true`.
-- If `address ≥ CommittedUntilAddress` (and `scanUncommitted = false`): not yet committed; block or return not-ready.
-- If `address ≥ BeginAddress`: record is on disk (immutable). Read via buffered page fetch.
-- If `address < BeginAddress`: truncated; return error.
-
-Forward scan advances `cursor += headerSize + Align(entryLength)` after each record. No index needed.
-
-**Scan buffering modes** (`ScanBufferingMode`):
-
-- `SinglePageBuffering`: one page-sized buffer. When the scanner crosses a page boundary and the new page is on disk, it
-  issues a synchronous async read and waits.
-- `DoublePageBuffering` (default): two page-sized buffers. While processing the current page, the next page is being
-  loaded from disk in the background (prefetch). For sequential scans over cold data, this roughly halves wait time.
-
-The iterator (`FasterLogScanIterator`) exposes:
-
-- `GetNext()` — synchronous, returns false if no more data available right now
-- `GetAsyncEnumerable()` — async C# enumerable that awaits new data when the cursor reaches `CommittedUntilAddress`
-- `WaitAsync()` — await until new data or commit arrives
-
-### 2.9 Truncation
-
-`TruncateUntilAddress(address)` advances `BeginAddress` to `address`. This frees in-memory page slots below `address`
-and allows segment files fully below `address` to be deleted. Truncation does not block appenders or readers above
-`address`.
-
-### 2.10 Summary of Complexity Sources
-
-| Complexity                                    | Why it exists in FasterLog                                                                     |
-|-----------------------------------------------|------------------------------------------------------------------------------------------------|
-| Epoch protection framework                    | Multiple threads append concurrently; need memory-safe access without locks                    |
-| `SafeTailAddress` distinct from `TailAddress` | In-flight concurrent appends to same page create a gap between reserved and fully-written tail |
-| Lock-free `fetch_add` on `TailAddress`        | Concurrent reservation of space in the page buffer                                             |
-| Deferred trigger table                        | Epoch-based deferral of `CommittedUntilAddress` advancement                                    |
-| Thread registration/management                | Every thread must register with the epoch system before use                                    |
-| Callback/`Task`-based commit wait             | No coroutine/fiber support in the C# implementation                                            |
-| `ILogCommitManager` abstraction               | Support pluggable storage backends for commit metadata                                         |
-| Fast commit mode scanner complexity           | Inline commit records must be recognized and skipped during scan                               |
-
-All of these except named iterators, commit cookie, and scan buffering mode exist purely to handle concurrent
-multi-threaded access to shared log state. In tinyio, the log is owned by a single IO thread. The concurrency complexity
-vanishes entirely.
+**Non-goals:** the hash index and key-value operations (Read/Upsert/RMW); these
+sit *above* this log and are out of scope here. Multi-thread concurrency is also
+out of scope — the design assumes a single writer fiber and cooperative
+scheduling. In-place record mutation (the KV store's mutable region) is not
+required for a pure log; the mutable/read-only split is retained only as a
+flush-timing mechanism.
 
 ---
 
-## 3. Motivation
+## 2. Terminology
 
-The FASTER project is a compelling piece of systems engineering, but its complexity is driven by a specific requirement:
-maximally concurrent access from many threads. tinyio's execution model gives us a different set of constraints:
-
-- Each `IO` instance runs on exactly one OS thread.
-- All operations on a log instance are issued by fibers running on that thread.
-- Cross-thread access is routed through `post()`, serializing it on the owning thread before it reaches the log.
-
-This means within a single log instance:
-
-- There is exactly one appender active at a time (the current fiber on the IO thread).
-- `TailAddress == SafeTailAddress` always — no in-flight writes from other threads, ever.
-- There is no concurrent mutation of any data structure.
-- No epoch protection is needed.
-- No lock-free atomics are needed on the append fast path.
-- There is no fuzzy region: when a fiber seals a page, no other writer is mid-write to it.
-
-We retain all of FasterLog's useful features — tiered storage, logical addresses, page-based I/O, group commit, forward
-scan with double-page prefetch, scan-uncommitted, named iterator checkpointing, commit cookie — with a much simpler
-implementation that maps naturally onto io_uring async I/O and fiber-based blocking.
+| Term                | Meaning                                                                                                                   |
+|---------------------|---------------------------------------------------------------------------------------------------------------------------|
+| **Logical address** | A 64-bit position in the conceptually infinite log, starting at 0. Not a memory pointer.                                  |
+| **Page**            | Fixed-size unit of the log (`2^page_bits` bytes). Allocation and flushing happen at page granularity.                     |
+| **Segment**         | A file on disk holding a fixed number of pages (`2^segment_bits` bytes).                                                  |
+| **Tail**            | The next free logical address; where `Enqueue` allocates.                                                                 |
+| **Flush**           | Writing a sealed page to the log device. Advances `flushedUntil`. Eviction / memory management, **not** durability.       |
+| **Commit**          | Durably recording a recoverable point (a prefix boundary). Advances `committedUntil`.                                     |
+| **Fold-over**       | Forcing the read-only boundary up to the tail so the entire in-memory region flushes; the log becomes its own checkpoint. |
 
 ---
 
-## 4. Design
+## 3. Background: the HybridLog address space
 
-### 4.1 Scope and Non-Goals
-
-**In scope**:
-
-- Append-only sequential write
-- Logical addressing (monotonic u64 offset)
-- Page-based group commit to disk via io_uring
-- Forward scan by logical address with double-page prefetch buffering
-- Async tail following: blocking fiber until new committed or uncommitted data arrives
-- Named / persisted iterators with `complete_until()` checkpointing
-- Commit cookie: arbitrary user bytes attached to each commit
-- Truncation with segment file deletion
-- Crash recovery from commit metadata
-- SIEVE-based read cache for on-disk pages
-
-**Not in scope** (for this RFC):
-
-- Cross-log transactions (handled at a higher layer)
-- Replication (log pages can be shipped by a separate fiber; not part of this design)
-- Fast commit mode / inline commit records (future extension; see §7)
-- Compression
-- Encryption
-- Multiple concurrent writers to the same log from multiple IO threads (use `post()` to serialize on the owner)
-
-### 4.2 Address Space
-
-The log exposes a 64-bit logical address space that grows monotonically. Three cursors partition it:
+The log is a single 64-bit logical address space. A bounded in-memory circular
+buffer holds the tail of that space; everything older lives on the device. Three
+internal markers split the resident region:
 
 ```
-  head_offset       flush_offset     tail_offset
-       │                  │               │
-       ▼                  ▼               ▼
-───────┼──────────────────┼───────────────┼──────▶  logical address (u64)
-       │   on disk        │  in memory    │
-       │   (immutable)    │  (mutable)    │
+addr 0          headOffset        readOnlyOffset                tailOffset
+  |                 |                   |                            |
+  v                 v                   v                            v
+  +-----------------+-------------------+----------------------------+
+  |     STABLE      |     READ-ONLY     |          MUTABLE           |
+  |   (on disk)     |   sealed, flush   |   open, append at tail     |
+  +-----------------+-------------------+----------------------------+
+   \___ on disk ___/ \________ resident in circular buffer _________/
 ```
 
-- `tail_offset`: next byte to write. Advances on every append. Because the log is single-threaded, this is also the safe
-  tail — there are never in-flight partial writes.
-- `flush_offset`: highest offset known to be durable on disk. Advances in `PAGE_SIZE` increments when a page flush
-  completes. Always page-aligned.
-- `head_offset`: lowest valid offset. Advances on truncation. Always page-aligned.
+A record's logical address never changes. As the tail grows, the markers slide
+right and a record drifts `MUTABLE -> READ-ONLY -> STABLE`. That drift is the
+eviction policy; no per-record statistics are kept.
 
-All three are `uint64_t`. On a 64-bit machine with 256 KB pages, the address space holds 4.7 × 10¹² pages — effectively
-unlimited.
-
-**Page number and offset within page** are derived from a logical address:
+**Address -> memory mapping** (valid only when `addr >= head`):
 
 ```
-page_number      = address / PAGE_SIZE
-offset_in_page   = address % PAGE_SIZE
+frame_index = (addr >> page_bits) % num_frames
+byte_offset = addr &  (page_size - 1)
+physical    = frames[frame_index].buf + byte_offset
 ```
 
-### 4.3 Record Format and Alignment
+> **Single-threaded simplification.** Because there is exactly one writer and no
+> preemption, the *safe-read-only offset* and *fuzzy region* from the FASTER
+> paper are unnecessary: `readOnlyOffset` is always current at the moment it is
+> read. Epoch protection, the tentative bit, and CAS loops are likewise dropped.
 
-Records are packed sequentially into pages. Each record is followed by alignment padding to the next 4-byte boundary
-(matching FasterLog's `Align()` convention). Scanners must apply the same formula to advance the cursor.
+---
 
+## 4. Architecture
+
+FasterLog is a thin API over two subsystems, each persisting to its own file set.
+
+```mermaid
+graph TD
+    EnqueueCall[Enqueue]:::call --> Allocator
+    CommitCall[Commit]:::call --> CommitMgr
+
+    subgraph FasterLog
+        Allocator[Allocator<br/>circular buffer of pages]
+        CommitMgr[Commit manager<br/>persists recovery info]
+    end
+
+    Allocator -->|flush pages| LogDevice[Log device<br/>segment files = data]
+    CommitMgr -->|write record| CommitFiles[Commit files<br/>newest = recovery point]
+
+    classDef call fill:transparent,stroke-dasharray:3 3;
 ```
- 0       1       2       3       4       5       6       7
- ┌───────┬───────┬───────┬───────┬───────────────────────┐
- │ magic │ magic │  payload_len (uint32_t, LE)            │
- ├───────┴───────┴───────┴───────┴───────────────────────┤
- │                  payload (variable)                    │
- ├───────────────────────────────────────────────────────┤
- │  crc32c (uint32_t, LE)  │  padding to 4-byte boundary │
- └─────────────────────────┴───────────────────────────┘
-```
 
-- `magic`: 2 bytes, fixed value `0xFA 0x57`. Used to detect corruption and to distinguish real records from zero-padded
-  page tails during recovery scan. FasterLog does not use magic bytes; we add them for robustness.
-- `payload_len`: 4 bytes, little-endian unsigned. Length of the payload in bytes. Does **not** include the header,
-  checksum, or padding.
-- `payload`: variable-length application data.
-- `crc32c`: 4 bytes, little-endian. CRC32C over `magic + payload_len + payload`. Verified on read. Hardware-accelerated
-  on x86 (SSE4.2) and aarch64 (ARMv8 CRC extension).
-- `padding`: 0–3 zero bytes so that the next record starts at a 4-byte aligned offset.
+The two-file separation is fundamental: the **log device** carries record data,
+the **commit files** carry recovery metadata. A record reaching the log device is
+"flushed"; the commit record naming that record is what makes it "committed."
 
-**Total per-record overhead**: 10 bytes fixed + 0–3 bytes padding.
+---
 
-**Alignment formula** (same as FasterLog):
+## 5. Configuration
 
 ```cpp
-static uint32_t align4(uint32_t n) { return (n + 3u) & ~3u; }
-
-// Slot consumed in the page by one record:
-uint32_t slot_size(uint32_t payload_len) {
-    return 10u + align4(payload_len) - payload_len  // wait, let me recalculate
-}
-// Simpler: total bytes written = 6 (header) + payload_len + 4 (crc) = 10 + payload_len
-// Bytes to advance cursor = align4(10 + payload_len)
-uint32_t record_stride(uint32_t payload_len) {
-    return align4(6u + payload_len) + 4u;  // header + aligned payload + crc
-}
-```
-
-Wait — to keep alignment simple and consistent with FasterLog: treat `(header + payload)` as the alignable unit, then
-append the CRC. Alternatively, align the entire record including CRC:
-
-```cpp
-// Stride = align4(magic(2) + len(4) + payload(N) + crc(4))
-//        = align4(10 + N)
-uint32_t record_stride(uint32_t payload_len) {
-    return align4(10u + payload_len);
-}
-```
-
-This is the convention we adopt. The cursor always advances by `align4(10 + payload_len)` after each record.
-
-**Max single-record payload**: `PAGE_SIZE - 10` bytes. Larger payloads require fragmentation (future extension; see §7).
-
-### 4.4 Page
-
-A page is a fixed-size raw byte buffer. It is the unit of I/O between memory and disk.
-
-```cpp
-static constexpr uint32_t PAGE_SIZE = 256 * 1024;  // 256 KB, must be power of two
-
-struct alignas(4096) Page {
-    uint8_t  data[PAGE_SIZE];
-    uint32_t written;   // bytes used; records are packed in data[0..written)
-    enum class State : uint8_t {
-        Mutable,   // current write target
-        Sealed,    // full or explicitly sealed; awaiting flush
-        Flushing,  // io_uring write in flight
-        Flushed,   // durable on disk; slot reusable
-    } state;
+struct LogSettings {
+    int    page_bits    = 22;    // 4 MB pages   (FasterLog default is 25 = 32 MB)
+    int    memory_bits  = 26;    // 64 MB resident -> 2^(26-22) = 16 pages in RAM
+    int    segment_bits = 30;    // 1 GB segment files on disk
+    double mutable_frac = 0.9;   // last 90% of RAM stays unflushed until commit
+    bool   checksum     = false; // per-entry checksum (12-byte header vs 4); see §11
+    std::string dir;             // log device + commit files live here
 };
 ```
 
-Pages are stored in a circular ring buffer in memory, sized `BUFFER_PAGES` entries. The ring slot for page `N` is
-`N % BUFFER_PAGES`. `BUFFER_PAGES` must be large enough that the flusher can finish flushing old pages before the
-appender wraps around and needs their slots. A safe default is 32 (8 MB in-memory buffer with 256 KB pages).
+Derived quantities:
 
-**Page boundary handling**: a record is never split across pages. If the current page does not have enough remaining
-space for the next record (`align4(10 + payload_len)` bytes), the remainder of the page is zero-padded and the page is
-sealed. The record is written at the start of the next page. Scanners detect the zero-padded tail by checking for a zero
-or invalid magic and skipping to the next page boundary.
+| Quantity           | Formula                                      |
+|--------------------|----------------------------------------------|
+| `page_size`        | `1 << page_bits`                             |
+| `pages_in_memory`  | `1 << (memory_bits - page_bits)` (minimum 2) |
+| `segment_size`     | `1 << segment_bits`                          |
+| pages per segment  | `segment_size / page_size`                   |
+| `segment_id(addr)` | `addr >> segment_bits`                       |
 
-**Large records** (payload exceeding `PAGE_SIZE - 10`) are fragmented: each fragment carries a continuation flag in the
-header. Fragmentation is rare in the WAL use case; for now we cap single-record payloads at `PAGE_SIZE - 10` and
-document fragmentation as a future extension (§7).
+---
 
-### 4.5 Segment Files
+## 6. Address markers and the durability model
 
-The on-disk address space is divided into segment files, each covering a fixed range of the logical address space.
-
-```
-Segment 0:  log_00000000.seg   offsets [0,           SEGMENT_SIZE)
-Segment 1:  log_00000001.seg   offsets [SEGMENT_SIZE, 2*SEGMENT_SIZE)
-...
-```
-
-`SEGMENT_SIZE` must be a multiple of `PAGE_SIZE`. Default: 512 MB.
-
-The segment file for address `A` is `A / SEGMENT_SIZE`. The byte offset within that file is `A % SEGMENT_SIZE`.
-
-Each segment file is pre-allocated with `fallocate` (via io_uring) before it is needed, so page writes never extend a
-file — they always overwrite pre-allocated space. The segment allocator fiber opens and preallocates the next segment
-file when the flusher reaches 80% of the current one.
-
-Segment files are opened with `O_DIRECT | O_RDWR`. All reads and writes are page-aligned, satisfying `O_DIRECT`
-alignment requirements. The kernel page cache is bypassed entirely; FastLog is its own page cache.
-
-**Commit metadata** is stored separately from log data, in a `log_commit/` subdirectory. Each commit produces one file
-named by `commit_num` (zero-padded hex). This mirrors FasterLog's `DeviceLogCommitCheckpointManager` approach and keeps
-the log files themselves pure data.
-
-### 4.6 Append Path
-
-The append path is synchronous from the caller's perspective — it writes bytes into the in-memory page buffer and
-returns a logical address immediately. No I/O is issued on the append path.
+Four addresses are exposed, and they are always sorted:
 
 ```
-LogAddress FastLog::append(std::span<const uint8_t> payload):
-
-  1. stride   = align4(10 + payload.size())
-  2. If stride > PAGE_SIZE - current_page.written:
-       seal current page (zero-pad remainder, set state = Sealed)
-       notify flusher fiber
-       advance to next page slot (wrapping in ring)
-       if next slot is not Flushed: return Err::buffer_full  // back-pressure
-       initialize next page (written = 0, state = Mutable)
-  3. addr = tail_offset
-  4. Write into current_page.data[current_page.written]:
-       write magic (2 bytes: 0xFA 0x57)
-       write payload_len (4 bytes LE)
-       write payload (payload.size() bytes)
-       write crc32c (4 bytes) over [magic + payload_len + payload]
-       write zero padding ((stride - 10 - payload.size()) bytes)
-  5. current_page.written += stride
-  6. tail_offset           += stride
-  7. notify tail_waiters   (wake any fiber waiting on scan-uncommitted)
-  8. return addr
+beginAddress      committedUntil      flushedUntil                tailAddress
+   |                   |                   |                           |
+   v                   v                   v                           v
+   +-------------------+-------------------+---------------------------+
+   |     committed     |   flushed only    |      in memory only       |
+   |  survives crash   |   lost on crash   |         volatile          |
+   +-------------------+-------------------+---------------------------+
+    \______________ persisted on disk _______________/
 ```
 
-No atomics. No locks. No kernel calls. The return value is the logical address of the record, usable for direct reads or
-for `wait_until_flushed()`.
+`beginAddress <= committedUntil <= flushedUntil <= tailAddress`
 
-If `buffer_full` is returned, the caller should yield to the event loop once to allow the flusher fiber to make
-progress, then retry. This is the natural back-pressure mechanism.
+- `Enqueue` advances **tailAddress** (in memory, not durable).
+- Background page flushing advances **flushedUntil** (on disk, not yet recoverable).
+- `Commit` advances **committedUntil** (recoverable). This is the only durability line.
+- `TruncateUntil` raises **beginAddress** (the floor).
 
-### 4.7 Page Flusher Fiber
+The middle band — flushed but not committed — is the subtle one: that data is
+physically on the SSD yet is discarded on recovery, because no commit record
+names it.
 
-A background fiber that runs on the same IO thread as the log. It wakes when a page is sealed and flushes sealed pages
-in order.
+**Guarantee (single-threaded prefix recovery).** After a crash, the log recovers
+to exactly `[beginAddress, committedUntil)` of the most recent commit. For two
+enqueues `e1` then `e2`, recovery contains none, only `e1`, or both — never `e2`
+without `e1`. This is the single-session specialization of FASTER's Concurrent
+Prefix Recovery (CPR).
 
-```
-void FastLog::flusher_fiber():
+---
 
-  loop:
-    wait for: at least one page in state Sealed
-              or shutdown signal
+## 7. Data structures
 
-    for each sealed page P in ascending order of page_number:
-      P.state = Flushing
-      seg_fd  = segment_file_for(P.page_number)
-      offset  = (P.page_number * PAGE_SIZE) % SEGMENT_SIZE
-      co_await io_uring_write(seg_fd, P.data, PAGE_SIZE, offset)
-      P.state = Flushed
-      flush_offset = (P.page_number + 1) * PAGE_SIZE
-      wake all commit_waiters with target_offset <= flush_offset
-
-    if flush_offset approaching next segment boundary:
-      ensure next segment file exists (preallocate if needed)
-```
-
-Key properties:
-
-- Pages are always flushed **in ascending order**. `flush_offset` never has gaps.
-- Multiple sealed pages can be submitted to io_uring as a batch before awaiting any — the disk subsystem can
-  reorder/merge internally. However, `flush_offset` advances only strictly in page order: page N+1 completing does not
-  advance `flush_offset` past page N.
-- `O_DIRECT` writes require the buffer to be 4096-byte aligned. `alignas(4096)` on `Page` satisfies this.
-- **Relaxed durability** (default): advance `flush_offset` on `io_uring` write completion (data in disk controller
-  buffer).
-- **Strict durability**: issue `io_uring_prep_fsync(IORING_FSYNC_DATASYNC)` after each page (or after each batch) and
-  advance `flush_offset` only on `fdatasync` completion.
-
-### 4.8 Commit Waiting and Commit Cookie
-
-**Commit waiting**: a fiber that needs durability at a given address suspends until `flush_offset` reaches that address.
+### 7.1 Logical address
 
 ```cpp
-struct CommitWaiter {
-    uint64_t    target_offset;
-    FiberHandle fiber;
-    byte[]      cookie;    // copied in, returned to waiter on wake
+using Address = int64_t;                  // 64-bit logical address, starts at 0
+constexpr Address kInvalid = -1;
+```
+
+### 7.2 Device (segmented files)
+
+The device abstracts the on-disk segment files. The reference implementation is
+`io_uring`-backed and shares a single registered buffer with the allocator's
+circular buffer (see §12).
+
+```cpp
+class IDevice {                            // fiber-blocking I/O: yields, never spins
+public:
+    virtual void WritePage(const uint8_t* src, Address dest, size_t n) = 0;  // eager flush, no fsync
+    virtual void Read     (uint8_t* dst,       Address src,  size_t n) = 0;
+    virtual void RemoveSegment(int segment_id) = 0;          // truncation
+
+    // Durability barrier: make written data durable, write the commit record,
+    // make the record durable — in strict order. Used by Commit (§9.2), not the
+    // eager flush path. Implemented as a single linked submission in §12.
+    virtual void CommitBarrier(const RecoveryInfo& info) = 0;
+
+    virtual ~IDevice() = default;
+};
+```
+
+### 7.3 Allocator (circular buffer + markers)
+
+```cpp
+struct Page {
+    uint8_t* buf = nullptr;                // points INTO the shared arena (§12); not owned
+    enum class State { Free, Filling, Sealed, Flushed } state = State::Free;
 };
 
-std::vector<CommitWaiter> commit_waiters_;  // kept sorted by target_offset
+class Allocator {
+public:
+    Address  Allocate(int size);           // bump tail; seal + queue flush on page cross
+    uint8_t* Get(Address a);               // physical ptr; valid only if a >= head_
+    void     ShiftReadOnlyToTail();        // commit's fold-over: flush everything in RAM
+    Address  Tail()         const { return tail_; }
+    Address  FlushedUntil() const { return flushed_until_; }
 
-Awaitable FastLog::wait_until_flushed(LogAddress addr,
-                                       std::span<const uint8_t> cookie = {}) {
-    if (flush_offset_ >= addr) return immediately;
-    commit_waiters_.push_back({addr, current_fiber(), {cookie.begin(), cookie.end()}});
-    co_yield;
-    // resumed by flusher when flush_offset >= addr
-}
-```
-
-When the flusher advances `flush_offset`, it wakes all waiters whose `target_offset ≤ new flush_offset` in one pass.
-This is implicit group commit: all appends that accumulate during one page's flush cycle are committed together when
-that page is flushed.
-
-**Commit cookie**: borrowed directly from FasterLog's `FasterLogRecoveryInfo.Cookie`. An arbitrary byte blob the caller
-attaches to a commit. It is persisted in the commit metadata file alongside `flush_offset` and named iterator positions.
-On recovery, the cookie from the last commit is returned to the application.
-
-Use cases:
-
-- A WAL writer attaches the B-tree checkpoint offset as a cookie, so on recovery it knows exactly which WAL entries
-  still need replay.
-- A pub-sub producer attaches a producer sequence number, enabling idempotent re-publish after crash.
-
-```cpp
-// Writing a WAL entry and attaching a checkpoint cookie:
-LogAddress addr = log.append(wal_record);
-CheckpointMeta meta = {.btree_lsn = current_lsn};
-co_await log.wait_until_flushed(addr, as_bytes(meta));
-// meta is now persisted alongside the commit record
-```
-
-The commit metadata file stores: `flush_offset`, `head_offset`, `commit_num`, named iterator positions, cookie length +
-cookie bytes, and a checksum of all fields (matching FasterLog's `ToByteArray()` format for potential
-cross-compatibility).
-
-### 4.9 Read Path
-
-```
-Record FastLog::read(LogAddress addr):
-
-  if addr < head_offset_:    return Err::truncated
-  if addr >= tail_offset_:   return Err::out_of_range
-
-  if addr >= flush_offset_:
-    // in memory — direct pointer into page buffer, no I/O
-    page = ring_[page_number(addr) % BUFFER_PAGES]
-    return decode_record(page.data + offset_in_page(addr))
-
-  // on disk — check read cache
-  page = read_cache_.get(page_number(addr))
-  if not page:
-    page = co_await fetch_page_from_disk(page_number(addr))
-    read_cache_.insert(page_number(addr), page)
-  return decode_record(page.data + offset_in_page(addr))
-```
-
-`decode_record` verifies magic bytes and CRC32C; returns `Err::corrupt` on mismatch.
-
-`fetch_page_from_disk`:
-
-```
-  seg_fd = segment_file_for(page_number)
-  buf    = allocate aligned buffer (PAGE_SIZE, alignment 4096)
-  co_await io_uring_read(seg_fd, buf, PAGE_SIZE, byte_offset_in_segment)
-  return buf
-```
-
-### 4.10 Read Cache
-
-The read cache holds recently fetched on-disk pages. It uses the SIEVE eviction algorithm (Zhang et al., 2023) in
-preference to LRU.
-
-**Why SIEVE over LRU**: the dominant read patterns for a log read cache are sequential scans (recovery replay, consumer
-catch-up). LRU is polluted by sequential scans — a one-time pass over 1 GB of pages evicts everything that was hot
-before. SIEVE is scan-resistant: sequentially accessed pages that are not revisited get their visited bit reset by the
-hand and are evicted without disturbing frequently re-accessed pages.
-
-```cpp
-struct SieveCache {
-    struct Slot {
-        uint64_t page_number = UINT64_MAX;  // UINT64_MAX = empty
-        Page*    page        = nullptr;
-        bool     visited     = false;
-    };
-
-    std::vector<Slot>                       ring_;
-    size_t                                  hand_ = 0;
-    std::unordered_map<uint64_t, size_t>    index_;  // page_number -> slot index
-
-    Page* get(uint64_t pn) {
-        auto it = index_.find(pn);
-        if (it == index_.end()) return nullptr;
-        ring_[it->second].visited = true;   // O(1), no reorder
-        return ring_[it->second].page;
-    }
-
-    void insert(uint64_t pn, Page* page) {
-        size_t slot = evict_one_();
-        ring_[slot] = {pn, page, false};
-        index_[pn]  = slot;
-    }
-
-    void evict_below(uint64_t below_page_number) {
-        for (auto& [pn, slot] : index_)
-            if (pn < below_page_number) ring_[slot] = {};
-        std::erase_if(index_, [&](auto& kv){ return kv.first < below_page_number; });
-    }
+    std::function<void(Address)> on_flushed;  // fires when flushed_until_ advances
 
 private:
-    size_t evict_one_() {
-        while (ring_[hand_].visited) {
-            ring_[hand_].visited = false;
-            hand_ = (hand_ + 1) % ring_.size();
-        }
-        if (ring_[hand_].page_number != UINT64_MAX)
-            index_.erase(ring_[hand_].page_number);
-        size_t s = hand_;
-        hand_ = (hand_ + 1) % ring_.size();
-        return s;
-    }
+    std::vector<Page> pages_;              // size = pages_in_memory
+    Address tail_ = 0, read_only_ = 0, head_ = 0, flushed_until_ = 0;
+    IDevice* device_;
+    void FlushSealedPages();               // writes pages below read_only_, advances flushed_until_
+    void WaitUntilSpaceAvailable(int size); // yields fiber until head_ advances enough
 };
 ```
 
-Default cache size: 64 slots (16 MB with 256 KB pages). Configurable. For WAL use (write-heavy, rare reads), 8 slots is
-sufficient.
-
-### 4.11 Tail Follower and Scan Modes
-
-A scanner reads records sequentially from a starting address. Two scan modes exist, mirroring FasterLog's
-`scanUncommitted` flag:
-
-**Committed scan** (default): the cursor only advances up to `flush_offset`. When `cursor >= flush_offset`, the fiber
-suspends until the flusher advances `flush_offset`.
-
-**Uncommitted scan**: the cursor can advance up to `tail_offset` (which in our single-threaded model is always fully
-written, so it equals FasterLog's `SafeTailAddress`). Records not yet durable on disk are visible. Useful for replica
-log shippers that can tolerate re-reading on crash.
-
-**Double-page prefetch** (mirroring FasterLog's `ScanBufferingMode.DoublePageBuffering`): when reading from disk, two
-page-sized read buffers are maintained. While the scanner processes records from page N, page N+1 is being loaded
-asynchronously. The prefetch is kicked off as soon as the cursor enters the second half of page N.
-
 ```cpp
-struct Scanner {
-    FastLog*   log;
-    LogAddress cursor;
-    bool       scan_uncommitted = false;
-
-    // Two prefetch slots (double buffering for disk pages)
-    struct PrefetchSlot {
-        uint64_t   page_number = UINT64_MAX;
-        Page*      page        = nullptr;
-        bool       in_flight   = false;
-    } prefetch_[2];
-
-    Awaitable<Record> next() {
-        uint64_t limit = scan_uncommitted ? log->tail_offset_
-                                          : log->flush_offset_;
-        if (cursor >= limit) {
-            // register as waiter on the appropriate counter
-            if (scan_uncommitted)
-                log->tail_waiters_.push_back({cursor, current_fiber()});
-            else
-                log->commit_waiters_.push_back({cursor + 1, current_fiber()});
-            co_yield;
-            limit = scan_uncommitted ? log->tail_offset_ : log->flush_offset_;
-        }
-
-        // Ensure current page is available (hit in-memory ring or read cache)
-        Page* page = co_await get_page_(page_number(cursor));
-
-        // Parse record
-        uint8_t* ptr = page->data + offset_in_page(cursor);
-        // check magic, decode payload_len, verify CRC32C ...
-        Record r = decode(ptr);
-
-        uint32_t stride = align4(10u + r.payload_len);
-        cursor += stride;
-
-        // Skip zero-padded tail if we've crossed a page boundary
-        if (offset_in_page(cursor) < 10 && cursor % PAGE_SIZE != 0)
-            cursor = round_up_to_page(cursor);
-
-        // Kick off prefetch for next page if we're past the midpoint of the current page
-        maybe_prefetch_(page_number(cursor) + 1);
-
-        return r;
+Address Allocator::Allocate(int size) {
+    if (size > page_size) {
+        throw std::invalid_argument("Entry size exceeds maximum page size");
     }
 
-    // ...
+    WaitUntilSpaceAvailable(size);         // Backpressure: yield if (tail_ + size) - head_ > capacity
+    
+    int off = tail_ & (page_size - 1);
+    if (off + size > page_size) {          // won't fit: seal this page, move on
+        pages_[page_of(tail_) % pages_.size()].state = Page::State::Sealed;
+        tail_ = (page_of(tail_) + 1) << page_bits;
+        FlushSealedPages();                // may yield while writing; advances flushed_until_
+        
+        // Wait again because skipping to the next page might have exhausted capacity
+        WaitUntilSpaceAvailable(size);
+    }
+    Address a = tail_;
+    tail_ += size;
+    return a;
+}
+```
+
+> **Note on Maximum Entry Size:** Because the circular buffer is logically sliced into fixed `page_size` blocks and entries are never split across pages, the maximum size of a single entry is bounded by the page size. FASTER handles oversized entries by using a separate object store, but for a pure log, rejecting them with an exception is the safest approach to maintain memory invariants and zero-copy reads.
+
+> **Note on Backpressure:** Because this is a single-threaded cooperative runtime, the writer fiber cannot spin or fail silently if the circular buffer is full (i.e., `tail_ - head_ >= arena.bytes()`). The `WaitUntilSpaceAvailable` method must yield the fiber. Crucially, `head_` (the eviction tail) can only advance after data is durable on disk (when `flushed_until_` advances). The fiber wakes up when the `OnFlushed` continuation (which is triggered when `device_->WritePage` completes) advances `flushed_until_` and frees up `head_`.
+
+### 7.4 Recovery info (the entire durable commit record)
+
+```cpp
+struct RecoveryInfo {
+    Address begin_address;
+    Address until_address;                 // the committed-prefix boundary
+    int64_t commit_num;                    // monotonic; recover to this exact point
+    std::vector<uint8_t> cookie;           // user metadata, atomically persisted
+    std::map<std::string, Address> iterators;  // named iterator positions
+
+    std::vector<uint8_t> Serialize() const;
+    static RecoveryInfo Deserialize(std::span<const uint8_t>);
 };
 ```
 
-The prefetch slots work as a 2-entry FIFO: when a prefetch completes, the page is handed to the read cache and to the
-scanner's next call. If both slots are full and the scanner needs a third page ahead, it simply waits for the oldest
-prefetch to complete.
-
-### 4.12 Named / Persisted Iterators
-
-Named iterators mirror FasterLog's `PersistedIterators` feature. A scanner can be registered with a string name; its
-confirmed read position (`complete_until`) is included in every commit metadata write and restored on recovery.
+### 7.5 Commit manager
 
 ```cpp
-// Create a named scanner
-Scanner* FastLog::scan(LogAddress begin, std::string_view name = "");
-
-// Called by the consumer after successfully processing a record:
-void Scanner::complete_until(LogAddress addr);
+class ICommitManager {
+public:
+    virtual void Commit(const RecoveryInfo&) = 0;     // atomic write of one commit file
+    virtual std::optional<RecoveryInfo> GetLatest() = 0;
+    virtual void RemoveCommits(int64_t keep_num) = 0;
+    virtual ~ICommitManager() = default;
+};
 ```
 
-Internally, `FastLog` maintains:
+### 7.6 FasterLog (top level)
 
 ```cpp
-std::unordered_map<std::string, LogAddress> named_scanner_positions_;
-```
+class FasterLog {
+public:
+    explicit FasterLog(const LogSettings&);  // recovers from latest commit if present
 
-On every commit, `named_scanner_positions_` is serialized into the commit metadata file alongside `flush_offset` and the
-cookie. On recovery, `named_scanner_positions_` is populated from the last commit file.
+    Address Enqueue(std::span<const uint8_t> entry);
+    bool    TryEnqueue(std::span<const uint8_t> entry, Address& out);
+    void    Commit(bool spin_wait = false);  // issues; returns immediately by default
+    void    WaitForCommit(Address until = 0);// does NOT issue a commit
+    Address EnqueueAndWaitForCommit(std::span<const uint8_t> entry);
+    void    TruncateUntil(Address a);
+    ScanIterator Scan(Address begin, Address end, std::string name = "",
+                      bool recover = true, bool scan_uncommitted = false);
 
-When a named scanner is created with `recover = true` (the default), it starts from the recovered position rather than
-`begin`. If no recovered position exists for the given name, it starts from `begin`.
+    Address BeginAddress()          const { return begin_; }
+    Address TailAddress()           const { return alloc_.Tail(); }
+    Address FlushedUntilAddress()   const { return alloc_.FlushedUntil(); }
+    Address CommittedUntilAddress() const { return committed_until_; }
 
-**`complete_until` semantics**: the consumer calls `complete_until(addr)` only after it has fully processed the record
-at `addr` and any downstream side effects are durable (e.g., written to a downstream queue, applied to a state machine).
-The distinction between "cursor advanced past this record" and "consumer confirmed this record" is what enables
-exactly-once semantics after a crash:
-
-```
-Consumer fiber:
-  while true:
-    Record r = co_await scanner.next()
-    apply(r)                             // process the record
-    co_await downstream.flush()          // make downstream effect durable
-    scanner.complete_until(r.address)    // only now mark it consumed
-    // if we crash here, on restart we will re-read r.address
-    // and re-apply — but downstream.flush() must be idempotent
-```
-
-### 4.13 Truncation
-
-```
-void FastLog::truncate_until(LogAddress new_head):
-
-  assert(new_head <= flush_offset_)    // can only truncate durable data
-  assert(new_head % PAGE_SIZE == 0)    // must be page-aligned
-
-  head_offset_ = new_head
-
-  // delete segment files now fully below new_head
-  for each segment S where (S + 1) * SEGMENT_SIZE <= new_head:
-    co_await io_uring_unlink(segment_path(S))
-
-  // evict read cache pages below new_head
-  read_cache_.evict_below(new_head / PAGE_SIZE)
-```
-
-Truncation is cooperative: the caller chooses when to truncate. For a WAL, truncation happens after a checkpoint: once
-all writes up to address `A` are reflected in durable B-tree state, WAL entries below `A` are no longer needed for
-recovery.
-
-### 4.14 Recovery
-
-On restart, recovery proceeds in two steps: (1) load the last commit metadata, (2) verify and set cursors.
-
-**Step 1 — load commit metadata**:
-
-1. List all files in `log_commit/`, sorted by `commit_num` descending.
-2. For each commit file (most recent first), attempt to deserialize a `CommitMetadata` record:
-    - `flush_offset`, `head_offset`, `commit_num`, named scanner positions, cookie, checksum.
-    - Verify checksum. If invalid, try the next file.
-3. If no valid commit file is found, treat as a fresh log: `flush_offset = head_offset = 0`.
-
-**Step 2 — verify log data**:
-The last page on disk may be partially written (if the process crashed mid-flush). We verify the last page to find the
-true `flush_offset`:
-
-1. Starting from `commit_metadata.flush_offset - PAGE_SIZE` (the last committed page), read the page.
-2. Scan records forward within the page using magic + CRC32C to find the last valid record.
-3. If the full page looks valid, `flush_offset = commit_metadata.flush_offset` (the commit was fully persisted).
-4. If the last page is partially corrupted, set `flush_offset` to the end of the last valid record in that page.
-5. Set `tail_offset = flush_offset` (everything on disk is now immutable; nothing is in the mutable ring).
-6. Set `head_offset = commit_metadata.head_offset`.
-7. Restore `named_scanner_positions_` from `commit_metadata`.
-8. Return `commit_metadata.cookie` to the application.
-
-The application is responsible for replaying WAL entries from `head_offset` to `tail_offset` to rebuild in-memory state.
-
----
-
-## 5. Integration with tinyio
-
-Each `FastLog` instance is owned by exactly one `IO` (tinyio event loop). All methods must be called from fibers running
-on that `IO`'s thread, or dispatched via `post()`.
-
-Fiber layout within the owning IO thread:
-
-```
-IO thread (log owner)
-├── [inline] append()
-│     Writes to page buffer, returns LogAddress immediately.
-│     No suspension, no I/O.
-│
-├── [background fiber] flusher_fiber()
-│     Sleeps until a page is Sealed.
-│     Issues io_uring writes, advances flush_offset, wakes commit_waiters.
-│     Runs concurrently with other fibers on the same thread.
-│
-├── [background fiber] segment_allocator_fiber()
-│     Preallocates the next segment file via io_uring fallocate.
-│     Woken by flusher when approaching segment boundary.
-│
-├── [background fiber] commit_writer_fiber()
-│     Triggered after flush_offset advances (or explicitly via commit()).
-│     Serializes CommitMetadata, writes to log_commit/<commit_num>.
-│     Advances committed_offset, wakes named_scanner checkpointing.
-│
-└── [on-demand, per caller] wait_until_flushed() / read() / Scanner::next()
-      Fiber suspends on I/O or commit wait; resumes when condition satisfied.
-      Multiple such fibers can be in-flight simultaneously.
-```
-
-The background fibers are started in `FastLog::open()` and stopped gracefully in `FastLog::close()` (drain all sealed
-pages, write final commit, then exit).
-
-Cross-thread append:
-
-```cpp
-// From a foreign thread, dispatch append to the log's owner:
-LogAddress addr = co_await post(log_io, [&]{ return log.append(payload); });
-co_await post(log_io, [&]{ return log.wait_until_flushed(addr); });
+private:
+    Allocator       alloc_;
+    ICommitManager* commit_mgr_;
+    Address begin_ = 0, committed_until_ = 0, safe_tail_ = 0;
+    int64_t commit_num_ = 0;
+    std::deque<std::pair<Address, RecoveryInfo>> pending_commits_;  // ordered by until
+    void OnFlushed(Address new_flushed);     // drains pending_commits_ -> writes commit files
+    void Recover();
+};
 ```
 
 ---
 
-## 6. Configuration Reference
+## 8. Public interface
 
-| Parameter                    | Type       | Default              | Description                                                                                      |
-|------------------------------|------------|----------------------|--------------------------------------------------------------------------------------------------|
-| `path`                       | `string`   | —                    | Directory for segment files and commit metadata.                                                 |
-| `page_size`                  | `uint32_t` | `262144` (256 KB)    | Page size in bytes. Must be a power of two and ≥ 4096.                                           |
-| `buffer_pages`               | `uint32_t` | `32`                 | In-memory ring buffer size in pages. Total = `page_size × buffer_pages`.                         |
-| `segment_size`               | `uint64_t` | `536870912` (512 MB) | Segment file size. Must be a multiple of `page_size`.                                            |
-| `cache_pages`                | `uint32_t` | `64`                 | SIEVE read cache size in pages (16 MB at default page size).                                     |
-| `flush_mode`                 | `enum`     | `Relaxed`            | `Relaxed`: advance `flush_offset` on write completion. `Strict`: require `fdatasync`.            |
-| `scan_buffering`             | `enum`     | `Double`             | `Single`: one prefetch buffer. `Double`: two buffers (prefetch next page while reading current). |
-| `segment_prealloc_threshold` | `float`    | `0.8`                | Fraction of current segment used before preallocating the next.                                  |
-| `auto_commit`                | `bool`     | `false`              | Automatically trigger a commit after each append (high durability, lower throughput).            |
-| `remove_outdated_commits`    | `bool`     | `true`               | Delete commit metadata files superseded by a later successful commit.                            |
+Mirrors FasterLog so application code ports directly.
+
+```cpp
+// Append (to memory only — not durable)
+Address Enqueue(std::span<const uint8_t> entry);
+bool    TryEnqueue(std::span<const uint8_t> entry, Address& out);   // false if full (throttle)
+
+// Durability (issues a commit; returns immediately unless spin_wait)
+void    Commit(bool spin_wait = false);
+
+// Block until durable (does NOT issue a commit)
+void    WaitForCommit(Address until = 0);
+
+// Convenience: append then wait (still does not itself issue the commit)
+Address EnqueueAndWaitForCommit(std::span<const uint8_t> entry);
+
+// Head truncation
+void    TruncateUntil(Address a);
+
+// Iteration (committed-only by default; tailing when end == INT64_MAX)
+ScanIterator Scan(Address begin, Address end, std::string name = "",
+                  bool recover = true, bool scan_uncommitted = false);
+```
+
+Entry wire format on the log (see §11 for integrity details):
+
+```
+checksum off   no checksum:  [ length : 4 ][ payload ... ]      headerSize = 4
+checksum on:                 [ checksum : 8 ][ length : 4 ][ payload ... ]   headerSize = 12
+```
+
+The checksum occupies offset 0; the length field follows at offset +8. This
+matches FasterLog (`headerSize = PerEntry ? 12 : 4`).
 
 ---
 
-## 7. Open Questions
+## 9. Call flows
 
-1. **Large record fragmentation**: the current design caps records at `PAGE_SIZE - 10`. For records larger than this
-   (e.g., large value writes in a storage engine), options are: (a) multi-page records with a fragment chain in the
-   header, (b) out-of-band large value store with the log holding a pointer. The pointer approach is simpler and avoids
-   changing the scanner; fragmentation is more self-contained. Decision deferred.
+### 9.1 Enqueue
 
-2. **Fast commit mode (inline commit records)**: embedding commit records inline in the log stream (as FasterLog's
-   `fastCommitMode` does) removes the separate `log_commit/` metadata write, cutting per-commit I/O by one. Cost is O
-   (log size) recovery instead of O (1). Worth implementing as an opt-in mode once the basic design is validated.
+Frame the entry, allocate at the tail, copy, return its address. No durability.
 
-3. **Durability mode granularity**: `Strict` flush mode issues one `fdatasync` per page. For high-throughput workloads
-   this may be too conservative. An alternative is `fdatasync` per batch of N pages or per commit call rather than per
-   page flush. Needs benchmarking.
+```cpp
+Address FasterLog::Enqueue(std::span<const uint8_t> e) {
+    int size = header_size_ + (int)e.size();         // 4 or 12 byte header + payload
+    Address a = alloc_.Allocate(size);
+    uint8_t* p = alloc_.Get(a);
+    SetHeader(p, (uint32_t)e.size());                 // writes length, and checksum if enabled
+    std::memcpy(p + header_size_, e.data(), e.size());
+    // NOTE: when checksums are on, compute over [length field + payload] AFTER
+    // the payload is copied, then store it at offset 0 (see §11).
+    return a;                                          // in memory only — not yet durable
+}
+```
 
-4. **Commit writer decoupling**: currently the `commit_writer_fiber` is triggered by flush completion. An alternative is
-   an explicit `commit()` call (like FasterLog) controlled by a `LogCommitPolicy`. The rate-limit policy is especially
-   useful: "commit no more than once per 10ms or 1MB". This prevents thundering-herd commits under high write load.
+### 9.2 Commit
 
-5. **Named scanner wake after commit**: currently named scanners in committed mode wait on `commit_waiters_`. After
-   recovery, the `commit_writer_fiber` must also wake named scanners whose `complete_until` position was restored from
-   the commit file, so they do not re-wait for data they already confirmed.
+```mermaid
+flowchart TD
+    A[Commit called] --> B[Snapshot the cut<br/>until = current tail, commitNum++]
+    B --> C[ShiftReadOnlyToTail<br/>flush all in-memory pages]
+    C --> D{flushedUntil >= until?}
+    D -->|yes, already on disk| F[Write commit record to disk]
+    D -->|no| E[Wait: flush reaches the cut]
+    E --> F[Write commit record to disk]
+    F --> G[Advance committedUntil<br/>wake waiters]
+```
 
-6. **Segment file naming**: zero-padded decimal (`log_00000000.seg`) is human-readable but limits segment count to 10⁸.
-   A hex scheme gives 16⁸ = ~4 billion segments. Decision: use zero-padded hex (`log_00000000.seg` where each digit is
-   hex) for the segment number.
+```cpp
+void FasterLog::Commit(bool spin_wait) {
+    RecoveryInfo info;
+    info.begin_address = begin_;
+    info.until_address = alloc_.Tail();              // the cut = current tail
+    info.commit_num    = ++commit_num_;
+    info.cookie        = current_cookie_;
+    info.iterators     = SnapshotIterators();
 
-7. **Checksum algorithm**: CRC32C is hardware-accelerated and adequate. xxHash3 is faster for large payloads (>1KB) but
-   not hardware-native. Decision: ship CRC32C, revisit if checksum appears in profiles.
+    pending_commits_.push_back({info.until_address, info});
+    alloc_.ShiftReadOnlyToTail();                    // force flush of all in-memory pages
+
+    if (alloc_.FlushedUntil() >= info.until_address) // fast path: data already on disk
+        OnFlushed(alloc_.FlushedUntil());            // -> writes commit file right now
+    if (spin_wait) WaitForCommit(info.until_address);
+}
+```
+
+The bottom three boxes of the flowchart run either *now* (fast path) or *later*,
+inside the flush-completion continuation — which on a fiber runtime is simply the
+code that resumes after `device_->WritePage` returns. Deferring them is the
+group-commit win: the append path never blocks on disk.
+
+### 9.3 OnFlushed (the drain that promotes flushed -> committed)
+
+```cpp
+void FasterLog::OnFlushed(Address f) {
+    while (!pending_commits_.empty() && pending_commits_.front().first <= f) {
+        auto [until, info] = pending_commits_.front();
+        commit_mgr_->Commit(info);          // durable metadata write
+        committed_until_ = until;           // THE durability line advances
+        pending_commits_.pop_front();
+        WakeWaiters(until);                 // resume fibers blocked in WaitForCommit
+    }
+}
+```
+
+FIFO order is mandatory: a later commit must not become durable before an earlier
+one, which yields the causality guarantee ("commit an entry only if all
+predecessors are committed"). If a flush errors for a range, stop draining at that
+range and surface the error; nothing past it commits.
+
+### 9.4 WaitForCommit
+
+Issues nothing. If `until == 0`, snap to the current tail, then yield the fiber
+until `committed_until_ >= until`. `EnqueueAndWaitForCommit` is `Enqueue` followed
+by `WaitForCommit(addr + size)`; it does **not** call `Commit`, preserving the
+ability to batch commits in the background.
+
+### 9.5 Recovery
+
+```cpp
+void FasterLog::Recover() {
+    auto info = commit_mgr_->GetLatest();
+    if (!info) return;                       // fresh log: all markers stay 0
+    begin_           = info->begin_address;
+    committed_until_ = info->until_address;
+    commit_num_      = info->commit_num;
+    alloc_.ResetTo(info->until_address);     // tail = flushed = until; discard anything above
+    RestoreIterators(info->iterators);
+    recovered_cookie_ = info->cookie;
+}
+```
+
+`ResetTo(until)` rewinds the tail down to the last committed address; the
+"flushed only" band at crash time is thrown away. No log replay is needed because
+the log *is* the data — there is no separate index to reconcile (that
+reconciliation step belongs to the full KV store, not this log).
+
+### 9.6 Truncation
+
+`TruncateUntil(a)` raises `begin_ = a` immediately, but defers physical segment
+deletion until the next commit persists the new begin. Otherwise a crash between
+"deleted the file" and "recorded the new begin" would point recovery at missing
+data. At the next `commit_mgr_->Commit`, after the new begin is durable, call
+`device_->RemoveSegment` for whole segments below it.
+
+---
+
+## 10. Durability guarantees
+
+- **Opt-in.** Durability work happens only on `Commit`; the append/flush fast path
+  is free of it.
+- **Prefix-consistent.** Recovery restores exactly `[begin, committedUntil)` of
+  the latest commit. Monotonic, gap-free.
+- **Two-phase.** Data is flushed to the log device *before* the commit record is
+  written. `committedUntil <= flushedUntil` is invariant.
+- **Causal.** Commits become durable in FIFO order; an entry commits only after
+  all predecessors do.
+- **Strong-commit option.** A commit may carry a caller-chosen `commit_num`
+  (recover to exactly that point) and a `cookie` (arbitrary metadata persisted
+  atomically with the commit).
+
+---
+
+## 11. Integrity (checksums)
+
+Checksums are **optional** and **per entry**. They live in the record header, not
+in a side structure.
+
+### 11.1 Placement
+
+```
+checksum on:   [ checksum : 8 ][ length : 4 ][ payload ... ]   header = 12 bytes
+checksum off:  [ length : 4 ][ payload ... ]                   header =  4 bytes
+```
+
+The checksum is at offset 0; the length field at offset +8. It covers the
+**length field plus the payload** — i.e. `header[8 ..]` for `4 + length` bytes.
+
+### 11.2 When it is computed and verified
+
+- **Computed at enqueue**, after the payload is copied into the page, and written
+  into the header. In memory; no I/O involved.
+- **Verified on read** (`ReadAsync` / random read): recompute over the entry and
+  compare; mismatch is a hard error.
+- **Verified during the recovery / iteration scan**, where it doubles as an
+  end-of-valid-data delimiter (a failing checksum marks where the trustworthy log
+  ends).
+
+```cpp
+void SetHeader(uint8_t* p, uint32_t length) {
+    if (!checksum_) { *(uint32_t*)p = length; return; }
+    *(uint32_t*)(p + 8) = length;
+    *(uint64_t*)p = Checksum(p + 8, length + 4);   // cover length field + payload
+}
+bool VerifyChecksum(const uint8_t* p, uint32_t length) {
+    if (!checksum_) return true;
+    return *(const uint64_t*)p == Checksum(p + 8, length + 4);
+}
+```
+
+### 11.3 Algorithm choice
+
+For production safety, use **CRC32C**, which is hardware-accelerated (`_mm_crc32_u64` on x86, or the CRC instructions on ARM). It takes nanoseconds per 4KB record (virtually identical to the cost of an XOR fold) but provides robust protection against burst errors and aliasing that simple XOR misses. The checksum occupies the same 8-byte header slot; only the `Checksum()` body changes.
+
+### 11.4 Interaction with commit mode
+
+The checksum's importance depends on how commits are recorded:
+
+- **Default — separate commit file.** Recovery reads `committedUntil` from the
+  newest commit file and trusts `[begin, committedUntil)`. The per-entry checksum
+  is defense-in-depth on reads; it does not gate recovery.
+- **Fast commit — inline commit records.** Commit points are appended into the log
+  itself as special records (marked by a **negative length** field to distinguish
+  them from data). There is no metadata file; recovery **scans** the log to find
+  them. The checksum is now load-bearing: the scan verifies each record to trust
+  the inline commit markers and to locate the true end of the log. This is why
+  fast commit requires checksums to be enabled.
+
+---
+
+## 12. io_uring integration (registered buffers and files)
+
+The reference device uses `io_uring` with **registered fixed buffers** and
+**registered files**. The design integrates cleanly because the allocator's
+existing flush/evict ordering already supplies the invariant fixed buffers
+require: an in-flight buffer must stay valid and unmodified from submission to
+completion, which is exactly the `Sealed` (immutable) + not-yet-evicted state of a
+page being flushed.
+
+### 12.1 The shared arena (tinyio FixedBufferPool integration)
+
+The resident window is allocated as **one contiguous, block-aligned slab**. Page
+frames slice it. Instead of managing a separate `posix_memalign` and buffer registration, `PageArena` requests its memory directly from `tinyio::FixedBufferPool` (which registers the buffers for the entire `io_uring` runtime).
+
+Configure `tinyio` with one massive bucket specifically for the log (e.g., 64MB). `PageArena` acquires this single slot:
+
+```cpp
+class PageArena {
+public:
+    PageArena(tinyio::FixedBufferPool& pool, size_t num_frames, size_t page_size)
+        : page_size_(page_size), bytes_(num_frames * page_size) {
+        auto res = pool.Take(bytes_);
+        if (!res) throw std::bad_alloc();
+        fixed_buf_ = std::move(*res);
+    }
+    
+    uint8_t* base() const { return static_cast<uint8_t*>(fixed_buf_.Ptr()); }
+    uint32_t buf_index() const { return fixed_buf_.Index(); }
+    size_t   bytes() const { return bytes_; }
+    uint8_t* frame(int i) const { return base() + size_t(i) * page_size_; }
+private:
+    tinyio::FixedBuffer fixed_buf_;
+    size_t page_size_, bytes_;
+};
+```
+
+### 12.1.1 The RAII Lifetime Pitfall
+`tinyio::FixedBuffer` is an RAII object. When `PageArena` is destroyed, the 64MB slot is automatically returned to the `FixedBufferPool` free list. 
+**Critical:** You must ensure no background `WRITE_FIXED` SQEs are still in flight when the log is destroyed. If the log is shut down while a page is still flushing, the `FixedBuffer` is returned to the pool and might be immediately acquired by a network socket. The kernel will then blindly overwrite that socket's data as the background flush completes. 
+**Solution:** The shutdown sequence must explicitly yield the fiber until `flushed_until_` catches up to the tail, ensuring the kernel is completely done with the buffer before allowing `PageArena` to destruct.
+
+### 12.2 Registration
+Registration of the memory is handled globally by `tinyio::IO::RegisterBuffers(pool)`. The log only needs to register the sparse file descriptors:
+
+```cpp
+io_uring_register_files_sparse(&ring_, MAX_SEGMENTS); // sparse fd table for segments
+```
+
+### 12.3 Eager flush: WRITE_FIXED
+
+The flush source is always inside the arena, so every page flush is a fixed write
+against a registered segment fd. No `fsync` here — eager flushes are eviction, not
+durability.
+
+```cpp
+void UringDevice::WritePage(const uint8_t* src, Address dest, size_t n) {
+    int   slot = SegmentSlot(dest >> segment_bits_);
+    off_t off  = dest & ((1LL << segment_bits_) - 1);
+    
+    // O_DIRECT requires block-aligned sizes. Pad partial page flushes.
+    // This is safe because the PageArena backing memory extends to the end of the page.
+    constexpr size_t kSectorSize = 4096;
+    size_t aligned_n = (n + kSectorSize - 1) & ~(kSectorSize - 1);
+
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    io_uring_prep_write_fixed(sqe, slot, src, aligned_n, off, arena_->buf_index());
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe, sched_.current());
+    io_uring_submit(&ring_);
+    if (int r = sched_.wait_io(); r < 0) throw DeviceError(-r);
+}
+```
+
+> **Note on `O_DIRECT` alignment:** When `ShiftReadOnlyToTail()` forces a flush on an incomplete page, `n` will not be block-aligned. `O_DIRECT` strictly requires the memory address, file offset, and length to be sector-aligned. We round `n` up to the next 4096-byte boundary. Memory bounds are not violated because `src` points into the `PageArena`, which is guaranteed to have allocated space up to the end of the current `page_size`. Recovery relies on `committedUntil` and per-entry checksums/lengths to ignore the trailing garbage.
+
+### 12.4 Completion reaper (fiber bridge)
+
+Called by the scheduler when all fibers are parked on I/O. `user_data` is the
+`Fiber*`; intermediate linked SQEs carry `nullptr` and are skipped.
+
+```cpp
+void UringDevice::pump(bool block) {
+    if (block) io_uring_submit_and_wait(&ring_, 1);
+    unsigned head, count = 0; io_uring_cqe* cqe;
+    io_uring_for_each_cqe(&ring_, head, cqe) {
+        if (Fiber* f = (Fiber*)io_uring_cqe_get_data(cqe)) { f->io_res = cqe->res; sched_.make_runnable(f); }
+        ++count;
+    }
+    io_uring_cq_advance(&ring_, count);
+}
+```
+
+### 12.5 Commit barrier: kernel-enforced ordering
+
+`CommitBarrier` runs after the data writes for the cut have completed
+(`flushedUntil >= until`, their CQEs already reaped). It issues a single linked
+chain so the commit record cannot reach disk before its data is durable. The "flush
+then stamp" invariant of §9.2 becomes a kernel guarantee.
+
+```cpp
+// chain: fdatasync(log) -> write(commit record) -> fdatasync(commit target)
+io_uring_sqe* a = io_uring_get_sqe(&ring_);
+io_uring_prep_fsync(a, log_slot, IORING_FSYNC_DATASYNC);
+a->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+
+io_uring_sqe* b = io_uring_get_sqe(&ring_);
+io_uring_prep_write(b, commit_slot, record, rec_n, rec_off);
+b->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+
+io_uring_sqe* c = io_uring_get_sqe(&ring_);
+io_uring_prep_fsync(c, commit_slot, IORING_FSYNC_DATASYNC);
+c->flags |= IOSQE_FIXED_FILE;                  // tail of chain: posts the CQE we wait on
+io_uring_sqe_set_data(c, sched_.current());
+
+io_uring_submit(&ring_);
+if (int r = sched_.wait_io(); r < 0)           // -ECANCELED if any earlier link failed
+    throw DeviceError(-r);                      // -> do NOT advance committedUntil
+```
+
+`IOSQE_IO_LINK` serializes the chain (each step waits for the previous to
+succeed); `IOSQE_CQE_SKIP_SUCCESS` suppresses intermediate completions so only the
+tail (or a failure, as `-ECANCELED`) wakes the fiber. In **fast-commit** mode the
+record is appended into the log via the arena, so it is itself a `WRITE_FIXED` and
+the barrier collapses to one trailing `fdatasync` on the log.
+
+> **Note on `O_DIRECT` and `fdatasync`:** Even when the log is opened with `O_DIRECT` (which bypasses the page cache), the first `fdatasync` in the chain is strictly required. Appending to a file updates the inode's file size metadata. If we crash before this metadata is synced, the filesystem will not know the file grew, effectively losing the newly appended data despite it physically reaching the disk blocks.
+
+### 12.6 Operational notes
+
+- **`RLIMIT_MEMLOCK`.** Registration pins the arena; its size counts against
+  locked memory. Raise the limit or grant `CAP_IPC_LOCK`, or registration fails.
+- **O_DIRECT alignment** is satisfied for the log (4096-aligned arena, page-size
+  frames, page-aligned offsets). Keep the commit file **buffered** to avoid
+  padding odd-sized records; `fdatasync` still makes it durable.
+- **Segment rotation.** New segment: open `O_DIRECT`, slot it in with
+  `register_files_update`. Truncated segment: set slot to `-1`, close. Maintain a
+  `segment_id -> slot` map.
+- **Kernel versions.** `CQE_SKIP_SUCCESS` >= 5.17, `register_files_sparse` ~5.19,
+  `WRITE_FIXED`/`FSYNC` >= 5.1, `IO_LINK` >= 5.3. On older kernels, drop the skip
+  flag and count chain completions in the reaper.
+- **Read path.** Whole-frame page-ins use `READ_FIXED` (same arena). Random small
+  record reads use plain `READ` or **provided buffer rings**
+  (`IORING_REGISTER_PBUF_RING`) — not fixed buffers, which are wrong for churny
+  per-request buffers.
+
+---
+
+## 13. Fiber concurrency notes
+
+The runtime is single-threaded with cooperative fibers, so state only changes at
+yield points (I/O).
+
+- `Allocate` does not race; no fetch-and-add or spin-wait dance is required.
+- A `Get(addr)` pointer and the marker values are valid only **between yields**.
+  If a fiber blocks on a device read for a stable record, another fiber may
+  advance the tail and slide the markers. Re-read `head_` / `read_only_` /
+  `flushed_until_` after any awaited I/O rather than trusting a pre-yield copy.
+- Flush completion and the `OnFlushed` drain run as the continuation of the
+  awaited `WritePage`; no separate completion thread or callback queue is needed.
+
+---
+
+## 14. Implementation plan
+
+This bottom-up approach ensures the core invariants are tested before interacting with `io_uring` or crash recovery.
+
+### Phase 1: The Core Memory & Formatting (No I/O)
+1. **`Checksum` & Formatting**: Implement the `SetHeader` and `VerifyChecksum` functions using hardware-accelerated CRC32C.
+2. **`PageArena`**: Implement the wrapper around `tinyio::FixedBufferPool` `Take()`.
+3. **`Allocator` (Memory Only)**: Implement the circular buffer markers (`head_`, `tail_`, `read_only_`), `Allocate()`, and page-sealing logic.
+*Goal:* Instantiate an allocator, enqueue entries until full, and manually verify that the memory contains perfectly formatted, checksummed records.
+
+### Phase 2: The Eager Flush Engine (Data I/O)
+1. **`IDevice` & `UringDevice`**: Implement the `io_uring` wrapper.
+2. **Buffer Registration**: Register sparse segment files (the `PageArena` buffer is already globally registered by `tinyio`).
+3. **`WritePage`**: Implement `io_uring_prep_write_fixed` (with sector padding for partial pages and `arena_->buf_index()`).
+4. **Backpressure**: Wire the flush completion to advance `flushed_until_`, and implement `WaitUntilSpaceAvailable` so the writer fiber yields when full.
+*Goal:* Stream 100GB of data via `Enqueue`. The `PageArena` should seamlessly flush to `O_DIRECT` segment files without overflowing or blocking indefinitely.
+
+### Phase 3: The Durability & Commit Engine (Metadata I/O)
+1. **`RecoveryInfo`**: Implement serialization of the commit metadata.
+2. **`CommitManager`**: Implement writing metadata to separate files (e.g., `commit.1`).
+3. **`CommitBarrier`**: Implement the `fdatasync` -> `write` -> `fdatasync` linked SQE chain.
+4. **`Commit()` & `WaitForCommit()`**: Implement the fold-over and fiber yielding.
+*Goal:* Append data, call `Commit()`, and verify the commit file appears on disk precisely *after* the segment files have been written.
+
+### Phase 4: Recovery & Scanning
+1. **`Recover()`**: On startup, read the highest `commit.X` file, extract the `begin_address` and `until_address`.
+2. **`ScanIterator`**: Implement reading pages from disk (using `READ_FIXED` or regular `READ`), verifying checksums, and yielding entries.
+*Goal:* Enqueue 1M records, commit, kill the process, restart, and assert that the `ScanIterator` returns exactly 1M records with perfect checksums.
+
+### Phase 5: Housekeeping
+1. **`TruncateUntil()`**: Delete old segment files once a commit advances the `begin_address`.
+2. **Iterators**: Save and restore named iterator positions.
+
+---
+
+## 15. References
+
+1. Chandramouli et al. *FASTER: A Concurrent Key-Value Store with In-Place
+   Updates.* SIGMOD 2018.
+2. Prasaad, Chandramouli, Kossmann. *Concurrent Prefix Recovery: Performing CPR
+   on a Database.* SIGMOD 2019.
+3. Microsoft FASTER project, `cs/src/core/FasterLog` — `FasterLog.cs`,
+   `FasterLogRecoveryInfo.cs`, `CommitInfo.cs`.
+4. FasterLog Basics (project documentation): Enqueue / Commit / WaitForCommit /
+   Scan / TruncateUntil semantics and configuration.
