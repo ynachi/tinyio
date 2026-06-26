@@ -1,0 +1,1363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The FASTER Hybrid Log — A Deep Dive for Builders</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f7f5f0;
+  --card: #ffffff;
+  --border: #e9e3d6;
+  --line-soft: #e9e3d6;
+  --text: #14171e;
+  --text-soft: #3a4256;
+  --text-mute: #7c7a72;
+  --primary: #2f6f5e;
+  --primary-soft: rgba(47, 111, 94, 0.08);
+  --accent: #c97b3f;
+  --accent-soft: rgba(201, 123, 63, 0.10);
+  --danger: #b06367;
+  --code-bg: #1a1a2e;
+  --code-text: #e8e8ed;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Outfit', sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  top: -200px;
+  right: -200px;
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, rgba(47, 111, 94, 0.04) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  bottom: -200px;
+  left: -200px;
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, rgba(201, 123, 63, 0.04) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 60px 32px 120px;
+  position: relative;
+  z-index: 1;
+}
+
+.eyebrow {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--primary);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+
+h1 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 56px;
+  line-height: 1.05;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  margin: 0 0 24px;
+  max-width: 18ch;
+}
+
+.lede {
+  font-size: 20px;
+  line-height: 1.55;
+  color: var(--text-soft);
+  max-width: 60ch;
+  margin: 0 0 12px;
+}
+
+.lede-meta {
+  font-size: 14px;
+  color: var(--text-mute);
+  margin: 0 0 48px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+h2 {
+  font-family: 'DM Serif Display', serif;
+  font-size: 36px;
+  line-height: 1.15;
+  font-weight: 400;
+  letter-spacing: -0.005em;
+  margin: 80px 0 24px;
+  max-width: 24ch;
+}
+
+h3 {
+  font-family: 'Outfit', sans-serif;
+  font-size: 19px;
+  font-weight: 600;
+  margin: 32px 0 12px;
+  color: var(--text);
+}
+
+p {
+  max-width: 68ch;
+  margin: 0 0 16px;
+  color: var(--text-soft);
+}
+
+p strong { color: var(--text); font-weight: 600; }
+
+ul, ol {
+  max-width: 68ch;
+  color: var(--text-soft);
+  padding-left: 20px;
+}
+
+li { margin-bottom: 8px; }
+
+code, pre {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13.5px;
+}
+
+code.inline {
+  background: var(--primary-soft);
+  color: var(--primary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+pre {
+  background: var(--code-bg);
+  color: var(--code-text);
+  padding: 20px 24px;
+  border-radius: 12px;
+  overflow-x: auto;
+  line-height: 1.6;
+  margin: 16px 0 24px;
+  font-size: 13px;
+}
+
+pre code { color: inherit; }
+
+.diagram {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px;
+  margin: 24px 0 32px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+}
+
+.diagram-caption {
+  font-size: 13px;
+  color: var(--text-mute);
+  text-align: center;
+  margin-top: 16px;
+  font-style: italic;
+}
+
+.kv {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin: 16px 0;
+  overflow: hidden;
+}
+
+.kv-row {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  border-top: 1px dashed var(--border);
+}
+
+.kv-row:first-child { border-top: none; }
+
+.kv-key {
+  padding: 14px 18px;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+  background: rgba(47, 111, 94, 0.03);
+  border-right: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.kv-val {
+  padding: 14px 18px;
+  font-size: 14px;
+  color: var(--text-soft);
+  font-family: 'JetBrains Mono', monospace;
+  line-height: 1.5;
+}
+
+.callout {
+  background: var(--primary-soft);
+  border-left: 3px solid var(--primary);
+  padding: 16px 20px;
+  border-radius: 0 8px 8px 0;
+  margin: 24px 0;
+  font-size: 15px;
+  color: var(--text-soft);
+}
+
+.callout.accent {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+}
+
+.callout strong { color: var(--text); }
+
+.svg-diagram { width: 100%; height: auto; display: block; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 16px 0 24px;
+  font-size: 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+th, td {
+  text-align: left;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  background: rgba(47, 111, 94, 0.05);
+  font-weight: 600;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+
+tr:last-child td { border-bottom: none; }
+
+.tldr {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px 32px;
+  margin: 32px 0 0;
+}
+
+.tldr-title {
+  font-family: 'Outfit', sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--primary);
+  margin-bottom: 12px;
+}
+
+.tldr ul { margin: 0; padding-left: 18px; }
+.tldr li { margin-bottom: 6px; }
+
+.toc {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  margin: 32px 0 0;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px 24px;
+  font-size: 14px;
+}
+
+.toc a {
+  color: var(--text-soft);
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toc a::before {
+  content: "→";
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.toc a:hover { color: var(--primary); }
+
+.timeline { position: relative; margin: 24px 0 32px; padding-left: 56px; }
+.timeline::before {
+  content: "";
+  position: absolute;
+  left: 18px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: linear-gradient(180deg, var(--primary), var(--accent));
+}
+.tstep {
+  position: relative;
+  margin-bottom: 28px;
+  padding-bottom: 8px;
+}
+.tstep:last-child { margin-bottom: 0; }
+.tstep-icon {
+  position: absolute;
+  left: -56px;
+  top: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 2px solid var(--primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--primary);
+  font-weight: 600;
+  font-size: 14px;
+  font-family: 'Outfit', sans-serif;
+}
+.tstep h4 {
+  margin: 0 0 4px;
+  font-size: 17px;
+  font-weight: 600;
+}
+.tstep p {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-soft);
+}
+
+.section-divider {
+  width: 60px;
+  height: 2px;
+  background: var(--border);
+  margin: 64px auto;
+}
+
+@media (max-width: 768px) {
+  .page { padding: 32px 20px 80px; }
+  h1 { font-size: 36px; }
+  h2 { font-size: 26px; margin: 56px 0 20px; }
+  .lede { font-size: 17px; }
+  .toc { grid-template-columns: 1fr; }
+  .kv-row { grid-template-columns: 1fr; }
+  .kv-key { border-right: none; border-bottom: 1px solid var(--border); }
+  table { font-size: 13px; }
+  th, td { padding: 10px 12px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <div class="eyebrow">Storage engine internals</div>
+  <h1>The FASTER Hybrid Log, taken apart</h1>
+  <p class="lede">A profound walkthrough of Microsoft's <em>FASTER</em> hybrid log — built specifically so you can ship a clean single-threaded port without losing the soul of the design.</p>
+  <div class="lede-meta">
+    <span>Reading time · ~25 min</span>
+    <span>·</span>
+    <span>Audience · someone about to build this</span>
+  </div>
+</header>
+
+<div class="tldr">
+  <div class="tldr-title">TL;DR — the mental model in one screen</div>
+  <ul>
+    <li>There is <strong>one logical log</strong>, with a 64-bit address per record, split into an in-memory tail and an on-disk head.</li>
+    <li>A <strong>concurrent hash index</strong> maps <code class="inline">key_hash → address</code>. The address is the only thing that moves on update.</li>
+    <li>The in-memory log is split into a small <strong>mutable region</strong> (lock-free writes) and a <strong>read-only region</strong> (frozen, flushable).</li>
+    <li>When memory fills up, you do an <strong>in-place flush</strong> (read-only pages → disk) or a <strong>fold-over</strong> (compact live records in place).</li>
+    <li><strong>Recovery</strong> = persisted hash index + replay from a recent on-disk checkpoint.</li>
+    <li>Single-threaded removes epoch protection, CAS, and concurrent overflow chains — but the rest of the data model stays identical.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <a href="#storage">1. The three tiers of storage</a>
+  <a href="#address">2. The 64-bit address space</a>
+  <a href="#memlog">3. The in-memory log layout</a>
+  <a href="#hash">4. The hash index</a>
+  <a href="#record">5. Record format</a>
+  <a href="#upsert">6. The upsert path</a>
+  <a href="#read">7. The read path</a>
+  <a href="#delete">8. The delete path (tombstones)</a>
+  <a href="#freeze">9. Freezing and flushing</a>
+  <a href="#foldover">10. Fold-over compaction</a>
+  <a href="#recovery">11. Crash recovery</a>
+  <a href="#single">12. What single-threaded lets you drop</a>
+  <a href="#skeleton">13. Skeleton code</a>
+  <a href="#build">14. Build order</a>
+</nav>
+
+<section id="storage">
+<h2>1 · The three tiers of storage</h2>
+<p>FASTER's central trick is that there is no "cache + index + storage" — there is <strong>one log</strong> with three physical homes. The hash index doesn't know which tier a record lives in; it just knows a 64-bit address. Decoding that address tells you exactly where to read.</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg">
+  <g>
+    <rect x="280" y="20" width="240" height="50" rx="10" fill="#ffffff" stroke="#2f6f5e" stroke-width="1.5"/>
+    <text x="400" y="50" text-anchor="middle" font-family="Outfit, sans-serif" font-size="15" font-weight="600" fill="#14171e">Client API · Read / Upsert / Delete</text>
+  </g>
+  <g>
+    <rect x="240" y="100" width="320" height="50" rx="10" fill="#ffffff" stroke="#c97b3f" stroke-width="1.5"/>
+    <text x="400" y="125" text-anchor="middle" font-family="Outfit, sans-serif" font-size="15" font-weight="600" fill="#14171e">Hash Index · key → 64-bit address</text>
+    <text x="400" y="142" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="#7c7a72">K1 → 0x0001_0023_00AB    K2 → 0xFFFF_0001_0004</text>
+  </g>
+  <g stroke="#7c7a72" stroke-width="1.2" fill="none">
+    <path d="M 360 150 L 360 180"/>
+    <path d="M 440 150 L 440 180"/>
+  </g>
+  <g fill="#7c7a72">
+    <polygon points="357,178 363,178 360,184"/>
+    <polygon points="437,178 443,178 440,184"/>
+  </g>
+  <g>
+    <rect x="60" y="180" width="200" height="60" rx="8" fill="rgba(201,123,63,0.15)" stroke="#c97b3f" stroke-width="1.5"/>
+    <text x="160" y="207" text-anchor="middle" font-family="Outfit, sans-serif" font-size="14" font-weight="600" fill="#14171e">Mutable region</text>
+    <text x="160" y="225" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" fill="#7c7a72">RAM · current write target</text>
+  </g>
+  <g>
+    <rect x="290" y="180" width="220" height="60" rx="8" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+    <text x="400" y="207" text-anchor="middle" font-family="Outfit, sans-serif" font-size="14" font-weight="600" fill="#14171e">Read-only region</text>
+    <text x="400" y="225" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" fill="#7c7a72">RAM · frozen, flushable</text>
+  </g>
+  <g>
+    <rect x="540" y="180" width="200" height="60" rx="8" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-width="1.5"/>
+    <text x="640" y="207" text-anchor="middle" font-family="Outfit, sans-serif" font-size="14" font-weight="600" fill="#14171e">On-disk log</text>
+    <text x="640" y="225" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" fill="#7c7a72">SSD · durable</text>
+  </g>
+  <g font-family="JetBrains Mono, monospace" font-size="11" fill="#7c7a72">
+    <text x="160" y="265" text-anchor="middle">0x0000_0000_0000</text>
+    <text x="640" y="265" text-anchor="middle">0xFFFF_FFFF_FFFF</text>
+  </g>
+  <g>
+    <rect x="60" y="280" width="200" height="40" fill="rgba(201,123,63,0.15)" stroke="#c97b3f"/>
+    <rect x="260" y="280" width="100" height="40" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e"/>
+    <rect x="360" y="280" width="380" height="40" fill="rgba(176,99,103,0.10)" stroke="#b06367"/>
+    <line x1="260" y1="280" x2="260" y2="320" stroke="#c97b3f" stroke-width="1.5" stroke-dasharray="2 2"/>
+    <line x1="360" y1="280" x2="360" y2="320" stroke="#2f6f5e" stroke-width="1.5" stroke-dasharray="2 2"/>
+    <text x="160" y="305" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" font-weight="600" fill="#c97b3f">mutable</text>
+    <text x="310" y="305" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" font-weight="600" fill="#2f6f5e">read-only</text>
+    <text x="550" y="305" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" font-weight="600" fill="#b06367">on-disk</text>
+  </g>
+  <text x="400" y="345" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" fill="#7c7a72" font-style="italic">addresses grow monotonically — a "tail pointer" tracks where the next write goes</text>
+</svg>
+  <div class="diagram-caption">Figure 1 · The hybrid log is a single address space spanning RAM and disk. The hash index doesn't care which tier a record lives in.</div>
+</div>
+
+<p>Three things follow from this layout:</p>
+<ol>
+  <li><strong>No data movement on update.</strong> Updating <code class="inline">K1</code> just appends a new record and changes the pointer in the hash index. The old record is left behind — it becomes garbage once nothing can read it.</li>
+  <li><strong>The index never relocates data.</strong> Buckets hold stable <code class="inline">(hash, address)</code> entries. This is what makes the cache hot and the operations cheap.</li>
+  <li><strong>Reads can land in three places.</strong> The hash lookup returns an address; the read routine decodes it to know whether to read RAM, SSD, or both.</li>
+</ol>
+</section>
+
+<section id="address">
+<h2>2 · The 64-bit address space</h2>
+<p>An address isn't a pointer — it's a packed descriptor. FASTER splits the 64 bits into three fields. A common layout:</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="JetBrains Mono, monospace">
+    <rect x="40" y="40" width="120" height="80" fill="rgba(176,99,103,0.18)" stroke="#b06367" stroke-width="1.5"/>
+    <text x="100" y="80" text-anchor="middle" font-size="20" font-weight="600" fill="#b06367">8 bits</text>
+    <text x="100" y="105" text-anchor="middle" font-size="13" fill="#14171e">segment</text>
+    <rect x="160" y="40" width="280" height="80" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e" stroke-width="1.5"/>
+    <text x="300" y="80" text-anchor="middle" font-size="20" font-weight="600" fill="#2f6f5e">24 bits</text>
+    <text x="300" y="105" text-anchor="middle" font-size="13" fill="#14171e">page index (within segment)</text>
+    <rect x="440" y="40" width="320" height="80" fill="rgba(201,123,63,0.18)" stroke="#c97b3f" stroke-width="1.5"/>
+    <text x="600" y="80" text-anchor="middle" font-size="20" font-weight="600" fill="#c97b3f">32 bits</text>
+    <text x="600" y="105" text-anchor="middle" font-size="13" fill="#14171e">byte offset within page</text>
+  </g>
+  <g font-family="Outfit, sans-serif" font-size="12" fill="#7c7a72">
+    <line x1="100" y1="140" x2="100" y2="155" stroke="#7c7a72"/>
+    <text x="100" y="170" text-anchor="middle">0–255</text>
+    <text x="100" y="188" text-anchor="middle">which log segment</text>
+    <line x1="300" y1="140" x2="300" y2="155" stroke="#7c7a72"/>
+    <text x="300" y="170" text-anchor="middle">0–16M pages</text>
+    <text x="300" y="188" text-anchor="middle">page granularity</text>
+    <line x1="600" y1="140" x2="600" y2="155" stroke="#7c7a72"/>
+    <text x="600" y="170" text-anchor="middle">0–4GB / page</text>
+    <text x="600" y="188" text-anchor="middle">slot pointer</text>
+  </g>
+</svg>
+  <div class="diagram-caption">Figure 2 · One possible 64-bit address split. The exact field widths are tunable; what matters is that the address is self-describing.</div>
+</div>
+
+<p>The "segment" field is the key. It tells you which physical log the record lives in (mutable in-memory, read-only in-memory, on-disk segment 0, on-disk segment 1, etc). With one bit-mask and one shift you know exactly where to read:</p>
+
+<pre><code>fn location(addr: u64) -&gt; Location {
+    let segment = (addr &gt;&gt; 56) &amp; 0xFF;
+    let page    = (addr &gt;&gt; 32) &amp; 0x00FF_FFFF;
+    let offset  = addr &amp; 0xFFFF_FFFF;
+    match segment {
+        0 =&gt; Location::Mutable(page, offset),
+        1 =&gt; Location::ReadOnly(page, offset),
+        _ =&gt; Location::Disk(segment - 2, page, offset),
+    }
+}</code></pre>
+
+<p>For your single-threaded port, you can simplify: 1 bit for in-memory vs on-disk, then a byte offset within that log. The complexity is optional. The principle — <strong>address, not pointer</strong> — is not.</p>
+
+<div class="callout"><strong>Why an address, not a pointer?</strong> Pointers die with the process and change with every relocation. Addresses survive crashes, encode "where to look" without being a memory address, and let the same hash entry point to RAM or SSD without type games. <strong>The address also doubles as the record's version</strong> — every record carries its own LSN in the header, which is what makes recovery and fold-over deterministic.</div>
+</section>
+
+<section id="memlog">
+<h2>3 · The in-memory log layout</h2>
+<p>The in-memory log is a sequence of fixed-size <strong>pages</strong> — typically 32 KB, but any power of two works. Each page has a status and holds a packed stream of records.</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="JetBrains Mono, monospace">
+    <text x="60" y="20" font-family="Outfit, sans-serif" font-size="11" fill="#7c7a72">head → first live address</text>
+    <line x1="100" y1="30" x2="100" y2="50" stroke="#7c7a72"/>
+    <g>
+      <rect x="100" y="50" width="120" height="80" fill="rgba(176,99,103,0.15)" stroke="#b06367" stroke-width="1.5"/>
+      <text x="160" y="85" text-anchor="middle" font-size="11" fill="#7c7a72">p0 · free</text>
+      <text x="160" y="105" text-anchor="middle" font-size="11" fill="#7c7a72">32 KB</text>
+    </g>
+    <g>
+      <rect x="220" y="50" width="120" height="80" fill="rgba(201,123,63,0.18)" stroke="#c97b3f" stroke-width="1.5"/>
+      <text x="280" y="85" text-anchor="middle" font-size="11" fill="#c97b3f">p1 · mutable</text>
+      <text x="280" y="105" text-anchor="middle" font-size="11" fill="#7c7a72">[▓▓▓▓░░░░]</text>
+    </g>
+    <g>
+      <rect x="340" y="50" width="120" height="80" fill="rgba(201,123,63,0.18)" stroke="#c97b3f" stroke-width="1.5"/>
+      <text x="400" y="85" text-anchor="middle" font-size="11" fill="#c97b3f">p2 · mutable</text>
+      <text x="400" y="105" text-anchor="middle" font-size="11" fill="#7c7a72">[▓▓░░░░░░]</text>
+    </g>
+    <g>
+      <rect x="460" y="50" width="120" height="80" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="520" y="85" text-anchor="middle" font-size="11" fill="#2f6f5e">p3 · read-only</text>
+      <text x="520" y="105" text-anchor="middle" font-size="11" fill="#7c7a72">[▓▓▓▓▓▓▓▓]</text>
+    </g>
+    <g>
+      <rect x="580" y="50" width="120" height="80" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="640" y="85" text-anchor="middle" font-size="11" fill="#2f6f5e">p4 · read-only</text>
+      <text x="640" y="105" text-anchor="middle" font-size="11" fill="#7c7a72">[▓▓▓▓▓▓▓▓]</text>
+    </g>
+    <g>
+      <rect x="220" y="180" width="480" height="50" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text x="460" y="210" text-anchor="middle" font-family="Outfit, sans-serif" font-size="13" fill="#b06367">on-disk log segment (SSD)</text>
+    </g>
+    <g stroke="#2f6f5e" stroke-width="1.5" fill="none" stroke-dasharray="4 3">
+      <path d="M 520 130 Q 520 155 460 180"/>
+      <path d="M 640 130 Q 640 155 460 180"/>
+    </g>
+    <g fill="#2f6f5e">
+      <polygon points="456,178 464,178 460,184"/>
+    </g>
+    <text x="745" y="85" font-family="Outfit, sans-serif" font-size="11" fill="#7c7a72">tail →</text>
+    <line x1="735" y1="50" x2="735" y2="130" stroke="#c97b3f" stroke-width="2" stroke-dasharray="2 2"/>
+    <line x1="700" y1="92" x2="730" y2="92" stroke="#c97b3f" stroke-width="2"/>
+  </g>
+  <g font-family="Outfit, sans-serif" font-size="12">
+    <rect x="100" y="260" width="14" height="14" fill="rgba(201,123,63,0.18)" stroke="#c97b3f"/>
+    <text x="120" y="271" fill="#14171e">mutable — new writes land here</text>
+    <rect x="320" y="260" width="14" height="14" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+    <text x="340" y="271" fill="#14171e">read-only — frozen, ready to flush</text>
+    <rect x="540" y="260" width="14" height="14" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-dasharray="3 2"/>
+    <text x="560" y="271" fill="#14171e">on-disk — durable, larger</text>
+  </g>
+  <text x="400" y="305" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" fill="#7c7a72" font-style="italic">A "tail pointer" points at the next free byte. The head can advance when old regions are folded or flushed.</text>
+</svg>
+  <div class="diagram-caption">Figure 3 · The in-memory log is a sequence of pages, each with a status that determines how it can be touched.</div>
+</div>
+
+<p>Three invariants the log maintains:</p>
+<ol>
+  <li>Writes only ever go to the <strong>tail</strong> (last mutable page).</li>
+  <li>A mutable page becomes read-only when full (or when you explicitly flush it).</li>
+  <li>A read-only page can be flushed to disk and its memory reused.</li>
+</ol>
+
+<p>For a single-threaded build, the page status is just an enum and the tail pointer is a single counter. No atomics, no compare-and-swap. The structure is identical to the multi-threaded version — only the synchronization changes.</p>
+
+<div class="callout accent"><strong>The "mutable" status isn't about concurrency.</strong> In FASTER it's about deferred batching: writes go into a mutable page that's cheap to append to, then frozen once full, so flushes can happen in big aligned chunks. You'll want this even single-threaded — it makes flushes cheap and lets the on-disk log align nicely to 4 KB / 32 KB boundaries.</div>
+</section>
+
+<section id="hash">
+<h2>4 · The hash index</h2>
+<p>The hash index is the gateway to every read. It maps <code class="inline">key_hash → 64-bit address</code>. FASTER uses a fixed-size bucket array with overflow chaining — the simplest concurrent-friendly hash structure.</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="JetBrains Mono, monospace">
+    <text x="120" y="20" font-family="Outfit, sans-serif" font-size="11" fill="#7c7a72">Bucket array (8 of N shown · typical size: 2× key count)</text>
+    <g>
+      <rect x="60" y="40" width="120" height="36" rx="4" fill="#ffffff" stroke="#2f6f5e"/>
+      <text x="120" y="62" text-anchor="middle" font-size="11" fill="#14171e">B[0]  empty</text>
+    </g>
+    <g>
+      <rect x="60" y="80" width="120" height="36" rx="4" fill="#ffffff" stroke="#2f6f5e"/>
+      <text x="120" y="102" text-anchor="middle" font-size="11" fill="#14171e">B[1]  empty</text>
+    </g>
+    <g>
+      <rect x="60" y="120" width="120" height="36" rx="4" fill="#ffffff" stroke="#2f6f5e"/>
+      <text x="120" y="142" text-anchor="middle" font-size="11" fill="#14171e">B[2]  empty</text>
+    </g>
+    <g>
+      <rect x="60" y="160" width="120" height="36" rx="4" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="120" y="182" text-anchor="middle" font-size="11" fill="#2f6f5e" font-weight="600">B[3]  → entry</text>
+    </g>
+    <g>
+      <rect x="60" y="200" width="120" height="36" rx="4" fill="#ffffff" stroke="#2f6f5e"/>
+      <text x="120" y="222" text-anchor="middle" font-size="11" fill="#14171e">B[4]  empty</text>
+    </g>
+    <g>
+      <rect x="60" y="240" width="120" height="36" rx="4" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="120" y="262" text-anchor="middle" font-size="11" fill="#2f6f5e" font-weight="600">B[5]  → entry</text>
+    </g>
+    <g>
+      <rect x="60" y="280" width="120" height="36" rx="4" fill="#ffffff" stroke="#2f6f5e"/>
+      <text x="120" y="302" text-anchor="middle" font-size="11" fill="#14171e">B[6]  empty</text>
+    </g>
+    <g>
+      <rect x="60" y="320" width="120" height="36" rx="4" fill="#ffffff" stroke="#2f6f5e"/>
+      <text x="120" y="342" text-anchor="middle" font-size="11" fill="#14171e">B[7]  empty</text>
+    </g>
+
+    <g>
+      <path d="M 180 178 L 230 178" stroke="#7c7a72" fill="none" marker-end="url(#arrH)"/>
+      <rect x="230" y="155" width="200" height="46" rx="6" fill="rgba(201,123,63,0.15)" stroke="#c97b3f"/>
+      <text x="330" y="175" text-anchor="middle" font-size="12" fill="#14171e">hash 0xAB12…4F</text>
+      <text x="330" y="192" text-anchor="middle" font-size="12" fill="#c97b3f">→ addr 0x0000_00A2_0014</text>
+    </g>
+
+    <g>
+      <path d="M 180 258 L 230 258" stroke="#7c7a72" fill="none" marker-end="url(#arrH)"/>
+      <rect x="230" y="225" width="200" height="46" rx="6" fill="rgba(201,123,63,0.15)" stroke="#c97b3f"/>
+      <text x="330" y="245" text-anchor="middle" font-size="12" fill="#14171e">hash 0x77F0…21</text>
+      <text x="330" y="262" text-anchor="middle" font-size="12" fill="#c97b3f">→ addr 0x0001_0001_0023</text>
+
+      <path d="M 430 248 L 460 248" stroke="#7c7a72" fill="none" marker-end="url(#arrH)"/>
+      <rect x="460" y="225" width="200" height="46" rx="6" fill="rgba(201,123,63,0.15)" stroke="#c97b3f"/>
+      <text x="560" y="245" text-anchor="middle" font-size="12" fill="#14171e">hash 0xC004…9A</text>
+      <text x="560" y="262" text-anchor="middle" font-size="12" fill="#c97b3f">→ addr 0x0001_00B7_0008</text>
+
+      <path d="M 660 248 L 690 248" stroke="#7c7a72" fill="none" marker-end="url(#arrH)"/>
+      <rect x="690" y="225" width="100" height="46" rx="6" fill="rgba(176,99,103,0.15)" stroke="#b06367"/>
+      <text x="740" y="252" text-anchor="middle" font-size="11" fill="#b06367">overflow</text>
+    </g>
+
+    <defs>
+      <marker id="arrH" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c7a72"/>
+      </marker>
+    </defs>
+  </g>
+  <text x="400" y="375" text-anchor="middle" font-family="Outfit, sans-serif" font-size="11" fill="#7c7a72" font-style="italic">Bucket 5 collides on hash % bucket_count — entries are linked into a chain. Each entry holds the FULL hash so you can disambiguate on lookup.</text>
+</svg>
+  <div class="diagram-caption">Figure 4 · Each bucket has a primary slot and an overflow chain. The full hash is stored, not just the bucket index, so collisions can be disambiguated.</div>
+</div>
+
+<p>Two important things to notice:</p>
+<ul>
+  <li>Only the <strong>full hash</strong> lives in the entry — not the key. The key is read from the log when you actually want to verify a read. This keeps the index small and cache-hot.</li>
+  <li>On an upsert, you walk the chain looking for a matching hash, and either update the existing entry in place or append a new one. The key never needs to be touched in the index.</li>
+</ul>
+
+<pre><code>struct HashEntry {
+    hash:    u64,   // full 64-bit hash
+    address: u64,   // 64-bit address in the hybrid log
+    tag:     u16,   // 16-bit tag (top bits of hash) for fast rejection
+}
+
+struct Bucket {
+    primary:  Option&lt;HashEntry&gt;,  // first slot — always present
+    overflow: Vec&lt;HashEntry&gt;,     // chained collisions
+}</code></pre>
+
+<div class="callout"><strong>Tag bits are the secret weapon.</strong> A 16-bit tag (top bits of the hash) lets you reject non-matching entries in one cache-line load before doing the full compare. It's why FASTER's hash index is fast even at 50M+ entries.</div>
+</section>
+
+<section id="record">
+<h2>5 · Record format</h2>
+<p>Every record in the log has the same on-disk/on-memory layout. A record is a header followed by a key and a value.</p>
+
+<div class="kv">
+  <div class="kv-row">
+    <div class="kv-key">Header (16 B)</div>
+    <div class="kv-val">
+      <div>version (8 B) &nbsp;·&nbsp; key_len (2 B) &nbsp;·&nbsp; value_len (4 B) &nbsp;·&nbsp; op (1 B) &nbsp;·&nbsp; checksum (1 B)</div>
+      <div style="margin-top:6px; color:#7c7a72;">op ∈ {Upsert(0), Delete(1), Copy(2)} &nbsp;·&nbsp; version = record's own address</div>
+    </div>
+  </div>
+  <div class="kv-row">
+    <div class="kv-key">Key</div>
+    <div class="kv-val">key_len bytes · raw key bytes &nbsp;·&nbsp; <span style="color:#7c7a72;">used to verify hash collisions</span></div>
+  </div>
+  <div class="kv-row">
+    <div class="kv-key">Value</div>
+    <div class="kv-val">value_len bytes · raw value bytes &nbsp;·&nbsp; <span style="color:#7c7a72;">absent for delete records</span></div>
+  </div>
+</div>
+
+<p>Three tricks to be aware of:</p>
+<ul>
+  <li><strong>The version field equals the record's address.</strong> That makes recovery a re-playable log: each record knows where it lives, so you can reconstruct an index from a snapshot + tail with zero ambiguity.</li>
+  <li><strong>Variable-length records are aligned to 8 bytes</strong> by padding the slot. This makes offset arithmetic within a page a single division rather than a scan.</li>
+  <li><strong>The "Copy" operation</strong> appears after a fold-over or a deep copy from disk to the read cache. It lets the same record appear at two addresses without duplicating storage — only the value bytes (the body) are repeated, the header still points at the original record.</li>
+</ul>
+</section>
+
+<section id="upsert">
+<h2>6 · The upsert path</h2>
+<p>An upsert is the simplest of the three operations. It always appends to the log and updates the hash index — no reading of the old value is required.</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="Outfit, sans-serif" font-size="13">
+    <g>
+      <rect x="20" y="30" width="150" height="60" rx="8" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="95" y="55" text-anchor="middle" font-weight="600" fill="#2f6f5e">1 · hash the key</text>
+      <text x="95" y="75" text-anchor="middle" font-size="11" fill="#7c7a72">e.g. xxHash3</text>
+    </g>
+    <g>
+      <rect x="20" y="110" width="150" height="60" rx="8" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="95" y="135" text-anchor="middle" font-weight="600" fill="#2f6f5e">2 · pack record</text>
+      <text x="95" y="155" text-anchor="middle" font-size="11" fill="#7c7a72">header + key + value</text>
+    </g>
+    <g>
+      <rect x="220" y="30" width="170" height="60" rx="8" fill="rgba(201,123,63,0.15)" stroke="#c97b3f" stroke-width="1.5"/>
+      <text x="305" y="55" text-anchor="middle" font-weight="600" fill="#c97b3f">3 · reserve slot</text>
+      <text x="305" y="75" text-anchor="middle" font-size="11" fill="#7c7a72">tail += slot_size</text>
+    </g>
+    <g>
+      <rect x="220" y="110" width="170" height="60" rx="8" fill="rgba(201,123,63,0.15)" stroke="#c97b3f" stroke-width="1.5"/>
+      <text x="305" y="135" text-anchor="middle" font-weight="600" fill="#c97b3f">4 · write bytes</text>
+      <text x="305" y="155" text-anchor="middle" font-size="11" fill="#7c7a72">memcpy at tail</text>
+    </g>
+    <g>
+      <rect x="440" y="30" width="170" height="60" rx="8" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="525" y="55" text-anchor="middle" font-weight="600" fill="#2f6f5e">5 · find bucket</text>
+      <text x="525" y="75" text-anchor="middle" font-size="11" fill="#7c7a72">hash % N</text>
+    </g>
+    <g>
+      <rect x="440" y="110" width="170" height="60" rx="8" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="525" y="135" text-anchor="middle" font-weight="600" fill="#2f6f5e">6 · walk chain</text>
+      <text x="525" y="155" text-anchor="middle" font-size="11" fill="#7c7a72">compare full hashes</text>
+    </g>
+    <g>
+      <rect x="660" y="70" width="130" height="60" rx="8" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="725" y="95" text-anchor="middle" font-weight="600" fill="#2f6f5e">7 · update / append</text>
+      <text x="725" y="115" text-anchor="middle" font-size="11" fill="#7c7a72">entry.address = new</text>
+    </g>
+    <g stroke="#7c7a72" stroke-width="1.2" fill="none" marker-end="url(#arrU)">
+      <path d="M 170 60 L 220 60"/>
+      <path d="M 170 140 L 220 140"/>
+      <path d="M 390 60 L 440 60"/>
+      <path d="M 390 140 L 440 140"/>
+      <path d="M 610 100 L 660 100"/>
+    </g>
+    <defs>
+      <marker id="arrU" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c7a72"/>
+      </marker>
+    </defs>
+  </g>
+</svg>
+  <div class="diagram-caption">Figure 5 · Upsert is append-only. The old record (if any) is simply abandoned in the log.</div>
+</div>
+
+<pre><code>fn upsert(&amp;mut self, key: &amp;[u8], value: &amp;[u8]) {
+    let h = hash(key);
+    let slot_size = align8(RECORD_HEADER + key.len() + value.len());
+
+    // 1. Reserve a slot in the mutable region
+    if self.tail + slot_size &gt; self.mem_log.end() {
+        self.freeze_mutable();      // see §9
+    }
+    let addr = self.tail;
+    self.tail += slot_size;
+
+    // 2. Write the record (its own address = its version)
+    let rec = Record::upsert(addr, key, value);
+    rec.write_at(self.mem_log, addr);
+
+    // 3. Update the hash index
+    let bucket = self.index.bucket_mut(h);
+    if let Some(entry) = bucket.find_mut(h) {
+        entry.address = addr;            // overwrite in place
+    } else {
+        bucket.push_overflow(h, addr);   // add a new chain link
+    }
+}</code></pre>
+
+<p>Note: <strong>the index walk is bounded by the chain length</strong>. In a healthy hash index with 2× more buckets than keys, chains are 1–2 entries long. In the worst case (load factor &gt; 1) you walk longer — for that, FASTER has a "genuine overflow" path that lives in a separate structure. For your port, just grow the table or use Robin-Hood hashing if you want better behavior under pressure.</p>
+</section>
+
+<section id="read">
+<h2>7 · The read path</h2>
+<p>A read is where the design really pays off. The hash lookup is constant time; the only variable cost is whether the record is in RAM or on disk.</p>
+
+<div class="timeline">
+  <div class="tstep">
+    <div class="tstep-icon">1</div>
+    <h4>Hash and bucket lookup</h4>
+    <p>Compute <code class="inline">h = hash(key)</code>, compute <code class="inline">b = h % N</code>, read the bucket. The primary slot is one cache line. The 16-bit tag rejects mismatches before any other work.</p>
+  </div>
+  <div class="tstep">
+    <div class="tstep-icon">2</div>
+    <h4>Walk the chain, get the address</h4>
+    <p>For each chain entry with a matching tag, compare the full 64-bit hash. On a hit, you have a 64-bit address. The chain length is the variable cost — usually 1.</p>
+  </div>
+  <div class="tstep">
+    <div class="tstep-icon">3</div>
+    <h4>Decode the address to a location</h4>
+    <p>Look at the segment bits: mutable RAM, read-only RAM, or on-disk segment N. Each maps to a different read routine.</p>
+  </div>
+  <div class="tstep">
+    <div class="tstep-icon">4</div>
+    <h4>Read the record</h4>
+    <p>For RAM: pointer arithmetic into the page buffer, read the header, return the value slice. For disk: page in the on-disk page, decompress if needed, then read the record. For disk records, <strong>optionally</strong> copy into the read cache on the way back.</p>
+  </div>
+  <div class="tstep">
+    <div class="tstep-icon">5</div>
+    <h4>Verify, interpret, return</h4>
+    <p>Read the key bytes from the record and confirm they match the requested key (catches false-positive hash collisions). Then interpret the op: <code class="inline">Upsert</code> returns the value, <code class="inline">Delete</code> returns <code class="inline">None</code> / "not found", <code class="inline">Copy</code> follows its pointer to the real data.</p>
+  </div>
+</div>
+
+<pre><code>fn read(&amp;mut self, key: &amp;[u8]) -&gt; Option&lt;&amp;[u8]&gt; {
+    let h = hash(key);
+    let bucket = self.index.bucket(h);
+
+    // Walk the chain
+    let addr = bucket.find(h)?.address;
+    let loc = self.decode(addr);
+
+    // Read the record from the right tier
+    let rec = match loc {
+        Location::Mutable(p, o)   =&gt; self.mem_log.page(p).record_at(o),
+        Location::ReadOnly(p, o)  =&gt; self.mem_log.page(p).record_at(o),
+        Location::Disk(s, p, o)   =&gt; self.disk.read(s, p, o)?,
+    };
+
+    // Verify the key matches (hash collisions)
+    if rec.key() != key {
+        return self.find_next_chain_entry(h, key);
+    }
+
+    match rec.op() {
+        Op::Upsert =&gt; Some(rec.value()),
+        Op::Delete =&gt; None,
+        Op::Copy   =&gt; self.read_at(rec.copy_target()),
+    }
+}</code></pre>
+
+<div class="callout"><strong>The read cache is optional but very effective.</strong> If disk reads dominate, a small in-memory ring of recently-read on-disk pages cuts latency by 10–100× for hot keys that have aged out of the main log. For a single-threaded build, a simple LRU of 64–256 pages is enough.</div>
+</section>
+
+<section id="delete">
+<h2>8 · The delete path (tombstones)</h2>
+<p>FASTER does not delete in place. A delete is an append of a record with <code class="inline">op = Delete</code> and an empty value. The hash index points to the new record, the old record becomes garbage.</p>
+
+<pre><code>fn delete(&amp;mut self, key: &amp;[u8]) {
+    let h = hash(key);
+    let slot_size = align8(RECORD_HEADER + key.len());  // no value
+
+    // Reserve + write a Delete record (same as upsert, but op = Delete)
+    let addr = self.append_record(Record::delete(addr, key), slot_size);
+    self.index.upsert_entry(h, addr);   // same routine as upsert
+}</code></pre>
+
+<p>Why tombstones instead of physical deletes?</p>
+<ul>
+  <li><strong>Append-only writes</strong> stay simple and lock-free (in the multi-threaded version).</li>
+  <li><strong>Recovery is deterministic</strong> — replaying the log gives the same final state.</li>
+  <li><strong>Physical deletes are the job of fold-over</strong> — when memory pressure forces compaction, the dead records get reaped. You can also drop them when their pages are flushed to disk and the index no longer references them.</li>
+</ul>
+
+<div class="callout accent"><strong>Watch the tombstone lifetime.</strong> A tombstone must survive long enough to override any older in-memory version of the same key. In FASTER this is handled by the fold-over / flush ordering — the tombstone is never "below" the fold-over watermark. In your single-threaded build it's automatic, but document it so future-you doesn't introduce a bug.</div>
+</section>
+
+<section id="freeze">
+<h2>9 · Freezing and flushing</h2>
+<p>When the mutable page fills up (or you decide to flush for durability), three operations happen, in this order:</p>
+
+<div class="timeline">
+  <div class="tstep">
+    <div class="tstep-icon">1</div>
+    <h4>Freeze the mutable page</h4>
+    <p>Mark the current page as <code class="inline">ReadOnly</code>. The tail pointer now points at the next page. New writes go there. No reads are affected — the read path treats mutable and read-only pages identically.</p>
+  </div>
+  <div class="tstep">
+    <div class="tstep-icon">2</div>
+    <h4>Open a new mutable page</h4>
+    <p>If the in-memory log is full, reuse a freed page (or allocate a new one). The old page can now be flushed without blocking future writes.</p>
+  </div>
+  <div class="tstep">
+    <div class="tstep-icon">3</div>
+    <h4>Flush the read-only page to disk</h4>
+    <p>Append the page to the on-disk log. The on-disk log is also a sequence of fixed-size segments; the new page becomes the tail of the current segment. Once the segment is full, a new segment is started. After a successful flush, the in-memory page can be recycled.</p>
+  </div>
+</div>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="Outfit, sans-serif" font-size="13">
+    <text x="200" y="25" text-anchor="middle" font-weight="600" fill="#14171e">Before</text>
+    <g>
+      <rect x="80" y="40" width="60" height="50" fill="rgba(201,123,63,0.18)" stroke="#c97b3f"/>
+      <text x="110" y="68" text-anchor="middle" font-size="11">p1 full</text>
+      <rect x="140" y="40" width="60" height="50" fill="rgba(201,123,63,0.18)" stroke="#c97b3f"/>
+      <text x="170" y="68" text-anchor="middle" font-size="11">p2 full</text>
+      <rect x="200" y="40" width="60" height="50" fill="rgba(201,123,63,0.18)" stroke="#c97b3f"/>
+      <text x="230" y="68" text-anchor="middle" font-size="11">p3 full</text>
+      <rect x="260" y="40" width="60" height="50" fill="rgba(201,123,63,0.18)" stroke="#c97b3f"/>
+      <text x="290" y="68" text-anchor="middle" font-size="11">p4 full</text>
+      <rect x="320" y="40" width="60" height="50" fill="rgba(176,99,103,0.15)" stroke="#b06367" stroke-dasharray="3 2"/>
+      <text x="350" y="68" text-anchor="middle" font-size="11">p5 free</text>
+    </g>
+    <text x="200" y="120" text-anchor="middle" font-size="11" fill="#7c7a72">4 mutable pages · no space</text>
+    <text x="200" y="140" text-anchor="middle" font-size="11" fill="#7c7a72">tail = end of p4</text>
+  </g>
+  <g stroke="#7c7a72" stroke-width="1.5" fill="none" marker-end="url(#arrF)">
+    <path d="M 410 65 L 470 65"/>
+  </g>
+  <text x="440" y="50" text-anchor="middle" font-family="Outfit, sans-serif" font-size="12" fill="#7c7a72">flush &amp; recycle</text>
+  <defs>
+    <marker id="arrF" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c7a72"/>
+    </marker>
+  </defs>
+  <text x="650" y="25" text-anchor="middle" font-weight="600" fill="#14171e">After</text>
+  <g>
+    <rect x="510" y="40" width="60" height="50" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-dasharray="2 2"/>
+    <text x="540" y="68" text-anchor="middle" font-size="11">p1 free</text>
+    <rect x="570" y="40" width="60" height="50" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+    <text x="600" y="68" text-anchor="middle" font-size="11">p2 RO</text>
+    <rect x="630" y="40" width="60" height="50" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+    <text x="660" y="68" text-anchor="middle" font-size="11">p3 RO</text>
+    <rect x="690" y="40" width="60" height="50" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+    <text x="720" y="68" text-anchor="middle" font-size="11">p4 RO</text>
+    <rect x="750" y="40" width="20" height="50" fill="rgba(201,123,63,0.18)" stroke="#c97b3f"/>
+  </g>
+  <text x="650" y="120" text-anchor="middle" font-size="11" fill="#7c7a72">tail wraps · p1 recycled</text>
+  <text x="650" y="140" text-anchor="middle" font-size="11" fill="#7c7a72">= classic circular buffer</text>
+  <rect x="510" y="170" width="240" height="20" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-dasharray="3 2"/>
+  <text x="630" y="184" text-anchor="middle" font-size="11" fill="#b06367">flushed to disk</text>
+</svg>
+  <div class="diagram-caption">Figure 6 · In-place flush: a read-only page is appended to the on-disk log and its in-memory slot is recycled.</div>
+</div>
+
+<p>Two things to track carefully:</p>
+<ul>
+  <li><strong>Head vs tail.</strong> The in-memory log can become circular. The head advances when the oldest page is fully flushed and no index entry references it. The tail advances on every write. The two pointers are what tell you "is this address in memory or on disk".</li>
+  <li><strong>Page pinning.</strong> A page can't be reused while any hash entry might still reference it. In single-threaded mode, you can scan the index at recycle time (cheap if your index is small, expensive if it's huge — for the port, scan is fine). In multi-threaded FASTER this is the epoch protocol.</li>
+</ul>
+</section>
+
+<section id="foldover">
+<h2>10 · Fold-over compaction</h2>
+<p>Fold-over is what makes the log genuinely "hybrid" — it's the operation that prevents the on-disk log from growing forever and the in-memory log from filling up with garbage.</p>
+
+<p>When memory pressure is high and the on-disk log is also saturated, FASTER <strong>compacts the in-memory log in place</strong>: it walks the in-memory pages, finds the latest version of every key still referenced by the hash index, and writes those records to the start of the in-memory log. Everything else is dropped.</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="Outfit, sans-serif" font-size="12">
+    <text x="180" y="25" text-anchor="middle" font-weight="600" fill="#14171e">Before fold-over</text>
+    <text x="180" y="42" text-anchor="middle" font-size="11" fill="#7c7a72">8 records in memory, only 3 are live</text>
+    <g>
+      <rect x="40" y="60" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="80" y="83" text-anchor="middle" font-size="11">K1 v1</text>
+      <rect x="120" y="60" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="160" y="83" text-anchor="middle" font-size="11">K2 v1</text>
+      <rect x="200" y="60" width="80" height="36" fill="rgba(176,99,103,0.12)" stroke="#b06367" stroke-dasharray="2 2"/>
+      <text x="240" y="83" text-anchor="middle" font-size="11" font-style="italic" fill="#b06367">K1 v2</text>
+      <rect x="280" y="60" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="320" y="83" text-anchor="middle" font-size="11">K3 v1</text>
+      <rect x="40" y="100" width="80" height="36" fill="rgba(176,99,103,0.12)" stroke="#b06367" stroke-dasharray="2 2"/>
+      <text x="80" y="123" text-anchor="middle" font-size="11" font-style="italic" fill="#b06367">K1 v3 (live)</text>
+      <rect x="120" y="100" width="80" height="36" fill="rgba(176,99,103,0.12)" stroke="#b06367" stroke-dasharray="2 2"/>
+      <text x="160" y="123" text-anchor="middle" font-size="11" font-style="italic" fill="#b06367">K2 v1 dead</text>
+      <rect x="200" y="100" width="80" height="36" fill="rgba(176,99,103,0.12)" stroke="#b06367" stroke-dasharray="2 2"/>
+      <text x="240" y="123" text-anchor="middle" font-size="11" font-style="italic" fill="#b06367">K3 v1 dead</text>
+      <rect x="280" y="100" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="320" y="123" text-anchor="middle" font-size="11">K2 v2 (live)</text>
+    </g>
+    <g stroke="#7c7a72" stroke-width="1.5" fill="none" marker-end="url(#arrFo)">
+      <path d="M 370 85 L 430 85"/>
+    </g>
+    <text x="400" y="70" text-anchor="middle" font-size="11" fill="#7c7a72">fold-over</text>
+    <defs>
+      <marker id="arrFo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c7a72"/>
+      </marker>
+    </defs>
+    <text x="610" y="25" text-anchor="middle" font-weight="600" fill="#14171e">After fold-over</text>
+    <text x="610" y="42" text-anchor="middle" font-size="11" fill="#7c7a72">3 live records, rest freed</text>
+    <g>
+      <rect x="470" y="80" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="510" y="103" text-anchor="middle" font-size="11">K1 v3</text>
+      <rect x="550" y="80" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="590" y="103" text-anchor="middle" font-size="11">K2 v2</text>
+      <rect x="630" y="80" width="80" height="36" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="670" y="103" text-anchor="middle" font-size="11">K3 v1</text>
+      <rect x="710" y="80" width="60" height="36" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-dasharray="2 2"/>
+      <text x="740" y="103" text-anchor="middle" font-size="11" fill="#7c7a72">free</text>
+    </g>
+    <g font-size="11">
+      <rect x="450" y="200" width="14" height="14" fill="rgba(47,111,94,0.15)" stroke="#2f6f5e"/>
+      <text x="470" y="212" fill="#14171e">live record (latest version)</text>
+      <rect x="450" y="220" width="14" height="14" fill="rgba(176,99,103,0.12)" stroke="#b06367" stroke-dasharray="2 2"/>
+      <text x="470" y="232" fill="#14171e">dead record (overwritten or tombstone)</text>
+    </g>
+    <text x="610" y="280" text-anchor="middle" font-size="11" fill="#7c7a72" font-style="italic">All hash entries are rewritten to point at the new addresses.</text>
+    <text x="610" y="296" text-anchor="middle" font-size="11" fill="#7c7a72" font-style="italic">Dead records are physically overwritten on the next write.</text>
+  </g>
+</svg>
+  <div class="diagram-caption">Figure 7 · Fold-over compacts the in-memory log by keeping only the latest live version of each key.</div>
+</div>
+
+<pre><code>fn fold_over(&amp;mut self) {
+    // 1. Snapshot every entry's live address
+    let live: Vec&lt;(u64, u64)&gt; = self.index.iter()
+        .map(|e| (e.hash, e.address))
+        .collect();
+
+    // 2. Compact the in-memory log: walk live addresses, copy
+    //    each record to the head of the log, get its new address.
+    self.mem_log.reset_head();
+    for (_, old_addr) in &amp;live {
+        let rec = self.mem_log.read_at(*old_addr);
+        let new_addr = self.mem_log.append(&amp;rec);
+        self.pending_index_updates.push((hash, new_addr));
+    }
+
+    // 3. Apply the new addresses back to the index
+    for (h, new_addr) in self.pending_index_updates.drain(..) {
+        self.index.upsert_address(h, new_addr);
+    }
+
+    // 4. Pages beyond the new tail are now garbage
+    self.mem_log.reclaim();
+}</code></pre>
+
+<div class="callout"><strong>Fold-over is the cost of being append-only.</strong> It's also why this design scales: fold-over work is proportional to the number of <em>live</em> records, not the number of writes. A workload with 10× write-amplification and a 90% overwrite ratio gets most of that space amplification back for free.</div>
+</section>
+
+<section id="recovery">
+<h2>11 · Crash recovery</h2>
+<p>Recovery is the part most people skip and then regret. FASTER's recovery is clean: <strong>checkpoint the hash index, replay the tail of the log</strong>.</p>
+
+<div class="diagram">
+<svg class="svg-diagram" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+  <g font-family="Outfit, sans-serif" font-size="12">
+    <text x="120" y="30" font-weight="600" fill="#14171e">On disk at checkpoint</text>
+    <g>
+      <rect x="20" y="50" width="220" height="40" rx="6" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-width="1.5"/>
+      <text x="130" y="75" text-anchor="middle" font-size="12" fill="#b06367">Hash index snapshot</text>
+      <rect x="20" y="100" width="220" height="40" rx="6" fill="rgba(176,99,103,0.10)" stroke="#b06367" stroke-width="1.5"/>
+      <text x="130" y="125" text-anchor="middle" font-size="12" fill="#b06367">On-disk log segments</text>
+      <rect x="20" y="150" width="220" height="40" rx="6" fill="rgba(201,123,63,0.15)" stroke="#c97b3f" stroke-width="1.5"/>
+      <text x="130" y="175" text-anchor="middle" font-size="12" fill="#c97b3f">Tail (last segment, partial)</text>
+    </g>
+    <g stroke="#7c7a72" stroke-width="1.5" fill="none" marker-end="url(#arrR)">
+      <path d="M 250 95 L 320 95"/>
+    </g>
+    <text x="285" y="80" text-anchor="middle" font-size="11" fill="#7c7a72">replay</text>
+    <defs>
+      <marker id="arrR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c7a72"/>
+      </marker>
+    </defs>
+    <text x="540" y="30" font-weight="600" fill="#14171e">Recovered in-memory state</text>
+    <g>
+      <rect x="340" y="50" width="220" height="40" rx="6" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="450" y="75" text-anchor="middle" font-size="12" fill="#2f6f5e">Hash index (reloaded)</text>
+      <rect x="340" y="100" width="220" height="40" rx="6" fill="rgba(47,111,94,0.10)" stroke="#2f6f5e" stroke-width="1.5"/>
+      <text x="450" y="125" text-anchor="middle" font-size="12" fill="#2f6f5e">Empty in-memory log</text>
+      <rect x="340" y="150" width="220" height="40" rx="6" fill="rgba(201,123,63,0.15)" stroke="#c97b3f" stroke-width="1.5"/>
+      <text x="450" y="175" text-anchor="middle" font-size="12" fill="#c97b3f">Tail replayed into mutable</text>
+    </g>
+    <g font-size="11" fill="#14171e">
+      <text x="600" y="65">① mmap the index snapshot</text>
+      <text x="600" y="85">② open on-disk log, get tail offset</text>
+      <text x="600" y="105">③ replay records from snapshot_address</text>
+      <text x="600" y="125">④ each replayed record updates the index</text>
+      <text x="600" y="145">⑤ resume in-memory appends</text>
+    </g>
+    <text x="400" y="240" text-anchor="middle" font-size="11" fill="#7c7a72" font-style="italic">You only replay from the checkpoint, not the entire log. The snapshot is the anchor.</text>
+  </g>
+</svg>
+  <div class="diagram-caption">Figure 8 · Recovery is a snapshot + tail replay. Bounded by the size of the tail, not the size of the database.</div>
+</div>
+
+<div class="callout"><strong>For your single-threaded port:</strong> persist the hash index as a flat file (just dump every <code class="inline">HashEntry</code> in order) and append every record to a file as it's written. On startup: mmap the index file, then sequentially scan the on-disk log from the snapshot's tail offset and replay into the mutable region. No fancy crash recovery, no torn-write protection — for a learning build, just make sure you sync to disk on a clean shutdown.</div>
+</section>
+
+<section id="single">
+<h2>12 · What single-threaded lets you drop</h2>
+<p>Building single-threaded is a <em>design</em> simplification, not a <em>design</em> change. The data model is identical. The pieces you can remove:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Multi-threaded FASTER</th>
+      <th>Single-threaded equivalent</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Epoch-based memory reclamation</td>
+      <td>Drop it. Single owner of memory means no readers can outlive a write.</td>
+    </tr>
+    <tr>
+      <td>CAS-based hash chain update</td>
+      <td>Plain <code class="inline">&amp;mut</code> access. Update in place.</td>
+    </tr>
+    <tr>
+      <td>Concurrent overflow chains</td>
+      <td>A <code class="inline">Vec&lt;HashEntry&gt;</code> per bucket. Append freely.</td>
+    </tr>
+    <tr>
+      <td>Atomic tail pointer</td>
+      <td>A single <code class="inline">u64</code>. No atomics.</td>
+    </tr>
+    <tr>
+      <td>Thread coordination around freezing</td>
+      <td>Just freeze it when full. No readers to coordinate with.</td>
+    </tr>
+    <tr>
+      <td>Lock-free record reservation</td>
+      <td>Compute slot, write, move on. No CAS loop.</td>
+    </tr>
+    <tr>
+      <td>Read cache LRU with locks</td>
+      <td>Plain LRU. <code class="inline">HashMap</code> + <code class="inline">VecDeque</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>What you keep (because they're part of the model, not the synchronization):</p>
+<ul>
+  <li>The mutable / read-only distinction. Even single-threaded, batching flushes is worth it.</li>
+  <li>Append-only writes with the index pointing at the latest address.</li>
+  <li>Fold-over compaction. Same code, no atomics.</li>
+  <li>The on-disk log + checkpoint + replay recovery model.</li>
+  <li>The 64-bit address space (or your simplified version of it).</li>
+</ul>
+</section>
+
+<section id="skeleton">
+<h2>13 · Skeleton code</h2>
+<p>A concrete starting point in Rust-flavored pseudocode. Treat this as the <em>shape</em> of the code, not the final form.</p>
+
+<pre><code>// ─── Constants ─────────────────────────────────────────────
+const PAGE_SIZE:    usize = 32 * 1024;
+const SLOT_ALIGN:   usize = 8;
+const BUCKET_COUNT: usize = 1 &lt;&lt; 20;     // 1M buckets
+
+// ─── Address ───────────────────────────────────────────────
+#[derive(Copy, Clone)]
+struct Address(u64);
+
+impl Address {
+    fn segment(&amp;self) -&gt; u8  { (self.0 &gt;&gt; 56) as u8 }
+    fn page(&amp;self)    -&gt; u32 { ((self.0 &gt;&gt; 32) &amp; 0x00FF_FFFF) as u32 }
+    fn offset(&amp;self)  -&gt; u32 { (self.0 &amp; 0xFFFF_FFFF) as u32 }
+    fn encode(seg: u8, page: u32, off: u32) -&gt; Self {
+        Address(((seg as u64) &lt;&lt; 56) | ((page as u64) &lt;&lt; 32) | off as u64)
+    }
+}
+
+#[derive(Debug)]
+enum Location {
+    Mutable(u32, u32),    // page, offset
+    ReadOnly(u32, u32),
+    Disk(u8, u32, u32),   // segment, page, offset
+}
+
+// ─── Record ────────────────────────────────────────────────
+#[derive(Copy, Clone)]
+enum Op { Upsert, Delete, Copy }
+
+struct Record {
+    version:  u64,    // = the record's own Address
+    key_len:  u16,
+    val_len:  u32,
+    op:       Op,
+    checksum: u8,
+    // followed by `key_len` bytes of key and `val_len` bytes of value
+}
+
+// ─── Hash index ────────────────────────────────────────────
+struct HashEntry {
+    tag:     u16,        // top 16 bits of hash — fast reject
+    address: Address,
+}
+
+struct Bucket {
+    primary:  Option&lt;HashEntry&gt;,
+    overflow: Vec&lt;HashEntry&gt;,
+}
+
+impl Bucket {
+    fn find(&amp;self, hash: u64) -&gt; Option&lt;&amp;HashEntry&gt; {
+        let tag = (hash &gt;&gt; 48) as u16;
+        if let Some(e) = &amp;self.primary {
+            if e.tag == tag { return Some(e); }
+        }
+        self.overflow.iter().find(|e| e.tag == tag)
+    }
+    fn upsert(&amp;mut self, hash: u64, addr: Address) {
+        let tag = (hash &gt;&gt; 48) as u16;
+        if let Some(e) = self.primary.iter_mut().find(|e| e.tag == tag) {
+            e.address = addr; return;
+        }
+        if let Some(e) = self.overflow.iter_mut().find(|e| e.tag == tag) {
+            e.address = addr; return;
+        }
+        match &amp;mut self.primary {
+            None =&gt; { self.primary = Some(HashEntry { tag, address: addr }); }
+            Some(_) =&gt; self.overflow.push(HashEntry { tag, address: addr }),
+        }
+    }
+}
+
+struct HashIndex {
+    buckets: Vec&lt;Bucket&gt;,
+}
+
+impl HashIndex {
+    fn bucket(&amp;self, hash: u64) -&gt; &amp;Bucket {
+        &amp;self.buckets[hash as usize % self.buckets.len()]
+    }
+    fn bucket_mut(&amp;mut self, hash: u64) -&gt; &amp;mut Bucket {
+        let n = self.buckets.len();
+        &amp;mut self.buckets[hash as usize % n]
+    }
+}
+
+// ─── Pages ─────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+enum PageStatus { Free, Mutable, ReadOnly }
+
+struct Page {
+    bytes:  Vec&lt;u8&gt;,
+    status: PageStatus,
+}
+
+// ─── In-memory log ─────────────────────────────────────────
+struct MemLog {
+    pages:     Vec&lt;Page&gt;,
+    head_idx:  usize,     // index of the page at the head address
+    tail_idx:  usize,     // index of the page at the tail address
+    tail_off:  u32,       // offset within the tail page
+    head_addr: u64,       // address of the first byte of the log
+}
+
+impl MemLog {
+    fn freeze_current(&amp;mut self) {
+        self.pages[self.tail_idx].status = PageStatus::ReadOnly;
+        self.tail_idx = (self.tail_idx + 1) % self.pages.len();
+        self.tail_off = 0;
+    }
+    fn append(&amp;mut self, rec: &amp;Record) -&gt; Address {
+        let slot = slot_size(rec);
+        if self.tail_off + slot as u32 &gt; PAGE_SIZE as u32 {
+            self.freeze_current();
+        }
+        let addr = Address::encode(1, self.tail_idx as u32, self.tail_off);
+        rec.write_into(&amp;mut self.pages[self.tail_idx].bytes[self.tail_off..]);
+        self.tail_off += slot as u32;
+        addr
+    }
+}
+
+// ─── On-disk log ───────────────────────────────────────────
+struct DiskLog { /* file handle + current segment + tail offset */ }
+
+// ─── The store itself ──────────────────────────────────────
+struct HybridKV {
+    hash:   HashIndex,
+    mem:    MemLog,
+    disk:   DiskLog,
+    next_internal_version: u64,
+}
+
+impl HybridKV {
+    pub fn upsert(&amp;mut self, key: &amp;[u8], value: &amp;[u8]) {
+        let h = xxhash3(key);
+        let rec = Record::upsert(self.next_internal_version, key, value);
+        let addr = self.mem.append(&amp;rec);
+        self.next_internal_version += 1;
+        self.hash.bucket_mut(h).upsert(h, addr);
+    }
+
+    pub fn read(&amp;mut self, key: &amp;[u8]) -&gt; Option&lt;&amp;[u8]&gt; {
+        let h = xxhash3(key);
+        let entry = self.hash.bucket(h).find(h)?;
+        // decode, follow op, verify key, return slice  (see §7)
+        todo!()
+    }
+}</code></pre>
+</section>
+
+<section id="build">
+<h2>14 · Build order</h2>
+<p>Suggested order for the single-threaded build. Each step is independently testable.</p>
+
+<ol>
+  <li><strong>Address encoding + record layout.</strong> Get the binary format right first. Write a hex-dump test to confirm round-trips.</li>
+  <li><strong>In-memory log with a single page.</strong> Append, read, scan. Verify with a unit test that a round-trip through the log gives back the same bytes.</li>
+  <li><strong>Hash index.</strong> Bucket array + overflow. Test with collisions: insert N keys, look them all up.</li>
+  <li><strong>Read and upsert end-to-end.</strong> At this point you have a working in-memory KV store. Stop and benchmark — make sure the basics are solid.</li>
+  <li><strong>Multi-page in-memory log + freeze.</strong> Add the mutable → read-only transition. Make sure reads still work after freezing.</li>
+  <li><strong>Append to a log file on disk + read back.</strong> Add the on-disk log as a simple append-only file. This is now a "bigger than memory" store.</li>
+  <li><strong>Address decoding into mutable/read-only/disk.</strong> The read path now has to look in three places.</li>
+  <li><strong>Freeze → flush pipeline.</strong> When a page becomes read-only, write it to disk. Recycle the in-memory slot.</li>
+  <li><strong>Fold-over.</strong> When in-memory is full and on-disk is also saturated, compact. Watch the space amplification number go down.</li>
+  <li><strong>Checkpoint + replay.</strong> Persist the hash index, record the tail address, replay from there on startup.</li>
+  <li><strong>Read cache (optional but recommended).</strong> A 64-page LRU on the on-disk read path. Big latency win for hot out-of-memory keys.</li>
+  <li><strong>Iterator / scan support (optional).</strong> Scans walk the on-disk log or in-memory log in address order. This is one of FASTER's distinctive features.</li>
+</ol>
+
+<div class="callout"><strong>You don't need to implement all of this to learn the design.</strong> Steps 1–5 give you the in-memory engine. Steps 6–8 give you durability. Steps 9–11 give you the full picture. Step 12 is a stretch.</div>
+
+<div class="section-divider"></div>
+
+<p style="text-align:center; font-family:'DM Serif Display', serif; font-size:20px; color:#14171e;">That's the whole hybrid log — one address space, one index, two physical homes, and a fold-over to keep it from filling up.</p>
+
+<p style="text-align:center; color:#7c7a72; font-size:14px;">If you want, I can write the Rust skeleton end-to-end next, with tests. Just say the word.</p>
+
+</div>
+</body>
+</html>

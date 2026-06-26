@@ -1,0 +1,8 @@
+build/
+build_bench/
+cmake-build-*/
+.git/
+.cache/
+*.o
+*.a
+*.so
