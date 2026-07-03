@@ -49,17 +49,17 @@ using namespace tinyio;
 int main() {
     IO io(0, IoOptions{}, {});
 
-    io.spawn([](IO& io) noexcept {
-        auto fd = TRY(io.open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644));
+    io.Spawn([](IO& io) noexcept {
+        auto fd = TRY(io.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644));
 
         std::string_view msg = "hello from a fiber\n";
         std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        TRY(io.write(fd, buf));
+        TRY(io.Write(fd, buf));
 
-        TRY(io.close(std::move(fd)));
+        TRY(io.Close(std::move(fd)));
     });
 
-    io.run_until_done();
+    io.RunUntilDone();
 }
 ```
 
@@ -74,10 +74,10 @@ using namespace tinyio;
 static Result<void> handle_client(IO& io, Fd client) noexcept {
     std::byte buf[4096];
     while (true) {
-        auto n = TRY(io.read(client, std::span{buf}));
+        auto n = TRY(io.Read(client, std::span{buf}));
         if (n == 0) break;
         // write response ...
-        TRY(io.write(client, response));
+        TRY(io.Write(client, response));
     }
     return {};
 }
@@ -86,8 +86,8 @@ static Result<void> accept_loop(IO& io, uint16_t port, std::stop_token st) noexc
     auto server = TRY(TcpListener::bind(port, "0.0.0.0"));
 
     while (!st.stop_requested()) {
-        auto client = TRY(io.accept(server));
-        io.spawn([c = std::move(client)](IO& io) mutable noexcept {
+        auto client = TRY(io.Accept(server));
+        io.Spawn([c = std::move(client)](IO& io) mutable noexcept {
             (void)handle_client(io, std::move(c));
         });
     }
@@ -104,10 +104,10 @@ int main() {
         auto st = stops.back().get_token();
         threads.emplace_back([i, st] {
             IO io(i, IoOptions{}, {});
-            io.spawn([st](IO& io) noexcept {
+            io.Spawn([st](IO& io) noexcept {
                 (void)accept_loop(io, 8080, st);
             });
-            io.run(st);
+            io.Run(st);
         });
     }
 
@@ -128,19 +128,19 @@ The full example is in `examples/tinyio/03_http_services.cpp`.
 IO io(0, IoOptions{}, {});
 
 // Spawn a fiber on the owner thread.
-Result<FiberId> io.spawn([](IO& io) noexcept { ... });
+Result<FiberId> io.Spawn([](IO& io) noexcept { ... });
 
 // Run until all fibers finish. No stop token needed.
-void io.run_until_done();
+void io.RunUntilDone();
 
 // Run until the stop token is fired, then drain.
-void io.run(const std::stop_token& st);
+void io.Run(const std::stop_token& st);
 
 // Yield the current fiber back to the scheduler (cooperative multitasking).
-Result<void> io.yield();
+Result<void> io.Yield();
 
 // Post a task from any thread. Thread-safe. Returns false if the queue is full.
-bool io.post([](IO& io) noexcept { ... });
+bool io.Post([](IO& io) noexcept { ... });
 ```
 
 `IO` is not copyable and not movable. Create it where it will live.
@@ -152,30 +152,30 @@ kernel completes the operation.
 
 ```cpp
 // Files
-Result<Fd>       io.open(path, flags, mode = 0644)
-Result<void>     io.close(Fd&&)
-Result<uint32_t> io.read(Fd&, std::span<std::byte>, off_t offset = -1)
-Result<uint32_t> io.write(Fd&, std::span<const std::byte>, off_t offset = -1)
-Result<uint32_t> io.readv(Fd&, std::span<const iovec>, off_t offset = -1)
-Result<uint32_t> io.writev(Fd&, std::span<const iovec>, off_t offset = -1)
-Result<void>     io.fsync(Fd&, bool datasync = false)
-Result<void>     io.fallocate(Fd&, int mode, off_t offset, off_t len)
-Result<void>     io.ftruncate(Fd&, off_t len)   // kernel 6.9+
-Result<void>     io.remove(path)
-Result<void>     io.rename(from, to)
+Result<Fd>       io.Open(path, flags, mode = 0644)
+Result<void>     io.Close(Fd&&)
+Result<uint32_t> io.Read(Fd&, std::span<std::byte>, off_t offset = -1)
+Result<uint32_t> io.Write(Fd&, std::span<const std::byte>, off_t offset = -1)
+Result<uint32_t> io.Readv(Fd&, std::span<const iovec>, off_t offset = -1)
+Result<uint32_t> io.Writev(Fd&, std::span<const iovec>, off_t offset = -1)
+Result<void>     io.Fsync(Fd&, bool datasync = false)
+Result<void>     io.Fallocate(Fd&, int mode, off_t offset, off_t len)
+Result<void>     io.Ftruncate(Fd&, off_t len)   // kernel 6.9+
+Result<void>     io.Remove(path)
+Result<void>     io.Rename(from, to)
 
 // Network
-Result<Fd>       io.accept(Fd& server, int flags = SOCK_NONBLOCK | SOCK_CLOEXEC)
-Result<Fd>       io.accept(Fd& server, SocketAddress& client_addr, int flags = ...)
-Result<void>     io.connect(Fd&, const SocketAddress&)
-Result<uint32_t> io.poll(Fd&, unsigned poll_mask)
+Result<Fd>       io.Accept(Fd& server, int flags = SOCK_NONBLOCK | SOCK_CLOEXEC)
+Result<Fd>       io.Accept(Fd& server, SocketAddress& client_addr, int flags = ...)
+Result<void>     io.Connect(Fd&, const SocketAddress&)
+Result<uint32_t> io.Poll(Fd&, unsigned poll_mask)
 
 // Fixed (registered) buffers — faster I/O path
-Result<uint32_t> io.read_fixed(Fd&, FixedBuffer&, size_t len, off_t offset = -1)
-Result<uint32_t> io.write_fixed(Fd&, const FixedBuffer&, size_t len, off_t offset = -1)
+Result<uint32_t> io.ReadFixed(Fd&, FixedBuffer&, size_t len, off_t offset = -1)
+Result<uint32_t> io.WriteFixed(Fd&, const FixedBuffer&, size_t len, off_t offset = -1)
 
 // Timers
-Result<void>     io.sleep_for_ns(std::chrono::nanoseconds)
+Result<void>     io.SleepForNs(std::chrono::nanoseconds)
 ```
 
 ### `TcpListener` — convenience socket setup
@@ -208,7 +208,7 @@ static context string.
 
 ```cpp
 // Manual check
-auto res = io.read(fd, buf);
+auto res = io.Read(fd, buf);
 if (!res) {
     // res.error().code      — errno value
     // res.error().error_code().message() — human-readable string
@@ -216,8 +216,8 @@ if (!res) {
 }
 
 // Rust ?-style propagation (GNU statement expression, Clang/GCC only)
-auto n = TRY(io.read(fd, buf));   // returns error to caller on failure
-TRY(io.fsync(fd));                // Result<void>: just propagate
+auto n = TRY(io.Read(fd, buf));   // returns error to caller on failure
+TRY(io.Fsync(fd));                // Result<void>: just propagate
 ```
 
 ### Fixed buffer pool
@@ -233,20 +233,41 @@ std::vector<BucketConfig> pool = {
 IO io(0, IoOptions{}, pool);
 
 // Inside a fiber
-auto buf = TRY(io.take_fixed_buffer(4096));
-auto n   = TRY(io.read_fixed(fd, buf, buf.size()));
+auto buf = TRY(io.TakeFixedBuffer(4096));
+auto n   = TRY(io.ReadFixed(fd, buf, buf.size()));
 // buf returns to pool automatically on destruction
+```
+
+### Synchronization (`TaskGroup`, `Mutex`, `Semaphore`, `Latch`)
+
+tinyio provides fiber-aware synchronization primitives that correctly suspend the fiber without blocking the underlying OS thread.
+
+#### `TaskGroup<T>`
+Use `TaskGroup` to run multiple fibers concurrently and wait for them to finish (Structured Concurrency).
+
+```cpp
+// 1. Fire-and-forget (TaskGroup<void> deduced)
+tinyio::TaskGroup group(io);
+group.Spawn([](IO& io) { /* Task 1 */ });
+group.Spawn([](IO& io) { /* Task 2 */ });
+group.Wait(); // Suspends until all tasks finish
+
+// 2. Collecting results
+tinyio::TaskGroup<int> results(io, 2);
+results.Spawn([](IO& io) -> Result<int> { return 42; });
+results.Spawn([](IO& io) -> Result<int> { return 100; });
+results.Wait();
 ```
 
 ### Cross-thread dispatch
 
 ```cpp
-// From any thread — enqueues a task into the lock-free MPSC queue
+// From any thread — enqueues a task into the lock-free moodycamel::ConcurrentQueue
 // and wakes the owner thread via eventfd.
-bool ok = io.post([](IO& io) noexcept {
-    io.spawn(some_task);
+bool ok = io.Post([](IO& io) noexcept {
+    io.Spawn(some_task);
 });
-// ok == false if the queue is full (bounded MPSC)
+// ok == false if the queue is full
 ```
 
 ---

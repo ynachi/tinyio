@@ -42,6 +42,8 @@ public:
     {
     }
 
+    FixedBuffer() noexcept = default;
+
     FixedBuffer(const FixedBuffer&) = delete;
 
     FixedBuffer(FixedBuffer&& other) noexcept;
@@ -106,6 +108,7 @@ public:
 
     bool IsRegistered() const noexcept { return registered_; }
     void SetRegistered() noexcept { registered_ = true; }
+    void SetUnregistered() noexcept { registered_ = false; }
 
     /// Query available slots in a specific bucket (debug/observability)
     [[nodiscard]] size_t AvailableInBucket(const uint32_t bucket_id) const noexcept

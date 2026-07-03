@@ -299,12 +299,12 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo) {
   EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
 }
 
-// ── ResultGroup ─────────────────────────────────────────────────────────────
+// ── TaskGroup<T> ────────────────────────────────────────────────────────────
 
 // All tasks run and their return values are accessible via results() after wait().
-TEST_F(FiberSyncTest, ResultGroupBasic) {
+TEST_F(FiberSyncTest, TaskGroupResultBasic) {
   (void)io_.Spawn([](IO& rt) noexcept {
-    ResultGroup<int> group(rt, 3);
+    TaskGroup<int> group(rt, 3);
 
     group.Spawn([](IO&) noexcept -> Result<int> { return 10; });
     group.Spawn([](IO&) noexcept -> Result<int> { return 20; });
@@ -325,9 +325,9 @@ TEST_F(FiberSyncTest, ResultGroupBasic) {
 }
 
 // A task that returns an error populates its slot with that error.
-TEST_F(FiberSyncTest, ResultGroupTaskError) {
+TEST_F(FiberSyncTest, TaskGroupResultTaskError) {
   (void)io_.Spawn([](IO& rt) noexcept {
-    ResultGroup<int> group(rt, 2);
+    TaskGroup<int> group(rt, 2);
 
     group.Spawn([](IO&) noexcept -> Result<int> { return 42; });
     group.Spawn([](IO&) noexcept -> Result<int> {
@@ -348,9 +348,9 @@ TEST_F(FiberSyncTest, ResultGroupTaskError) {
 }
 
 // Slots that were never spawned remain std::nullopt.
-TEST_F(FiberSyncTest, ResultGroupUnspawnedSlotIsNullopt) {
+TEST_F(FiberSyncTest, TaskGroupResultUnspawnedSlotIsNullopt) {
   (void)io_.Spawn([](IO& rt) noexcept {
-    ResultGroup<int> group(rt, 3);
+    TaskGroup<int> group(rt, 3);
 
     group.Spawn([](IO&) noexcept -> Result<int> { return 1; });
     // slots 1 and 2 are never spawned

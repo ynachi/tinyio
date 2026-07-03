@@ -60,10 +60,6 @@ struct Operation
     /// The completion flags provided by the kernel.
     unsigned cqe_flags = 0;
 
-    /// Persists timeout structs in user-space. io_uring requires this struct to
-    /// remain valid in memory until the timeout operation completes in the kernel.
-    timespec timeout_ts{};
-
     /// Absolute CLOCK_MONOTONIC deadline (ns) while this op is armed in the
     /// runtime's TimerWheel; 0 when no timeout is attached.
     uint64_t deadline_ns = 0;
