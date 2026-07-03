@@ -2,119 +2,85 @@
 
 #include <cstddef>
 
+#include <boost/intrusive/list.hpp>
+
 namespace tinyio {
 
-/// \brief A generic hook for intrusive linked lists.
-/// \tparam Tag A unique tag type to allow a single struct to be in multiple lists.
 template <typename Tag>
-struct IntrusiveHook {
-  // Initialize to point to itself (unlinked/circular state)
-  IntrusiveHook* prev = this;
-  IntrusiveHook* next = this;
+struct IntrusiveHook : boost::intrusive::list_base_hook<
+                           boost::intrusive::tag<Tag>,
+                           boost::intrusive::link_mode<boost::intrusive::auto_unlink>> {
+  [[nodiscard]] bool IsLinked() const noexcept { return this->is_linked(); }
 
-  [[nodiscard]] bool IsLinked() const noexcept { return next != this; }
+  void UnlinkSelf() noexcept {
+    if (this->is_linked()) {
+      this->unlink();
+    }
+  }
 };
 
-namespace detail {
-/// Mixin that holds the size counter only when TrackSize is true.
-template <bool TrackSize>
-struct SizeTracker {
-  std::size_t size_ = 0;
-  void Inc() noexcept { ++size_; }
-  void Dec() noexcept { --size_; }
-  [[nodiscard]] std::size_t Size() const noexcept { return size_; }
-};
-
-template <>
-struct SizeTracker<false> {
-  static void Inc() noexcept {}
-  static void Dec() noexcept {}
-};
-}  // namespace detail
-
-/// \brief A branchless, circular, doubly-linked intrusive list using dummy heads.
-/// \tparam T The node type (must publicly inherit from IntrusiveHook<Tag>).
-/// \tparam Tag The unique tag identifying which hook to use.
 template <typename T, typename Tag, bool TrackSize = true>
-class IntrusiveList : detail::SizeTracker<TrackSize> {
-  using Tracker = detail::SizeTracker<TrackSize>;
+class IntrusiveList {
+  using ListType =
+      boost::intrusive::list<T, boost::intrusive::base_hook<IntrusiveHook<Tag>>,
+                             boost::intrusive::constant_time_size<false>>;
+
+  ListType list_;
+  std::size_t size_ = 0;
 
  public:
   constexpr IntrusiveList() noexcept = default;
 
-  [[nodiscard]] bool Empty() const noexcept { return dummy_.next == &dummy_; }
+  [[nodiscard]] bool Empty() const noexcept { return list_.empty(); }
 
   [[nodiscard]] std::size_t Size() const noexcept
     requires TrackSize
   {
-    return Tracker::Size();
+    return size_;
   }
 
-  /// \brief Pushes a node to the front of the list (O(1), branchless)
-  void PushFront(T* node) noexcept { InsertBetween(GetHook(node), &dummy_, dummy_.next); }
+  void PushFront(T* node) noexcept {
+    list_.push_front(*node);
+    if constexpr (TrackSize) {
+      ++size_;
+    }
+  }
 
-  /// \brief Pushes a node to the back of the list (O(1), branchless)
-  /// This gives the list perfect FIFO Queue semantics.
-  void PushBack(T* node) noexcept { InsertBetween(GetHook(node), dummy_.prev, &dummy_); }
+  void PushBack(T* node) noexcept {
+    list_.push_back(*node);
+    if constexpr (TrackSize) {
+      ++size_;
+    }
+  }
 
-  /// \brief Pops a node from the front of the list (O(1), branchless)
   [[nodiscard]] T* PopFront() noexcept {
-    if (Empty()) {
+    if (list_.empty()) {
       return nullptr;
     }
-    IntrusiveHook<Tag>* hook = dummy_.next;
-    RemoveHook(hook);
-    return GetNode(hook);
+    T* front = &list_.front();
+    list_.pop_front();
+    if constexpr (TrackSize) {
+      --size_;
+    }
+    return front;
   }
 
-  /// \brief Removes a specific node from the list (O(1), branchless)
   void Remove(T* node) noexcept {
-    IntrusiveHook<Tag>* hook = GetHook(node);
-    if (hook->IsLinked()) {
-      RemoveHook(hook);
+    if (static_cast<IntrusiveHook<Tag>*>(node)->IsLinked()) {
+      list_.erase(list_.iterator_to(*node));
+      if constexpr (TrackSize) {
+        --size_;
+      }
     }
   }
 
   template <class Fn>
   void ForEach(Fn&& fn) noexcept {
-    auto* hook = dummy_.next;
-    while (hook != &dummy_) {
-      auto* next = hook->next;
-      fn(*GetNode(hook));
-      hook = next;
+    for (auto it = list_.begin(); it != list_.end();) {
+      auto& node = *it;
+      ++it;
+      fn(node);
     }
-  }
-
- private:
-  IntrusiveHook<Tag> dummy_;
-
-  static IntrusiveHook<Tag>* GetHook(T* node) noexcept {
-    // Safe upcast from derived to base hook
-    return static_cast<IntrusiveHook<Tag>*>(node);
-  }
-
-  static T* GetNode(IntrusiveHook<Tag>* hook) noexcept {
-    // Safe downcast from base hook to derived node
-    return static_cast<T*>(hook);
-  }
-
-  void InsertBetween(IntrusiveHook<Tag>* node, IntrusiveHook<Tag>* prev,
-                     IntrusiveHook<Tag>* next) noexcept {
-    node->next = next;
-    node->prev = prev;
-    prev->next = node;
-    next->prev = node;
-    Tracker::Inc();
-  }
-
-  void RemoveHook(IntrusiveHook<Tag>* node) noexcept {
-    node->prev->next = node->next;
-    node->next->prev = node->prev;
-
-    // Reset the hook to unlinked circular state
-    node->next = node;
-    node->prev = node;
-    Tracker::Dec();
   }
 };
 

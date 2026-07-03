@@ -43,7 +43,6 @@ struct Latch {
     }
   }
 
-  /// Suspends the calling fiber until count == 0. Returns immediately if already 0.
   [[nodiscard]] Result<void> Wait() noexcept {
     auto* self = io_.RunningFiber();
     assert(self != nullptr && "wait() called outside a fiber");
@@ -55,6 +54,13 @@ struct Latch {
       }
     }
     return {};
+  }
+
+  ~Latch() {
+    if (!waiters_.Empty()) {
+      ALOG_FATAL("Latch destroyed with fibers waiting");
+      std::abort();
+    }
   }
 
  private:
@@ -119,6 +125,13 @@ struct Semaphore {
       return true;
     }
     return false;
+  }
+
+  ~Semaphore() {
+    if (!waiters_.Empty()) {
+      ALOG_FATAL("Semaphore destroyed with fibers waiting");
+      std::abort();
+    }
   }
 
  private:
@@ -207,6 +220,13 @@ struct Mutex {
     return Guard{this};
   }
 
+  ~Mutex() {
+    if (!waiters_.Empty()) {
+      ALOG_FATAL("Mutex destroyed with fibers waiting");
+      std::abort();
+    }
+  }
+
  private:
   IO& io_;
   bool held_{false};
@@ -216,6 +236,9 @@ struct Mutex {
 /// @brief Ties fiber lifetime to a lexical scope. Ensures that spawned child fibers
 /// cannot outlive the group.
 ///
+template <typename T = void>
+struct TaskGroup;
+
 /// A TaskGroup allows you to spawn multiple fibers and wait for all of them to complete.
 /// This prevents "runaway" fibers that outlive the scope where they were created.
 /// The destructor asserts that no tasks are still active, enforcing that `wait()` is
@@ -233,7 +256,8 @@ struct Mutex {
 ///     group.wait(); // Suspends until Task 1 and Task 2 are finished
 /// }
 /// @endcode
-struct TaskGroup {
+template <>
+struct TaskGroup<void> {
   explicit TaskGroup(IO& io) : io_(io) {}
 
   // Spawns a child fiber tracked by this group.
@@ -291,6 +315,9 @@ struct TaskGroup {
   FiberWaitQueue waiters_;
 };
 
+// Deduction guide for TaskGroup (deduces to TaskGroup<void>)
+TaskGroup(IO&) -> TaskGroup<void>;
+
 /// @brief An extension of TaskGroup that collects a Result<T> per task into a pre-sized
 /// vector.
 ///
@@ -301,7 +328,7 @@ struct TaskGroup {
 /// Requires: T is nothrow-move-constructible (enforced at instantiation time).
 ///
 /// @code
-/// tinyio::ResultGroup<int> group(io, 2);
+/// tinyio::TaskGroup<int> group(io, 2);
 /// group.spawn([](tinyio::IO& io) -> tinyio::Result<int> {
 ///     return 42;
 /// });
@@ -317,11 +344,11 @@ struct TaskGroup {
 /// }
 /// @endcode
 template <typename T>
-struct ResultGroup {
+struct TaskGroup {
   static_assert(std::is_nothrow_move_constructible_v<T>,
-                "ResultGroup<T>: T must be nothrow-move-constructible");
+                "TaskGroup<T>: T must be nothrow-move-constructible");
 
-  explicit ResultGroup(IO& io, std::size_t capacity) : tg_(io), results_(capacity) {}
+  explicit TaskGroup(IO& io, std::size_t capacity) : tg_(io), results_(capacity) {}
 
   // Spawns the next child fiber; its result lands in the next available slot.
   // If the runtime cannot allocate a fiber, the slot is pre-populated with the
@@ -329,7 +356,7 @@ struct ResultGroup {
   template <class Fn>
     requires std::constructible_from<std::move_only_function<Result<T>(IO&) noexcept>, Fn>
   Result<void> Spawn(Fn&& task) noexcept {
-    assert(next_ < results_.size() && "ResultGroup: more spawns than capacity");
+    assert(next_ < results_.size() && "TaskGroup: more spawns than capacity");
     std::size_t index = next_++;
     auto res = tg_.Spawn([this, index, t = std::forward<Fn>(task)](
                              IO& io) mutable noexcept { results_[index] = t(io); });
@@ -350,7 +377,7 @@ struct ResultGroup {
   }
 
  private:
-  TaskGroup tg_;
+  TaskGroup<void> tg_;
   std::vector<std::optional<Result<T>>> results_;
   std::size_t next_ = 0;
 };

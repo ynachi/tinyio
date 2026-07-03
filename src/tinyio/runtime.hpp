@@ -23,8 +23,7 @@ namespace tinyio {
 
 /// Default io uring flag
 inline constexpr unsigned k_uring_default_additional_flag =
-    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN |
-    IORING_SETUP_TASKRUN_FLAG;
+    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
 
 /// These are mandatory base flags
 inline constexpr unsigned k_uring_base_flags =
@@ -158,6 +157,9 @@ class IO final {
   template <class Fn>
     requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
   [[nodiscard]] bool Post(Fn&& fn) noexcept {
+    if (stopping_.load(std::memory_order_acquire)) {
+      return false;
+    }
     try {
       if (!post_queue_.Enqueue(
               std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)))) {
@@ -187,6 +189,7 @@ class IO final {
   /// Register a fixed buffer pool
   Result<void> RegisterBuffers(FixedBufferPool& pool) noexcept;
   Result<void> UnregisterBuffers() noexcept;
+  [[nodiscard]] FixedBufferPool& GetBufferPool() noexcept { return buffer_pool_; }
   [[nodiscard]] Result<FixedBuffer> TakeFixedBuffer(const size_t size) noexcept {
     return buffer_pool_.Take(size);
   }
@@ -209,17 +212,18 @@ class IO final {
   /// auto n = TRY(fio.write_fixed(fd, buf, data.size(), file_offset));
   /// @endcode
   [[nodiscard]] Result<uint32_t> WriteFixed(const Fd& fd, const FixedBuffer& buf,
-                                            size_t len, off_t offset = -1) noexcept;
+                                            size_t len, off_t file_offset = -1,
+                                            size_t buffer_offset = 0) noexcept;
 
-  /// Write the whole contents of @p buf to @p fd starting at @p offset.
-  /// Equivalent to write_fixed(fd, buf, buf.size(), offset).
+  /// Write the whole contents of @p buf to @p fd starting at @p file_offset.
+  /// Equivalent to write_fixed(fd, buf, buf.size(), file_offset).
   [[nodiscard]] Result<uint32_t> WriteFixed(const Fd& fd, const FixedBuffer& buf,
-                                            off_t offset = -1) noexcept;
+                                            off_t file_offset = -1) noexcept;
   /// Read up to @p len bytes from @p fd into @p buf (a registered fixed buffer)
   /// starting at @p offset.
   ///
   /// Uses io_uring's READ_FIXED operation.
-  /// Pass @p offset = -1 to use the file's current position.
+  /// Pass @p file_offset = -1 to use the file's current position.
   ///
   /// @return Number of bytes read, or an error code.
   ///
@@ -230,12 +234,13 @@ class IO final {
   ///                          static_cast<size_t>(n)};
   /// @endcode
   [[nodiscard]] Result<uint32_t> ReadFixed(const Fd& fd, FixedBuffer& buf, size_t len,
-                                           off_t offset = -1) noexcept;
+                                           off_t file_offset = -1,
+                                           size_t buffer_offset = 0) noexcept;
 
-  /// Read up to buf.size() bytes from @p fd into @p buf starting at @p offset.
-  /// Equivalent to read_fixed(fd, buf, buf.size(), offset).
+  /// Read up to buf.size() bytes from @p fd into @p buf starting at @p file_offset.
+  /// Equivalent to read_fixed(fd, buf, buf.size(), file_offset).
   [[nodiscard]] Result<uint32_t> ReadFixed(const Fd& fd, FixedBuffer& buf,
-                                           off_t offset = -1) noexcept;
+                                           off_t file_offset = -1) noexcept;
 
   /// Read up to buf.size() bytes from @p fd into the caller-provided span @p buf.
   ///
@@ -410,7 +415,7 @@ class IO final {
   /// fibers).
   Result<void> Tick() noexcept;
   Result<void> ArmWakeRead() noexcept;
-  void Wake() const noexcept;
+  void Wake() noexcept;
 
   struct MultishotAcceptState {
     Fd server_fd;
@@ -549,7 +554,7 @@ class IO final {
   //
   bool is_activated_{false};
   bool is_running_{false};
-  bool stopping_{false};
+  std::atomic<bool> stopping_{false};
   std::thread::id owner_tid_;
 
   //
@@ -605,37 +610,17 @@ class IO final {
       std::move_only_function<void(IO&) noexcept> task) noexcept;
 
   void PinToCpu() const;
+  Result<void> AcceptLoopImpl(Fd server_fd,
+                              std::move_only_function<void(IO&, Result<Fd>) noexcept> handler) noexcept;
 };
 
 template <class Fn>
   requires std::constructible_from<
       std::move_only_function<void(IO&, Result<Fd>) noexcept>, Fn>
 [[nodiscard]] Result<void> IO::AcceptLoop(Fd server_fd, Fn&& handler) noexcept {
-  if (stopping_) return Fail(ECANCELED, "accept_loop");
-  if (!server_fd.IsValid()) return Fail(EBADF, "accept_loop: invalid fd");
-
-  auto* state = new (std::nothrow)
-      MultishotAcceptState{std::move(server_fd), std::forward<Fn>(handler)};
-  if (!state) return Fail(ENOMEM, "accept_loop: OOM allocating state");
-  static_assert(alignof(MultishotAcceptState) >= 2,
-                "tagged pointer requires even alignment");
-
-  auto* sqe = GetSqe().value_or(nullptr);
-  if (!sqe) {
-    delete state;
-    return Fail(EAGAIN, "accept_loop: ring full");
-  }
-
-  io_uring_prep_multishot_accept(sqe, state->server_fd.Get(), nullptr, nullptr, 0);
-  if (state->server_fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
-
-  // Tag the lowest bit to indicate a MultishotAcceptState
-  uint64_t tagged_ptr = reinterpret_cast<uint64_t>(state) | 1ULL;
-  io_uring_sqe_set_data64(sqe, tagged_ptr);
-  active_multishots_.push_back(tagged_ptr);
-
-  inflight_ops_++;
-  return {};
+  return AcceptLoopImpl(std::move(server_fd),
+                        std::move_only_function<void(IO&, Result<Fd>) noexcept>(
+                            std::forward<Fn>(handler)));
 }
 
 }  // namespace tinyio

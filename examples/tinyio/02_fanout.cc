@@ -1,7 +1,7 @@
 //
 // Fan-out TCP health-checker: probe a list of hostnames concurrently and
 // report UP/DOWN with round-trip latency.
-// Demonstrates ResultGroup (fan-out/fan-in) and Semaphore throttle.
+// Demonstrates TaskGroup (fan-out/fan-in) and Semaphore throttle.
 //
 #include <chrono>
 #include <string>
@@ -15,7 +15,7 @@
 using tinyio::Fd;
 using tinyio::IO;
 using tinyio::Result;
-using tinyio::ResultGroup;
+using tinyio::TaskGroup;
 using tinyio::Semaphore;
 using tinyio::SocketAddress;
 
@@ -51,7 +51,7 @@ Result<double> probe_target(IO& io, const Target& t, Semaphore& gate) noexcept {
 
 void run_probes(IO& io) noexcept {
   Semaphore gate(io, 64);  // at most 64 probes in flight
-  ResultGroup<double> probes(io, targets.size());
+  TaskGroup<double> probes(io, targets.size());
 
   for (const auto& t : targets) {
     if (auto res = probes.spawn([&gate, &t](IO& fio) noexcept -> Result<double> {

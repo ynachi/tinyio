@@ -38,11 +38,10 @@
 #endif
 
 #if TINYIO_ASAN_ENABLED
-extern "C" void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom,
-                                               std::size_t size);
-extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save,
-                                                const void** bottom_old,
-                                                std::size_t* size_old);
+extern "C" void SanitizerStartSwitchFiber(void** fake_stack_save, const void* bottom,
+                                          std::size_t size);
+extern "C" void SanitizerFinishSwitchFiber(void* fake_stack_save, const void** bottom_old,
+                                           std::size_t* size_old);
 #endif
 
 #if TINYIO_TSAN_ENABLED
@@ -60,7 +59,7 @@ struct ToolFiberState {
   bool owns_tsan_fiber = false;
 };
 
-inline void tools_capture_current_thread(ToolFiberState& state) noexcept {
+inline void ToolsCaptureCurrentThread(ToolFiberState& state) noexcept {
 #if TINYIO_TSAN_ENABLED
   state.tsan_fiber = __tsan_get_current_fiber();
   state.owns_tsan_fiber = false;
@@ -69,7 +68,7 @@ inline void tools_capture_current_thread(ToolFiberState& state) noexcept {
 #endif
 }
 
-inline void tools_create_fiber(ToolFiberState& state) noexcept {
+inline void ToolsCreateFiber(ToolFiberState& state) noexcept {
 #if TINYIO_ASAN_ENABLED
   state.asan_fake_stack = nullptr;
 #endif
@@ -98,7 +97,7 @@ inline void ToolsBeforeSwitch(ToolFiberState& from, ToolFiberState* to_tools,
 #if TINYIO_ASAN_ENABLED
   const void* bottom = to_stack == nullptr ? nullptr : to_stack->low;
   const std::size_t size = to_stack == nullptr ? 0U : to_stack->usable_size;
-  __sanitizer_start_switch_fiber(&from.asan_fake_stack, bottom, size);
+  SanitizerStartSwitchFiber(&from.asan_fake_stack, bottom, size);
 #else
   (void)from;
   (void)to_stack;
@@ -113,9 +112,9 @@ inline void ToolsBeforeSwitch(ToolFiberState& from, ToolFiberState* to_tools,
 #endif
 }
 
-inline void ToolsAfterSwitch(ToolFiberState& current) noexcept {
+inline void ToolsAfterSwitch(const ToolFiberState& current) noexcept {
 #if TINYIO_ASAN_ENABLED
-  __sanitizer_finish_switch_fiber(current.asan_fake_stack, nullptr, nullptr);
+  SanitizerFinishSwitchFiber(current.asan_fake_stack, nullptr, nullptr);
 #else
   (void)current;
 #endif

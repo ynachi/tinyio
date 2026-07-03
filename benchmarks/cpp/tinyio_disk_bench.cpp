@@ -204,7 +204,7 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
     const auto start = Clock::now();
 
     (void)io.Spawn([&](tinyio::IO& fio) noexcept {
-        tinyio::ResultGroup<std::uint64_t> group(fio, n_fibers);
+        tinyio::TaskGroup<std::uint64_t> group(fio, n_fibers);
 
         for (std::size_t i = 0; i < n_fibers; ++i)
         {
