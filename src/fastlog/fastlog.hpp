@@ -1,7 +1,7 @@
 #pragma once
-#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <utility>
 
 #include "page_arena.hpp"
 #include "sieve.hpp"
@@ -123,8 +123,8 @@ class AddressManager {
   LogAddress tail_ = 0;
 
  public:
-  AddressManager(const FastLogSettings& settings, const LogAddress first)
-      : s_(settings), tail_(first) {}
+  AddressManager(FastLogSettings  settings, const LogAddress first)
+      : s_(std::move(settings)), tail_(first) {}
 
   [[nodiscard]] constexpr std::uint64_t PageNumberOf(const LogAddress addr) const {
     return addr >> s_.page_bits;
