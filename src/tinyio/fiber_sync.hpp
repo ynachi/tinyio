@@ -377,7 +377,7 @@ struct TaskGroup {
   }
 
  private:
-  TaskGroup<void> tg_;
+  TaskGroup<> tg_;
   std::vector<std::optional<Result<T>>> results_;
   std::size_t next_ = 0;
 };

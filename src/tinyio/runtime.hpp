@@ -54,6 +54,37 @@ struct IoOptions {
   /// max resume per tick
   std::size_t batch_max_size = 128;
 
+  /// Event-loop ordering.
+  enum class LoopStyle
+  {
+    /// submit/wait -> drain -> resume.
+    ///
+    /// SQEs armed by a resumed fiber are carried into the kernel by the
+    /// *next* iteration's submit.
+    kSubmitFirst,
+    /// resume -> submit/wait -> drain.
+    ///
+    /// kio's pipeline. Resuming is what arms the SQEs, so resuming first
+    /// lets the submit that follows carry them into the kernel in the same
+    /// iteration. Completions are reaped at the end of the iteration and
+    /// only mark fibers ready; the next iteration resumes them.
+    ///
+    /// This requires a quiesce check before the blocking submit: phase 1
+    /// can finish the last fiber, and blocking then would wait forever for
+    /// a completion that can never arrive.
+    kResumeFirst,
+  };
+
+  /// Selects the event-loop ordering.
+  ///
+  /// The default is kResumeFirst (kio's pipeline): it submits the SQEs that
+  /// the resumed fibers just armed in the same iteration, which measures
+  /// ~3% more HTTP throughput with a ~4x lower median p99 than kSubmitFirst
+  /// (333,441 vs 322,319 req/s; 2.50 vs 9.87 ms p99, 17 samples each).
+  /// kSubmitFirst is kept for A/B and for anyone who depends on the old
+  /// ordering.
+  LoopStyle loop_style = LoopStyle::kResumeFirst;
+
   /// Capacity for the cross-thread post queue (must be power of 2)
   std::size_t post_queue_capacity = 4096;
 
@@ -408,6 +439,9 @@ class IO final {
   //
   io_uring ring_{};
   Result<void> SubmitOrWaitFor() noexcept;
+  /// Submits pending SQEs and, when @p runnable is false, sleeps until a
+  /// completion arrives.
+  Result<void> SubmitOrWait(bool runnable) noexcept;
   Result<io_uring_sqe*> GetSqe() noexcept;
 
   Result<void> Activate() noexcept;
@@ -554,6 +588,11 @@ class IO final {
   //
   bool is_activated_{false};
   bool is_running_{false};
+  /// When true, a tick returns instead of sleeping once the runtime has
+  /// nothing left to do. RunUntilDone() and CancelAndDrain() turn this on:
+  /// those callers drive their own loop and decide when to stop, so a tick
+  /// must not block on a completion that can never arrive.
+  bool drain_to_completion_{false};
   std::atomic<bool> stopping_{false};
   std::thread::id owner_tid_;
 

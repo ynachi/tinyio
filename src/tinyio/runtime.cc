@@ -492,6 +492,12 @@ void IO::CancelAndDrain() noexcept {
 
   // Drain all IO completions and ready fibers. This allows cancelled IO fibers
   // to naturally wake up their sync-parked dependents.
+  //
+  // drain_to_completion_ keeps a tick from sleeping once the runtime is
+  // quiesced: the loop below is the one that decides when to stop, so a tick
+  // that blocked here would wait for a completion that can never arrive.
+  const bool prev_drain_to_completion = drain_to_completion_;
+  drain_to_completion_ = true;
   while (inflight_ops_ > 0 || !ready_queue_.Empty()) {
     if (auto res = Tick(); !res) {
       ALOG_ERROR("tick failed during cancel_and_drain: [{}] {}", res.error().op,
@@ -499,6 +505,7 @@ void IO::CancelAndDrain() noexcept {
       break;
     }
   }
+  drain_to_completion_ = prev_drain_to_completion;
 
   // Pass 2: Forcefully wake up any abandoned sync-parked fibers.
   // At this point, there are no active IO operations. Any fiber still
@@ -557,7 +564,13 @@ extern "C" [[noreturn]] void TinyioFiberEntry(
 namespace tinyio {
 Result<void> IO::SubmitOrWaitFor() noexcept {
   // Only block if we have no local work to do.
-  if (io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || !post_queue_.Empty()) {
+  const bool runnable =
+      io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || !post_queue_.Empty();
+  return SubmitOrWait(runnable);
+}
+
+Result<void> IO::SubmitOrWait(const bool runnable) noexcept {
+  if (runnable) {
     int ret = 0;
     if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN) {
       ret = io_uring_submit_and_get_events(&ring_);
@@ -776,6 +789,49 @@ void IO::ResumeReadyFibers() {
   }
 }
 Result<void> IO::Tick() noexcept {
+  if (opts_.loop_style == IoOptions::LoopStyle::kResumeFirst) {
+    // ---- kio-style pipeline: resume -> submit -> reap ----
+    //
+    // Phase 1: harvest tasks posted from remote threads, then resume the
+    // ready fibers. Resuming is what arms the SQEs, so doing it first
+    // means the submit below carries them into the kernel in this very
+    // iteration instead of the next one.
+    DrainRemote();
+    ResumeReadyFibers();
+
+    // kio's quiesce check. kio verifies that the loop is not about to
+    // sleep with zero outstanding operations BEFORE it blocks in
+    // submit_and_wait -- otherwise it waits for a completion that can
+    // never arrive. The same hazard exists here because phase 1 may have
+    // just finished the last fiber.
+    if (drain_to_completion_ && !HasLiveFibers() && inflight_ops_ == 0 &&
+        ready_queue_.Empty() && post_queue_.Empty()) {
+      return {};
+    }
+
+    // Phase 2: submit. Sleep only when there is genuinely nothing runnable.
+    const bool runnable = io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() ||
+                          !post_queue_.Empty();
+    if (auto ret = SubmitOrWait(runnable); !ret) {
+      auto err = ret.error();
+      ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op,
+                 err.ErrorCode().message());
+    }
+
+    // Phase 3: reap. Completions only mark fibers ready; the next
+    // iteration's phase 1 resumes them.
+    auto count =
+        TRY_LOG_ERR(DrainCompletions(), "current tick run failed to drain completions");
+    ALOG_DEBUG("drained {} io completions", count);
+
+    // Cancel overdue timed ops. Runs after drain_completions() on purpose:
+    // ops that completed in this batch have already been disarmed, so we
+    // never cancel an op whose result the fiber is about to consume.
+    ProcessExpiredTimers();
+
+    return {};
+  }
+
   // Flush SQEs and/or wait for CQEs.
   // If ready_queue_ is empty, this safely drops the CPU to 0% and
   // sleeps the thread until the kernel wakes us via a CQE.
@@ -877,6 +933,10 @@ void IO::RunUntilDone() noexcept {
     return;
   }
 
+  // The loop below decides when to stop, so a tick must never sleep once
+  // the runtime is quiesced.
+  drain_to_completion_ = true;
+
   // Also drain the cross-thread post queue: tasks posted before run_until_done()
   // is called would be silently dropped if we only checked live_fibers_.
   // inflight_ops_ tracks user I/O ops and cancel SQEs only (the wake_fd_
@@ -892,6 +952,7 @@ void IO::RunUntilDone() noexcept {
     }
   }
 
+  drain_to_completion_ = false;
   is_running_ = false;
 }
 //
