@@ -50,7 +50,7 @@ struct Latch {
       waiters_.PushBack(self);
       io_.ParkRunning();
       if (io_.Stopping()) {
-        return Fail(ECANCELED, "latch.wait");
+        return Error::fail_errno(ECANCELED, "latch.wait");
       }
     }
     return {};
@@ -58,7 +58,7 @@ struct Latch {
 
   ~Latch() {
     if (!waiters_.Empty()) {
-      ALOG_FATAL("Latch destroyed with fibers waiting");
+      ELOGFMT(FATAL, "Latch destroyed with fibers waiting");
       std::abort();
     }
   }
@@ -103,7 +103,7 @@ struct Semaphore {
       waiters_.PushBack(self);
       io_.ParkRunning();
       if (io_.Stopping()) {
-        return Fail(ECANCELED, "semaphore.acquire");
+        return Error::fail_errno(ECANCELED, "semaphore.acquire");
       }
     }
     return {};
@@ -129,7 +129,7 @@ struct Semaphore {
 
   ~Semaphore() {
     if (!waiters_.Empty()) {
-      ALOG_FATAL("Semaphore destroyed with fibers waiting");
+      ELOGFMT(FATAL, "Semaphore destroyed with fibers waiting");
       std::abort();
     }
   }
@@ -168,7 +168,7 @@ struct Mutex {
     waiters_.PushBack(self);
     io_.ParkRunning();
     if (io_.Stopping()) {
-      return Fail(ECANCELED, "mutex.lock");
+      return Error::fail_errno(ECANCELED, "mutex.lock");
     }
     return {};
   }
@@ -222,7 +222,7 @@ struct Mutex {
 
   ~Mutex() {
     if (!waiters_.Empty()) {
-      ALOG_FATAL("Mutex destroyed with fibers waiting");
+      ELOGFMT(FATAL, "Mutex destroyed with fibers waiting");
       std::abort();
     }
   }
@@ -283,7 +283,7 @@ struct TaskGroup<void> {
       waiters_.PushBack(self);
       io_.ParkRunning();
       if (io_.Stopping()) {
-        return Fail(ECANCELED, "taskgroup.wait");
+        return Error::fail_errno(ECANCELED, "taskgroup.wait");
       }
     }
     return {};
@@ -294,8 +294,8 @@ struct TaskGroup<void> {
     // later invoke on_task_done() through a dangling `this` — a UAF inside
     // a fiber callback is strictly worse than aborting here.
     if (active_tasks_ != 0) {
-      ALOG_FATAL("TaskGroup destroyed with {} live task(s); call wait() first",
-                 active_tasks_);
+      ELOGFMT(FATAL, "TaskGroup destroyed with {} live task(s); call wait() first",
+              active_tasks_);
       std::abort();
     }
   }

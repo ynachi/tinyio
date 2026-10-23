@@ -1,28 +1,23 @@
 #include <chrono>
 #include <iostream>
 
+#include <ylt/easylog.hpp>
+
 #include "tinyio/error.hpp"
-#include "tinyio/logger.hpp"
 
 using namespace tinyio;
 
-// Helper to disable logging output dynamically during benchmark
-namespace tinyio {
-extern bool g_log_disabled_for_bench;
-}
-bool tinyio::g_log_disabled_for_bench = false;
-
 inline Result<int> dummy_success() { return 42; }
 
-inline Result<int> dummy_error() { return Fail(EINVAL, "dummy"); }
+inline Result<int> dummy_error() { return Error::fail_errno(EINVAL, "dummy"); }
 
 inline Result<int> test_try_success() {
-  auto n = TRY(dummy_success());
+  TRY(n, dummy_success());
   return n;
 }
 
 inline Result<int> test_try_log_success() {
-  auto n = TRY_LOG_ERR(dummy_success(), "failed");
+  TRY_LOG_ERR(n, dummy_success(), "failed");
   return n;
 }
 
@@ -43,19 +38,19 @@ inline Result<int> test_go_style_log_success() {
   auto res = dummy_success();
   if (!res) {
     const auto err = res.error();
-    ALOG_ERROR("{} failed: code={} failed", err.op, err.code);
+    ELOGFMT(ERROR, "{} failed: code={} failed", err.context(), err.value());
     return std::unexpected(err);
   }
   return *res;
 }
 
 inline Result<int> test_try_error() {
-  auto n = TRY(dummy_error());
+  TRY(n, dummy_error());
   return n;
 }
 
 inline Result<int> test_try_log_error() {
-  auto n = TRY_LOG_ERR(dummy_error(), "failed");
+  TRY_LOG_ERR(n, dummy_error(), "failed");
   return n;
 }
 
@@ -71,7 +66,7 @@ inline Result<int> test_go_style_log_error() {
   auto res = dummy_error();
   if (!res) {
     const auto err = res.error();
-    ALOG_ERROR("{} failed: code={} failed", err.op, err.code);
+    ELOGFMT(ERROR, "{} failed: code={} failed", err.context(), err.value());
     return std::unexpected(err);
   }
   return *res;

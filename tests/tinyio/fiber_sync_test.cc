@@ -330,9 +330,8 @@ TEST_F(FiberSyncTest, TaskGroupResultTaskError) {
     TaskGroup<int> group(rt, 2);
 
     group.Spawn([](IO&) noexcept -> Result<int> { return 42; });
-    group.Spawn([](IO&) noexcept -> Result<int> {
-      return std::unexpected(Error{EINVAL, "test-op"});
-    });
+    group.Spawn(
+        [](IO&) noexcept -> Result<int> { return Error::fail_errno(EINVAL, "test-op"); });
 
     (void)group.Wait();
 
@@ -341,7 +340,7 @@ TEST_F(FiberSyncTest, TaskGroupResultTaskError) {
     EXPECT_EQ(r[0]->value(), 42);
 
     ASSERT_TRUE(r[1].has_value() && !r[1]->has_value());
-    EXPECT_EQ(r[1]->error().code, EINVAL);
+    EXPECT_EQ(r[1]->error().value(), EINVAL);
   });
 
   io_.RunUntilDone();

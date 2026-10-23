@@ -6,16 +6,18 @@
 #include <memory>
 #include <utility>
 
-#include "libs/concurrentqueue.hpp"
+#include <ylt/util/concurrentqueue.h>
 
 namespace tinyio::detail {
 
 /// A bounded, lock-free Multi-Producer Single-Consumer (MPSC) queue.
 /// Wait-free for the consumer, lock-free for producers.
-/// Wraps moodycamel::ConcurrentQueue.
+/// Wraps moodycamel::ConcurrentQueue, taken from YLT: easylog pulls the same
+/// header in, and two copies of it cannot live in one translation unit.
+/// YLT keeps moodycamel under ylt::detail, hence the qualified name.
 template <typename T>
 class MpscQueue {
-  moodycamel::ConcurrentQueue<T> queue_;
+  ylt::detail::moodycamel::ConcurrentQueue<T> queue_;
 
  public:
   explicit MpscQueue(const size_t capacity = 4096) : queue_(capacity) {}

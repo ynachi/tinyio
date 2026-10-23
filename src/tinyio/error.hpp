@@ -1,33 +1,88 @@
 #pragma once
+
 #include <expected>
 #include <format>
+#include <ostream>
+#include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
+#include <utility>
+
+#include "logging.hpp"
 
 namespace tinyio {
+// A deliberately small error value. `operation` is diagnostic context and
+// must have static storage duration; use a string literal.
 struct Error {
-  int code = 0;
-  const char* op = "";
+  std::error_code code{};
+  const char* operation = "";
 
-  /// Returns this error as a generic POSIX std::error_code.
-  [[nodiscard]] std::error_code ErrorCode() const noexcept {
-    return {code, std::generic_category()};
+  /// Build an error from a positive errno value (POSIX category).
+  [[nodiscard]] static Error from_errno(const int value,
+                                        const char* operation = "") noexcept {
+    return {.code = {value, std::generic_category()},
+            .operation = operation != nullptr ? operation : ""};
   }
 
-  /// \brief Construct an \c Error from a positive errno value.
-  /// \param e POSIX errno (positive).
-  /// \param ctx Static context string (must outlive the Error; use a literal).
-  [[nodiscard]] static constexpr Error FromErrno(const int e,
-                                                 const char* ctx = "") noexcept {
-    return Error{.code = e, .op = ctx != nullptr ? ctx : ""};
+  /// Build an error from a std::errc value.
+  [[nodiscard]] static Error from_errc(const std::errc value,
+                                       const char* operation = "") noexcept {
+    return {.code = std::make_error_code(value),
+            .operation = operation != nullptr ? operation : ""};
   }
 
-  /// Returns true when this object contains a non-zero errno value.
-  [[nodiscard]] explicit operator bool() const noexcept { return code != 0; }
+  /// Build a failed Result from a std::errc value.
+  [[nodiscard]] static std::unexpected<Error> fail_errc(
+      const std::errc value, const char* operation = "") noexcept {
+    return std::unexpected(from_errc(value, operation));
+  }
 
-  /// Returns the system error message string for this error.
-  [[nodiscard]] std::string Message() const { return ErrorCode().message(); }
+  /// Build a failed Result from a positive errno value.
+  [[nodiscard]] static std::unexpected<Error> fail_errno(
+      const int code, const char* operation = "") noexcept {
+    return std::unexpected(from_errno(code, operation));
+  }
+
+  /// True when this object carries a failure.
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return static_cast<bool>(code);
+  }
+
+  /// The raw error value: the errno for from_errno, the errc value for
+  /// from_errc.
+  [[nodiscard]] int value() const noexcept { return code.value(); }
+
+  /// The system message for this error.
+  [[nodiscard]] std::string message() const { return code.message(); }
+
+  /// The diagnostic context ("operation") this error was raised with.
+  [[nodiscard]] std::string_view context() const noexcept {
+    return operation != nullptr ? operation : "";
+  }
+
+  [[nodiscard]] bool operator==(const std::error_code& rhs) const noexcept {
+    return code == rhs;
+  }
+
+  // errc comparison without spelling make_error_code at every call site:
+  // if (res.error() == std::errc::timed_out).
+  [[nodiscard]] bool operator==(const std::errc e) const noexcept {
+    return code == std::make_error_code(e);
+  }
+
+  [[nodiscard]] bool operator==(const Error& rhs) const noexcept {
+    return code == rhs.code;
+  }
 };
 
+template <typename T>
+using Result = std::expected<T, Error>;
+
+/// Stream an error as "<message> (<value>) [<context>]".
+inline std::ostream& operator<<(std::ostream& os, const Error& err) {
+  return os << err.message() << " (" << err.value() << ") [" << err.context() << "]";
+}
 }  // namespace tinyio
 
 template <>
@@ -35,76 +90,94 @@ struct std::formatter<tinyio::Error> : std::formatter<std::string> {
   template <typename FormatContext>
   auto format(const tinyio::Error& err, FormatContext& ctx) const {
     return std::formatter<std::string>::format(
-        std::format("{} ({})", err.Message(), err.code), ctx);
+        std::format("{} ({}) [{}]", err.message(), err.value(), err.context()), ctx);
   }
 };
 
-namespace tinyio {
-
-/// \brief Equality compares only the code (context is diagnostic, not identity).
-[[nodiscard]] constexpr bool operator==(const Error& a, const Error& b) noexcept {
-  return a.code == b.code;
-}
-
-template <class T>
-using Result = std::expected<T, Error>;
-
-/// \brief Convenience: build an error-state \c Result payload.
-/// \param code Positive errno-style code.
-/// \param ctx  Static context string.
-[[nodiscard]] inline std::unexpected<Error> Fail(const int code,
-                                                 const char* ctx = "") noexcept {
-  return std::unexpected(Error::FromErrno(code, ctx));
-}
-}  // namespace tinyio
-
 namespace tinyio::detail {
 
-template <class T, class E>
-decltype(auto) UnwrapExpected(std::expected<T, E>& result) noexcept {
-  if constexpr (!std::is_void_v<T>) {
-    return T(std::move(*result));
+/// Move the value out of an expected; yields nothing when it holds void.
+template <class Exp>
+auto UnwrapExpected(Exp&& exp) noexcept {
+  using ValueT = std::decay_t<Exp>::value_type;
+  if constexpr (std::is_void_v<ValueT>) {
+    return;
+  } else {
+    return std::move(*std::forward<Exp>(exp));
   }
 }
-
 }  // namespace tinyio::detail
 
 // ---------------------------------------------------------------------------
-// Propagation macros (GNU statement-expression; Linux-first, GCC/Clang only).
+// Propagation macros.
 //
-// __extension__ marks the statement expression as a deliberate GNU
-// extension, so -Wpedantic (and therefore -Werror) does not reject it. The
-// build applies the same strict warning set as the rest of the project.
+// These are plain if-statements, not GNU statement expressions: every
+// expansion is standard C++ and works under -Wpedantic.
+//
+// ARGUMENT LIFETIME: pass an RVALUE. The expansion binds auto&& to the
+// argument and then moves out of it -- handed an lvalue, the macro silently
+// empties the caller's object (the expected keeps has_value() == true with
+// a moved-from value). `TRY(n, helper(1));`, not `TRY(n, member_result);`.
 // ---------------------------------------------------------------------------
 
-/// \brief Rust `?`-style propagation.
-///
-/// Evaluates \c expr (a \c Result<T>); on error, returns the error from the
-/// enclosing function; on success, yields the unwrapped \c T value.
+#define TINYIO_DETAIL_CAT_I(a, b) a##b
+#define TINYIO_DETAIL_CAT(a, b) TINYIO_DETAIL_CAT_I(a, b)
+
+/// \brief Bind the value of a Result and propagate the error on failure.
 ///
 /// \code
-///   auto n = TRY(io.read(fd, buf));   // n is size_t on success
-///   TRY(io.sleep_for(10ms));          // Result<void>: just propagate
+///   TRY(n, io.Read(fd, buf));   // n is the unwrapped value
+///   TRY_VOID(io.Close(fd));     // Result<void>: just propagate
 /// \endcode
-#define TRY(EXPR)                                  \
-  __extension__({                                  \
-    auto _tinyio_res = (EXPR);                     \
-    if (!_tinyio_res) {                            \
-      return std::unexpected(_tinyio_res.error()); \
-    }                                              \
-    ::tinyio::detail::UnwrapExpected(_tinyio_res); \
-  })
-/// \brief Like \c UX_TRY but logs error before propagating.
+#define TRY(var, ...) TRY_IMPL(var, __COUNTER__, __VA_ARGS__)
+
+#define TRY_IMPL(var, id, ...)                                                      \
+  auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (__VA_ARGS__);                       \
+  if (!TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]]                \
+    return std::unexpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)).error()); \
+  auto var =                                                                        \
+      ::tinyio::detail::UnwrapExpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)))
+
+/// \brief Propagate the error of a Result<void>; binds nothing.
+///
+/// A Result<void> cannot be bound to a variable, so every void operation
+/// (close, fsync, drain, ...) needs this form.
+#define TRY_VOID(...) TRY_VOID_IMPL(__COUNTER__, __VA_ARGS__)
+
+#define TRY_VOID_IMPL(id, ...)                                       \
+  if (auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (__VA_ARGS__);    \
+      !TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] \
+  return std::unexpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)).error())
+
+/// \brief Like \c TRY but logs the error before propagating it.
+///
+/// \param var The variable the value is bound to.
 /// \param expr A \c Result<T>.
-/// \param msg  A \c const \c char* description logged on failure.
-#define TRY_LOG_ERR(EXPR, FMT, ...)                                                      \
-  __extension__({                                                                        \
-    auto _tinyio_res = (EXPR);                                                           \
-    if (!_tinyio_res) {                                                                  \
-      const auto _tinyio_err = _tinyio_res.error();                                      \
-      ALOG_ERROR("{} failed: code={} " FMT, _tinyio_err.op ? _tinyio_err.op : "unknown", \
-                 _tinyio_err.code __VA_OPT__(, ) __VA_ARGS__);                           \
-      return std::unexpected(_tinyio_err);                                               \
-    }                                                                                    \
-    ::tinyio::detail::UnwrapExpected(_tinyio_res);                                       \
-  })
+/// \param fmt  A format string for the context of the failure; extra
+///              arguments are appended to it.
+#define TRY_LOG_ERR(var, expr, fmt, ...) \
+  TRY_LOG_ERR_IMPL(var, __COUNTER__, expr, fmt, __VA_ARGS__)
+
+#define TRY_LOG_ERR_IMPL(var, id, expr, fmt, ...)                          \
+  auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (expr);                     \
+  if (!TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] {     \
+    const auto& _tinyio_err = TINYIO_DETAIL_CAT(_tinyio_try_, id).error(); \
+    ELOGFMT(ERROR, "{} failed: code={} " fmt, _tinyio_err.context(),       \
+            _tinyio_err.value() __VA_OPT__(, ) __VA_ARGS__);               \
+    return std::unexpected(_tinyio_err);                                   \
+  }                                                                        \
+  auto var =                                                               \
+      ::tinyio::detail::UnwrapExpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)))
+
+/// \brief Like \c TRY_VOID but logs the error before propagating it.
+#define TRY_LOG_ERR_VOID(expr, fmt, ...) \
+  TRY_LOG_ERR_VOID_IMPL(__COUNTER__, expr, fmt, __VA_ARGS__)
+
+#define TRY_LOG_ERR_VOID_IMPL(id, expr, fmt, ...)                          \
+  if (auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (expr);                 \
+      !TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] {     \
+    const auto& _tinyio_err = TINYIO_DETAIL_CAT(_tinyio_try_, id).error(); \
+    ELOGFMT(ERROR, "{} failed: code={} " fmt, _tinyio_err.context(),       \
+            _tinyio_err.value() __VA_OPT__(, ) __VA_ARGS__);               \
+    return std::unexpected(_tinyio_err);                                   \
+  }

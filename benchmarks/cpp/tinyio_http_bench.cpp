@@ -10,8 +10,8 @@
 #include <thread>
 #include <vector>
 
-#include <tinyio/logger.hpp>
 #include <tinyio/tcp_listener.hpp>
+#include <ylt/easylog.hpp>
 
 #include "tinyio/runtime.hpp"
 
@@ -74,12 +74,12 @@ Options parse_args(int argc, char** argv) {
   return opts;
 }
 
-tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd,
+tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::UniqueFd& fd,
                                std::span<const std::byte> data) {
   while (!data.empty()) {
-    auto written = TRY(fio.Write(fd, data));
+    TRY(written, fio.Write(fd, data));
     if (written == 0) {
-      return tinyio::Fail(EIO, "write");
+      return tinyio::Error::fail_errno(EIO, "write");
     }
     data = data.subspan(written);
   }
@@ -87,7 +87,7 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd,
 }
 
 void handle_client(tinyio::IO& fio, int raw_fd) {
-  tinyio::Fd client_fd{raw_fd};
+  tinyio::UniqueFd client_fd{raw_fd};
   std::byte buf[4096];
   const auto response =
       std::as_bytes(std::span{kHttpResponse.data(), kHttpResponse.size()});
@@ -108,17 +108,16 @@ void handle_client(tinyio::IO& fio, int raw_fd) {
 void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size) {
   auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
   if (!listener) {
-    std::cerr << "bind failed: " << listener.error().ErrorCode().message() << '\n';
+    std::cerr << "bind failed: " << listener.error().message() << '\n';
     return;
   }
 
-  tinyio::Fd server_fd = std::move(*listener);
+  tinyio::UniqueFd server_fd = std::move(*listener);
   while (!g_stop_requested.load(std::memory_order_relaxed)) {
     auto client_res = worker.Accept(server_fd);
     if (!client_res) {
       if (!g_stop_requested.load(std::memory_order_relaxed)) {
-        std::cerr << "accept failed: " << client_res.error().ErrorCode().message()
-                  << '\n';
+        std::cerr << "accept failed: " << client_res.error().message() << '\n';
       }
       return;
     }
@@ -137,7 +136,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGPIPE, SIG_IGN);
 
-    tinyio::log::SetLevel(tinyio::log::Level::Disabled);
+    easylog::set_console(false);
 
     std::vector<std::jthread> threads;
     std::vector<std::stop_source> stop_sources;

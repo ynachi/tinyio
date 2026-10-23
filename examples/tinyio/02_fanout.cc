@@ -12,12 +12,12 @@
 
 #include "tinyio/tinyio.hpp"
 
-using tinyio::Fd;
 using tinyio::IO;
 using tinyio::Result;
 using tinyio::Semaphore;
 using tinyio::SocketAddress;
 using tinyio::TaskGroup;
+using tinyio::UniqueFd;
 
 using namespace std::chrono_literals;
 
@@ -32,18 +32,18 @@ struct Target {
 std::vector<Target> targets;
 
 Result<double> probe_target(IO& io, const Target& t, Semaphore& gate) noexcept {
-  TRY_LOG_ERR(gate.Acquire(), "semaphore acquire");
+  TRY_LOG_ERR_VOID(gate.Acquire(), "semaphore acquire");
   const auto t0 = std::chrono::steady_clock::now();
-  const Fd sock{::socket(t.addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+  const UniqueFd sock{::socket(t.addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0)};
 
-  if (!sock.IsValid()) {
+  if (!sock.Valid()) {
     gate.Release();
-    return tinyio::Fail(errno, "socket");
+    return tinyio::Error::fail_errno(errno, "socket");
   }
 
   const auto r = io.Connect(sock, t.addr, 2s);
   gate.Release();
-  TRY_LOG_ERR(r, "connect");
+  TRY_LOG_ERR_VOID(r, "connect");
 
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
       .count();
@@ -58,21 +58,23 @@ void run_probes(IO& io) noexcept {
           return probe_target(fio, t, gate);
         });
         !res) {
-      ALOG_ERROR("failed to spawn probe for {}: {}", t.host, res.error());
+      ELOGFMT(ERROR, "failed to spawn probe for {}: [{}] {}", t.host,
+              res.error().context(), res.error().message());
     }
   }
 
   // everyone wait here, the line completed before we move on
   if (auto res = probes.Wait(); !res) {
-    ALOG_ERROR("probe group interrupted: {}", res.error());
+    ELOGFMT(ERROR, "probe group interrupted: [{}] {}", res.error().context(),
+            res.error().message());
   }
 
   for (size_t i = 0; i < targets.size(); ++i) {
     if (const auto& slot = probes.Results()[i]; slot && slot->has_value()) {
-      ALOG_INFO("{:<24} UP    {:>6.1f} ms", targets[i].host, slot->value());
+      ELOGFMT(INFO, "{:<24} UP    {:>6.1f} ms", targets[i].host, slot->value());
     } else if (slot) {
-      ALOG_INFO("{:<24} DOWN  ({})", targets[i].host,
-                slot->error().code == ETIMEDOUT ? "timeout" : "refused");
+      ELOGFMT(INFO, "{:<24} DOWN  ({})", targets[i].host,
+              slot->error().value() == ETIMEDOUT ? "timeout" : "refused");
     }
   }
 }
@@ -82,7 +84,7 @@ int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   if (argc < 2) {
-    ALOG_ERROR("usage: {} [flags] website1.com website2.com...", argv[0]);
+    ELOGFMT(ERROR, "usage: {} [flags] website1.com website2.com...", argv[0]);
     return 1;
   }
 
@@ -91,23 +93,24 @@ int main(int argc, char** argv) {
     std::string host = argv[i];
     auto a = tinyio::ResolveIp(host, static_cast<uint16_t>(FLAGS_port));
     if (!a) {
-      ALOG_ERROR("{:<24} resolve failed ({})", host, a.error().code);
+      ELOGFMT(ERROR, "{:<24} resolve failed ({})", host, a.error().value());
       continue;
     }
     targets.push_back({std::move(host), *a});
   }
 
   if (targets.empty()) {
-    ALOG_ERROR("no valid targets to probe");
+    ELOGFMT(ERROR, "no valid targets to probe");
     return 1;
   }
 
-  ALOG_INFO("probing {} target(s) on port {}", targets.size(), FLAGS_port);
+  ELOGFMT(INFO, "probing {} target(s) on port {}", targets.size(), FLAGS_port);
 
   IO io{0, tinyio::IoOptions{}, {}};
 
   if (auto res = io.Spawn(run_probes); !res.has_value()) {
-    ALOG_ERROR("failed to spawn: {}", res.error());
+    ELOGFMT(ERROR, "failed to spawn: [{}] {}", res.error().context(),
+            res.error().message());
     return 1;
   }
 

@@ -9,7 +9,7 @@ struct TcpListener {
   /// @param addr The SocketAddress to bind to (IPv4 or IPv6)
   /// @param backlog Pending connection queue size (default: 4096)
   /// @return Result<Fd> with the listening socket or error
-  static Result<Fd> Bind(const SocketAddress& addr, int backlog = 4096);
+  static Result<UniqueFd> Bind(const SocketAddress& addr, int backlog = 4096);
 
   /// @brief Convenience overload that automatically detects IPv4 vs IPv6.
   /// @param port Port number in host byte order
@@ -17,6 +17,7 @@ struct TcpListener {
   ///           Defaults to nullptr (INADDR_ANY / 0.0.0.0).
   /// @param backlog Pending connection queue size
   /// @return Result<Fd> with the listening socket or error
-  static Result<Fd> Bind(uint16_t port, const char* ip = nullptr, int backlog = 4096);
+  static Result<UniqueFd> Bind(uint16_t port, const char* ip = nullptr,
+                               int backlog = 4096);
 };
 }  // namespace tinyio

@@ -35,11 +35,12 @@ constexpr std::string_view kHttpResponse =
     "Hello, io_uring!";
 
 // Write the whole buffer, retrying on partial writes
-static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> data) {
+static Result<void> write_all(IO& fio, const UniqueFd& fd,
+                              std::span<const std::byte> data) {
   while (!data.empty()) {
-    const auto written = TRY(fio.Write(fd, data));
+    TRY(written, fio.Write(fd, data));
     if (written == 0) {
-      return Fail(EIO, "write");
+      return Error::fail_errno(EIO, "write");
     }
     data = data.subspan(written);
   }
@@ -47,12 +48,11 @@ static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> 
 }
 
 // Handle a single client connection
-static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
+static Result<void> handle_client(IO& fio, UniqueFd client_fd) noexcept {
   std::byte buf[1024];
 
   while (true) {
-    auto r_n =
-        TRY_LOG_ERR(fio.Read(client_fd, std::span{buf}), "failed to read from client");
+    TRY_LOG_ERR(r_n, fio.Read(client_fd, std::span{buf}), "failed to read from client");
 
     if (r_n == 0) {
       break;
@@ -62,7 +62,8 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
                             kHttpResponse.size());
 
     if (auto res = write_all(fio, client_fd, out_buf); !res) {
-      ALOG_ERROR("failed to write response: {}", res.error());
+      ELOGFMT(ERROR, "failed to write response: [{}] {}", res.error().context(),
+              res.error().message());
       break;
     }
   }
@@ -72,22 +73,23 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
 
 // Accept incoming connections on a single worker
 static Result<void> server_loop(IO& fio, uint16_t port) {
-  auto server_fd =
-      TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
+  TRY_LOG_ERR(server_fd, TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
 
-  ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.Id(), port);
+  ELOGFMT(INFO, "[Worker {}] Listening on http://0.0.0.0:{}", fio.Id(), port);
 
   return fio.AcceptLoop(
-      std::move(server_fd), [](IO& worker_fio, Result<Fd> client_fd_res) noexcept {
+      std::move(server_fd), [](IO& worker_fio, Result<UniqueFd> client_fd_res) noexcept {
         if (!client_fd_res) {
-          ALOG_ERROR("Accept failed: {}", client_fd_res.error());
+          ELOGFMT(ERROR, "Accept failed: [{}] {}", client_fd_res.error().context(),
+                  client_fd_res.error().message());
           return;
         }
 
         (void)worker_fio.Spawn(
             [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
               if (auto res = handle_client(client_fio, std::move(client_fd)); !res) {
-                ALOG_ERROR("Client handler failed: {}", res.error());
+                ELOGFMT(ERROR, "Client handler failed: [{}] {}", res.error().context(),
+                        res.error().message());
               }
             });
       });
@@ -95,7 +97,7 @@ static Result<void> server_loop(IO& fio, uint16_t port) {
 
 int main() {
   // Update ALOG namespace based on new logging
-  tinyio::log::SetLevel(log::Level::Disabled);
+  easylog::set_console(false);
 
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
@@ -124,7 +126,8 @@ int main() {
       // Spawn the initial accept loop fiber onto this worker
       (void)worker.Spawn([st](IO& fio) noexcept {
         if (auto res = server_loop(fio, port); !res) {
-          ALOG_ERROR("Server loop failed: {}", res.error());
+          ELOGFMT(ERROR, "Server loop failed: [{}] {}", res.error().context(),
+                  res.error().message());
         }
       });
 

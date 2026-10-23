@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <utility>
 
-#include "logger.hpp"
+#include <ylt/easylog.hpp>
 
 namespace tinyio {
 FixedBuffer::FixedBuffer(FixedBuffer&& other) noexcept
@@ -52,7 +52,7 @@ FixedBufferPool::Bucket::Bucket(const size_t size, const size_t count,
 [[nodiscard]] Result<uint32_t> FixedBufferPool::Bucket::Pop() noexcept {
   if (free_stack.empty()) [[unlikely]] {
     // resize is not allowed
-    return Fail(EAGAIN, "fixed_buffer_pool.pop");
+    return Error::fail_errno(EAGAIN, "fixed_buffer_pool.pop");
   }
   const uint32_t idx = free_stack.back();
   free_stack.pop_back();
@@ -90,11 +90,11 @@ FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs) {
     current_global_index += static_cast<uint32_t>(config.count);
   }
 
-  ALOG_INFO("MultiSizeFixedBufferPool: {} buckets, {} total slots, {} MB allocated",
-            buckets_.size(), global_iovecs_.size(),
-            std::ranges::fold_left(configs, 0ull, [](size_t acc, const auto& c) {
-              return acc + c.size * c.count;
-            }) / (1024 * 1024));
+  ELOGFMT(INFO, "MultiSizeFixedBufferPool: {} buckets, {} total slots, {} MB allocated",
+          buckets_.size(), global_iovecs_.size(),
+          std::ranges::fold_left(configs, 0ull, [](size_t acc, const auto& c) {
+            return acc + c.size * c.count;
+          }) / (1024 * 1024));
 }
 
 [[nodiscard]] Result<FixedBuffer> FixedBufferPool::Take(const size_t size) noexcept {
@@ -102,7 +102,7 @@ FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs) {
   const auto it = std::ranges::lower_bound(buckets_, size, {}, &Bucket::slot_size);
 
   if (it == buckets_.end()) [[unlikely]] {
-    return Fail(ENOMEM, "fixed_buffer_pool.take");
+    return Error::fail_errno(ENOMEM, "fixed_buffer_pool.take");
   }
 
   Result<uint32_t> idx_res = it->Pop();

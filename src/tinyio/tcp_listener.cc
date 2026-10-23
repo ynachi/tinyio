@@ -5,15 +5,15 @@
 #include "error.hpp"
 
 namespace tinyio {
-Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog) {
+Result<UniqueFd> TcpListener::Bind(const SocketAddress& addr, int backlog) {
   // Create the raw socket
   const int raw_fd = ::socket(addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (raw_fd < 0) {
-    return Fail(errno, "socket");
+    return Error::fail_errno(errno, "socket");
   }
 
   // Immediately wrap in your RAII Fd primitive
-  Fd sock{raw_fd};
+  UniqueFd sock{raw_fd};
 
   // Reuse your variadic SetOptions!
   // Note: TCP_NODELAY set on a listening socket is inherited by accepted clients in
@@ -26,18 +26,19 @@ Result<Fd> TcpListener::Bind(const SocketAddress& addr, int backlog) {
 
   // Explicit bind
   if (::bind(sock.Get(), addr.Get(), addr.addrlen) < 0) {
-    return Fail(errno, "bind");
+    return Error::fail_errno(errno, "bind");
   }
 
   // Start listening
   if (::listen(sock.Get(), backlog) < 0) {
-    return Fail(errno, "listen");
+    return Error::fail_errno(errno, "listen");
   }
 
   return sock;
 }
 
-Result<Fd> TcpListener::Bind(const uint16_t port, const char* ip, const int backlog) {
+Result<UniqueFd> TcpListener::Bind(const uint16_t port, const char* ip,
+                                   const int backlog) {
   SocketAddress addr;
 
   if (ip != nullptr && std::string_view(ip).find(':') != std::string_view::npos) {

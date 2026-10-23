@@ -34,6 +34,7 @@ option(TINYIO_BUILD_PHOTON_BENCH "Build the Photon network benchmarks" OFF)
 option(TINYIO_BUILD_GFLAGS_BENCH "Build the gflags network benchmark" OFF)
 option(TINYIO_USE_MIMALLOC "Link mimalloc as the global allocator" OFF)
 option(TINYIO_FETCH_LIBURING "Build a pinned liburing instead of the system one" ON)
+option(TINYIO_USE_SYSTEM_FMT "Let easylog use the system fmt instead of pinning it to std::format" OFF)
 set(TINYIO_SANITIZER "none" CACHE STRING "none | address (ASan+UBSan) | thread (TSan)")
 set_property(CACHE TINYIO_SANITIZER PROPERTY STRINGS none address thread)
 option(ENABLE_CLANG_TIDY "Run clang-tidy during compilation" OFF)
@@ -67,6 +68,7 @@ include(TinyioWarnings)
 include(TinyioDependencies)
 include(TinyioSanitizers)
 include(TinyioHelpers)
+include(TinyioStacktrace)
 
 # add_tinyio_lib() and the install/export rules for the library.
 include(TinyioBuildUtils)
@@ -74,8 +76,15 @@ include(TinyioBuildUtils)
 tinyio_configure_dependencies()
 tinyio_configure_sanitizers()
 tinyio_configure_warnings()
+tinyio_configure_stacktrace()
 
 include_directories(${CMAKE_SOURCE_DIR})
+
+# easylog prints a stack trace on a fatal record. Resolving the addresses in
+# it needs the executable's symbols to be in the dynamic symbol table, so every
+# executable is linked with -rdynamic. Without it a crash prints bare
+# addresses and the trace is close to useless.
+set(CMAKE_ENABLE_EXPORTS ON)
 
 # The library itself: src/tinyio/CMakeLists.txt defines tinyio_static /
 # tinyio_shared and the Tinyio::tinyio alias, and owns the install/export

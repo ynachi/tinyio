@@ -13,8 +13,8 @@
 #include <thread>
 #include <vector>
 
-#include <tinyio/logger.hpp>
 #include <tinyio/runtime.hpp>
+#include <ylt/easylog.hpp>
 
 using namespace std::chrono_literals;
 
@@ -132,7 +132,7 @@ static bool test_post_while_running() {
 }
 
 int main() {
-  tinyio::log::SetLevel(tinyio::log::Level::Disabled);
+  easylog::set_console(false);
 
   bool ok = true;
   ok &= test_post_before_run();

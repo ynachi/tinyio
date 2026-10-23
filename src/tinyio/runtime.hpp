@@ -19,7 +19,7 @@
 #include "detail/timer_wheel.hpp"
 #include "error.hpp"
 #include "fd.hpp"
-#include "logger.hpp"
+#include "logging.hpp"
 
 namespace tinyio {
 
@@ -160,9 +160,9 @@ class IO final {
     try {
       return SpawnTask(std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
     } catch (const std::bad_alloc&) {
-      return Fail(ENOMEM, "spawn");
+      return Error::fail_errno(ENOMEM, "spawn");
     } catch (...) {
-      return Fail(EINVAL, "spawn");
+      return Error::fail_errno(EINVAL, "spawn");
     }
   }
 
@@ -239,17 +239,17 @@ class IO final {
   /// @return Number of bytes written, or an error code.
   ///
   /// @code
-  /// auto buf = TRY(fio.take_fixed_buffer(4096));
+  /// TRY(buf, fio.take_fixed_buffer(4096));
   /// std::memcpy(buf.ptr(), data.data(), data.size());
-  /// auto n = TRY(fio.write_fixed(fd, buf, data.size(), file_offset));
+  /// TRY(n, fio.write_fixed(fd, buf, data.size(), file_offset));
   /// @endcode
-  [[nodiscard]] Result<uint32_t> WriteFixed(const Fd& fd, const FixedBuffer& buf,
+  [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                             size_t len, off_t file_offset = -1,
                                             size_t buffer_offset = 0) noexcept;
 
   /// Write the whole contents of @p buf to @p fd starting at @p file_offset.
   /// Equivalent to write_fixed(fd, buf, buf.size(), file_offset).
-  [[nodiscard]] Result<uint32_t> WriteFixed(const Fd& fd, const FixedBuffer& buf,
+  [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                             off_t file_offset = -1) noexcept;
   /// Read up to @p len bytes from @p fd into @p buf (a registered fixed buffer)
   /// starting at @p offset.
@@ -260,18 +260,18 @@ class IO final {
   /// @return Number of bytes read, or an error code.
   ///
   /// @code
-  /// auto buf = TRY(fio.take_fixed_buffer(4096));
-  /// auto n = TRY(fio.read_fixed(fd, buf, 4096, 0));
+  /// TRY(buf, fio.take_fixed_buffer(4096));
+  /// TRY(n, fio.read_fixed(fd, buf, 4096, 0));
   /// std::string_view content{reinterpret_cast<const char*>(buf.ptr()),
   ///                          static_cast<size_t>(n)};
   /// @endcode
-  [[nodiscard]] Result<uint32_t> ReadFixed(const Fd& fd, FixedBuffer& buf, size_t len,
-                                           off_t file_offset = -1,
+  [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf,
+                                           size_t len, off_t file_offset = -1,
                                            size_t buffer_offset = 0) noexcept;
 
   /// Read up to buf.size() bytes from @p fd into @p buf starting at @p file_offset.
   /// Equivalent to read_fixed(fd, buf, buf.size(), file_offset).
-  [[nodiscard]] Result<uint32_t> ReadFixed(const Fd& fd, FixedBuffer& buf,
+  [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf,
                                            off_t file_offset = -1) noexcept;
 
   /// Read up to buf.size() bytes from @p fd into the caller-provided span @p buf.
@@ -281,7 +281,7 @@ class IO final {
   /// Pass @p offset = -1 to use the file's current position.
   ///
   /// @return Number of bytes read, or an error code.
-  [[nodiscard]] Result<uint32_t> Read(const Fd& fd, std::span<std::byte> buf,
+  [[nodiscard]] Result<uint32_t> Read(const UniqueFd& fd, std::span<std::byte> buf,
                                       off_t offset = -1) noexcept;
 
   /// Write up to buf.size() bytes from the caller-provided span @p buf to @p fd.
@@ -289,7 +289,7 @@ class IO final {
   /// Pass @p offset = -1 to use the file's current position.
   ///
   /// @return Number of bytes written, or an error code.
-  [[nodiscard]] Result<uint32_t> Write(const Fd& fd, std::span<const std::byte> buf,
+  [[nodiscard]] Result<uint32_t> Write(const UniqueFd& fd, std::span<const std::byte> buf,
                                        off_t offset = -1) noexcept;
 
   /// Write the scatter-gather vector @p iovecs to @p fd starting at @p offset.
@@ -298,7 +298,7 @@ class IO final {
   /// Pass @p offset = -1 to use the file's current position.
   ///
   /// @return Total bytes written, or an error code.
-  [[nodiscard]] Result<uint32_t> Writev(const Fd& fd, std::span<const iovec> iovecs,
+  [[nodiscard]] Result<uint32_t> Writev(const UniqueFd& fd, std::span<const iovec> iovecs,
                                         off_t offset = -1) noexcept;
 
   /// Read the scatter-gather vector @p iovecs from @p fd starting at @p offset.
@@ -307,7 +307,7 @@ class IO final {
   /// Pass @p offset = -1 to use the file's current position.
   ///
   /// @return Total bytes read, or an error code.
-  [[nodiscard]] Result<uint32_t> Readv(const Fd& fd, std::span<const iovec> iovecs,
+  [[nodiscard]] Result<uint32_t> Readv(const UniqueFd& fd, std::span<const iovec> iovecs,
                                        off_t offset = -1) noexcept;
 
   /// Flush pending writes on @p fd to the storage device.
@@ -317,7 +317,7 @@ class IO final {
   ///                  metadata such as mtime may lag).  If false, flushes
   ///                  both data and metadata (fsync semantics).
   /// @return {} on success, or an error code.
-  [[nodiscard]] Result<void> Fsync(const Fd& fd, bool datasync = false) noexcept;
+  [[nodiscard]] Result<void> Fsync(const UniqueFd& fd, bool datasync = false) noexcept;
 
   /// Open or create the file at @p path and return a file descriptor.
   ///
@@ -328,29 +328,30 @@ class IO final {
   /// @return An owned Fd on success, or an error code (e.g. ENOENT, EACCES).
   ///
   /// @code
-  /// auto fd = TRY(fio.open("/var/log/app.log", O_CREAT | O_WRONLY | O_APPEND, 0644));
+  /// TRY(fd, fio.Open("/var/log/app.log", O_CREAT | O_WRONLY | O_APPEND, 0644));
   /// @endcode
-  [[nodiscard]] Result<Fd> Open(const std::filesystem::path& path, int flags,
-                                mode_t mode = 0644) noexcept;
+  [[nodiscard]] Result<UniqueFd> Open(const std::filesystem::path& path, int flags,
+                                      mode_t mode = 0644) noexcept;
 
   /// Accept a new connection on @p server_fd, retrieving the client address.
   ///
   /// @return An owned Fd on success, or an error code.
-  [[nodiscard]] Result<Fd> Accept(const Fd& server_fd, SocketAddress& client_addr,
-                                  int flags = k_default_accept_flags) noexcept;
+  [[nodiscard]] Result<UniqueFd> Accept(const UniqueFd& server_fd,
+                                        SocketAddress& client_addr,
+                                        int flags = k_default_accept_flags) noexcept;
 
   /// Accept a new connection on @p server_fd without retrieving the client address.
   ///
   /// @return An owned Fd on success, or an error code.
-  [[nodiscard]] Result<Fd> Accept(const Fd& server_fd,
-                                  int flags = k_default_accept_flags) noexcept;
+  [[nodiscard]] Result<UniqueFd> Accept(const UniqueFd& server_fd,
+                                        int flags = k_default_accept_flags) noexcept;
 
   /// Accept connections in a continuous background loop using IORING_ACCEPT_MULTISHOT.
   /// Every accepted connection will automatically spawn a new fiber executing @p handler.
   template <class Fn>
     requires std::constructible_from<
-        std::move_only_function<void(IO&, Result<Fd>) noexcept>, Fn>
-  [[nodiscard]] Result<void> AcceptLoop(Fd server_fd, Fn&& handler) noexcept;
+        std::move_only_function<void(IO&, Result<UniqueFd>) noexcept>, Fn>
+  [[nodiscard]] Result<void> AcceptLoop(UniqueFd server_fd, Fn&& handler) noexcept;
 
   /// Close @p fd asynchronously via io_uring.
   ///
@@ -362,11 +363,11 @@ class IO final {
   [[nodiscard]] Result<void> Close(int fd) noexcept;
 
   /// @brief Close an Fd via io_uring. Unregisters if it's a direct Fd.
-  [[nodiscard]] Result<void> Close(Fd fd) noexcept;
+  [[nodiscard]] Result<void> Close(UniqueFd fd) noexcept;
 
   /// @brief Registers an Fd as a direct file descriptor to bypass kernel FD lookup
   /// overhead. The input fd is consumed. The resulting Fd will have `is_direct()` true.
-  [[nodiscard]] Result<Fd> RegisterFile(Fd fd) noexcept;
+  [[nodiscard]] Result<UniqueFd> RegisterFile(UniqueFd fd) noexcept;
 
   /// @brief Internal: Unregister a direct FD immediately (synchronous syscall).
   void UnregisterDirectFd(int direct_idx) noexcept;
@@ -382,11 +383,12 @@ class IO final {
   ///
   /// @param poll_mask Standard poll(2) mask (e.g. POLLIN, POLLOUT).
   /// @return The triggered events, or an error code.
-  [[nodiscard]] Result<uint32_t> Poll(const Fd& fd, unsigned poll_mask) noexcept;
+  [[nodiscard]] Result<uint32_t> Poll(const UniqueFd& fd, unsigned poll_mask) noexcept;
 
   /// Connect @p fd to the remote address @p addr.
   /// Note: @p addr must outlive this function call.
-  [[nodiscard]] Result<void> Connect(const Fd& fd, const SocketAddress& addr) noexcept;
+  [[nodiscard]] Result<void> Connect(const UniqueFd& fd,
+                                     const SocketAddress& addr) noexcept;
 
   /// Allocate or deallocate disk space for @p fd in the range [@p offset, @p offset + @p
   /// len).
@@ -395,14 +397,14 @@ class IO final {
   /// @param mode  fallocate(2) mode flags (0 for a simple pre-allocation,
   ///              FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to punch a hole, etc.).
   /// @return {} on success, or an error code.
-  [[nodiscard]] Result<void> Fallocate(const Fd& fd, int mode, off_t offset,
+  [[nodiscard]] Result<void> Fallocate(const UniqueFd& fd, int mode, off_t offset,
                                        off_t len) noexcept;
 
   /// Truncate or extend @p fd to exactly @p len bytes.
   ///
   /// Requires kernel 6.9+ and liburing 2.6+.
   /// @return {} on success, or an error code.
-  [[nodiscard]] Result<void> Ftruncate(const Fd& fd, off_t len) noexcept;
+  [[nodiscard]] Result<void> Ftruncate(const UniqueFd& fd, off_t len) noexcept;
 
   /// Suspend the current fiber for the given duration.
   ///
@@ -419,17 +421,18 @@ class IO final {
   // honored with up to TimerWheel::kTickNs (64ms) of slack. The hot path
   // costs two intrusive-list operations; the kernel is only involved
   // (one ASYNC_CANCEL) when a timeout actually fires.
-  [[nodiscard]] Result<uint32_t> Read(const Fd& fd, std::span<std::byte> buf,
+  [[nodiscard]] Result<uint32_t> Read(const UniqueFd& fd, std::span<std::byte> buf,
                                       std::chrono::nanoseconds timeout,
                                       off_t offset = -1) noexcept;
-  [[nodiscard]] Result<uint32_t> Write(const Fd& fd, std::span<const std::byte> buf,
+  [[nodiscard]] Result<uint32_t> Write(const UniqueFd& fd, std::span<const std::byte> buf,
                                        std::chrono::nanoseconds timeout,
                                        off_t offset = -1) noexcept;
-  [[nodiscard]] Result<Fd> Accept(const Fd& server_fd, std::chrono::nanoseconds timeout,
-                                  int flags = k_default_accept_flags) noexcept;
-  [[nodiscard]] Result<void> Connect(const Fd& fd, const SocketAddress& addr,
+  [[nodiscard]] Result<UniqueFd> Accept(const UniqueFd& server_fd,
+                                        std::chrono::nanoseconds timeout,
+                                        int flags = k_default_accept_flags) noexcept;
+  [[nodiscard]] Result<void> Connect(const UniqueFd& fd, const SocketAddress& addr,
                                      std::chrono::nanoseconds timeout) noexcept;
-  [[nodiscard]] Result<uint32_t> Poll(const Fd& fd, unsigned poll_mask,
+  [[nodiscard]] Result<uint32_t> Poll(const UniqueFd& fd, unsigned poll_mask,
                                       std::chrono::nanoseconds timeout) noexcept;
 
  private:
@@ -453,8 +456,8 @@ class IO final {
   void Wake() noexcept;
 
   struct MultishotAcceptState {
-    Fd server_fd;
-    std::move_only_function<void(IO&, Result<Fd>) noexcept> handler;
+    UniqueFd server_fd;
+    std::move_only_function<void(IO&, Result<UniqueFd>) noexcept> handler;
   };
   std::vector<uint64_t> active_multishots_;
 
@@ -467,20 +470,20 @@ class IO final {
   template <typename T = uint32_t, typename Prep>
   TIO_NO_SANITIZE_ADDRESS Result<T> Syscall(const char* op_name, Prep&& prep) noexcept {
     if (stopping_) {
-      return Fail(ECANCELED, op_name);
+      return Error::fail_errno(ECANCELED, op_name);
     }
 
     // - Prevents multi-threaded corruption of io_uring
     // - Prevents calling io.read() from outside a fiber
     if (!IsOwnerThread() || current_fiber_ == nullptr) {
-      return Fail(EPERM, op_name);
+      return Error::fail_errno(EPERM, op_name);
     }
 
     // Internal Sanity Checks
     assert(current_fiber_->runtime == this);
     assert(current_fiber_->state == detail::fiber::FiberState::running);
 
-    auto sqe = TRY_LOG_ERR(GetSqe(), "failed to get sqe: io ops [{}]", op_name);
+    TRY_LOG_ERR(sqe, GetSqe(), "failed to get sqe: io ops [{}]", op_name);
 
     detail::fiber::Operation& op = current_fiber_->operation;
     op = detail::fiber::Operation{};
@@ -498,7 +501,7 @@ class IO final {
     SuspendFiber(current_fiber_);
 
     if (op.cqe_res < 0) {
-      return Fail(-op.cqe_res, op_name);
+      return Error::fail_errno(-op.cqe_res, op_name);
     }
 
     if constexpr (std::is_same_v<T, void>) {
@@ -521,11 +524,11 @@ class IO final {
     }
 
     if (stopping_) {
-      return Fail(ECANCELED, op_name);
+      return Error::fail_errno(ECANCELED, op_name);
     }
 
     if (!IsOwnerThread() || current_fiber_ == nullptr) {
-      return Fail(EPERM, op_name);
+      return Error::fail_errno(EPERM, op_name);
     }
 
     assert(current_fiber_->runtime == this);
@@ -533,7 +536,7 @@ class IO final {
     assert(!static_cast<IntrusiveHook<TimerTag>*>(current_fiber_)->IsLinked() &&
            "fiber already armed in the timer wheel");
 
-    auto sqe = TRY_LOG_ERR(GetSqe(), "failed to get sqe: io ops [{}]", op_name);
+    TRY_LOG_ERR(sqe, GetSqe(), "failed to get sqe: io ops [{}]", op_name);
 
     detail::fiber::Operation& op = current_fiber_->operation;
     op = detail::fiber::Operation{};
@@ -555,10 +558,10 @@ class IO final {
     // On resume the fiber is always disarmed: drain_completions() disarms
     // on normal completion; process_expired_timers() disarmed on expiry.
     if (op.cqe_res == -ECANCELED && op.timed_out) {
-      return Fail(ETIMEDOUT, op_name);
+      return Error::fail_errno(ETIMEDOUT, op_name);
     }
     if (op.cqe_res < 0) {
-      return Fail(-op.cqe_res, op_name);
+      return Error::fail_errno(-op.cqe_res, op_name);
     }
 
     if constexpr (std::is_same_v<T, void>) {
@@ -656,17 +659,17 @@ class IO final {
 
   void PinToCpu() const;
   Result<void> AcceptLoopImpl(
-      Fd server_fd,
-      std::move_only_function<void(IO&, Result<Fd>) noexcept> handler) noexcept;
+      UniqueFd server_fd,
+      std::move_only_function<void(IO&, Result<UniqueFd>) noexcept> handler) noexcept;
 };
 
 template <class Fn>
   requires std::constructible_from<
-      std::move_only_function<void(IO&, Result<Fd>) noexcept>, Fn>
-[[nodiscard]] Result<void> IO::AcceptLoop(Fd server_fd, Fn&& handler) noexcept {
-  return AcceptLoopImpl(
-      std::move(server_fd),
-      std::move_only_function<void(IO&, Result<Fd>) noexcept>(std::forward<Fn>(handler)));
+      std::move_only_function<void(IO&, Result<UniqueFd>) noexcept>, Fn>
+[[nodiscard]] Result<void> IO::AcceptLoop(UniqueFd server_fd, Fn&& handler) noexcept {
+  return AcceptLoopImpl(std::move(server_fd),
+                        std::move_only_function<void(IO&, Result<UniqueFd>) noexcept>(
+                            std::forward<Fn>(handler)));
 }
 
 }  // namespace tinyio

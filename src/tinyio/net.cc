@@ -75,11 +75,11 @@ Result<SocketAddress> ResolveIp(const std::string_view host, const uint16_t port
   if (const int rc = getaddrinfo(hostname.c_str(), service.c_str(), &hints, &res);
       rc != 0) {
     // EAI_SYSTEM means check errno; all other EAI_* codes map to EIO.
-    return Fail(rc == EAI_SYSTEM ? errno : EIO, "getaddrinfo");
+    return Error::fail_errno(rc == EAI_SYSTEM ? errno : EIO, "getaddrinfo");
   }
 
   if (!res) {
-    return Fail(EIO, "getaddrinfo_null_result");
+    return Error::fail_errno(EIO, "getaddrinfo_null_result");
   }
 
   SocketAddress out;

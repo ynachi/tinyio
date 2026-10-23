@@ -78,25 +78,48 @@ function(tinyio_configure_dependencies)
     endif ()
 
     #
-    # ABSEIL
+    # YLT (yalantinglibs)
     #
-    message(STATUS "Setting up Google Abseil")
+    # tinyio uses two YLT modules: easylog for logging and struct_pack for
+    # serialization. YLT is header-only the way we embed it here (FetchContent
+    # -> add_subdirectory): none of it is compiled, the interface target only
+    # carries the include path. The YLT_ENABLE_* switches below turn off every
+    # optional backend YLT could otherwise pull in (OpenSSL, ibverbs, io_uring,
+    # CUDA, PMR, ...), so the only reachable parts are the header modules we
+    # actually use.
+    #
+    message(STATUS "Setting up YLT (yalantinglibs)")
 
+    set(YLT_ENABLE_SSL OFF)
+    set(YLT_ENABLE_NTLS OFF)
+    set(YLT_ENABLE_IBV OFF)
+    set(YLT_ENABLE_URMA OFF)
+    set(YLT_ENABLE_IO_URING OFF)
+    set(YLT_ENABLE_FILE_IO_URING OFF)
+    set(YLT_ENABLE_OWN_RING OFF)
+    set(YLT_ENABLE_CUDA OFF)
+    set(YLT_ENABLE_NVCOMP OFF)
+    set(YLT_ENABLE_ND OFF)
+    set(YLT_ENABLE_PMR OFF)
+    # YLT's own stacktrace support links dl; the YLT_ENABLE_LD macro that
+    # actually turns dladdr on is not one of YLT's switches.
+    set(YLT_ENABLE_DL ON)
+
+    # Pinned to the 0.6.1 release tag, not the v0.6.1 branch: the branch moves,
+    # the tag does not. 0.6.1 is the first release with the easylog fix for a
+    # lost wakeup in appender::stop(): it set the stop flag while holding the
+    # file mutex instead of the queue mutex the writer thread waits on, so the
+    # notification could be dropped and ~appender() would block forever in
+    # join(). Any tinyio program that logs and exits could hang at exit.
     FetchContent_Declare(
-            abseil-cpp
+            yalantinglibs
             SYSTEM
-            GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-            GIT_TAG 20260107.1
-            EXCLUDE_FROM_ALL                  # Don't build Abseil's tests/docs by default
-    )
+            GIT_REPOSITORY https://github.com/alibaba/yalantinglibs.git
+            GIT_TAG 0.6.1
+            GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(yalantinglibs)
 
-    # Configure Abseil build options BEFORE MakeAvailable
-    set(ABSL_BUILD_TESTING OFF CACHE BOOL "Build Abseil tests" FORCE)
-    set(ABSL_BUILD_DOCS OFF CACHE BOOL "Build Abseil docs" FORCE)
-    set(ABSL_USE_EXTERNAL_GOOGLETEST ON CACHE BOOL "Use system googletest if needed" FORCE)
-    set(ABSL_ENABLE_INSTALL OFF CACHE BOOL "Don't install Abseil" FORCE)  # Optional
-
-    FetchContent_MakeAvailable(abseil-cpp)
+    add_library(tinyio::ylt ALIAS yalantinglibs)
 
     #
     # BOOST

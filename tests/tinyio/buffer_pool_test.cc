@@ -44,7 +44,7 @@ TEST(FixedBufferPoolConstruction, TakeFromEmptyPoolReturnsENOMEM) {
   FixedBufferPool pool{std::vector<BucketConfig>{}};
   auto buf = pool.Take(4096);
   ASSERT_FALSE(buf.has_value());
-  EXPECT_EQ(buf.error().code, ENOMEM);
+  EXPECT_EQ(buf.error().value(), ENOMEM);
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ TEST_F(SingleBucketPoolTest, ExhaustedBucketReturnsEAGAIN) {
   // One more take must fail — the bucket does not spill to another bucket.
   auto extra = pool_.Take(kSlotSize);
   ASSERT_FALSE(extra.has_value());
-  EXPECT_EQ(extra.error().code, EAGAIN);
+  EXPECT_EQ(extra.error().value(), EAGAIN);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ TEST_F(MultiBucketPoolTest, TakeUsesLargerBucketWhenRequestBetweenSizes) {
 TEST_F(MultiBucketPoolTest, TakeFailsWhenRequestExceedsAllBuckets) {
   auto buf = pool_.Take(16384);
   ASSERT_FALSE(buf.has_value());
-  EXPECT_EQ(buf.error().code, ENOMEM);
+  EXPECT_EQ(buf.error().value(), ENOMEM);
 }
 
 TEST_F(MultiBucketPoolTest, ExhaustedSmallBucketDoesNotSpillToLarger) {
@@ -223,7 +223,7 @@ TEST_F(MultiBucketPoolTest, ExhaustedSmallBucketDoesNotSpillToLarger) {
   // Requesting 4096 again must fail — take() does not fall back to the 8192 bucket.
   auto extra = pool_.Take(4096);
   ASSERT_FALSE(extra.has_value());
-  EXPECT_EQ(extra.error().code, EAGAIN);
+  EXPECT_EQ(extra.error().value(), EAGAIN);
 
   // The 8192-byte bucket is untouched.
   EXPECT_EQ(pool_.AvailableInBucket(1), 2u);

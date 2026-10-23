@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "error.hpp"
-#include "logger.hpp"
+#include "logging.hpp"
 
 namespace tinyio {
 

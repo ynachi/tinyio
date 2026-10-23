@@ -26,7 +26,7 @@ set(TINYIO_STATIC_BUILD_INTERFACE_LIBS
         OpenSSL::SSL
         OpenSSL::Crypto
         Threads::Threads
-        absl::log)
+        yalantinglibs)
 set(TINYIO_SHARED_BUILD_INTERFACE_LIBS
         tinyio::liburing
         Boost::context
@@ -34,7 +34,7 @@ set(TINYIO_SHARED_BUILD_INTERFACE_LIBS
         OpenSSL::SSL
         OpenSSL::Crypto
         Threads::Threads
-        absl::log)
+        yalantinglibs)
 set(TINYIO_STATIC_INSTALL_INTERFACE_LIBS)
 set(TINYIO_SHARED_INSTALL_INTERFACE_LIBS)
 
@@ -58,6 +58,36 @@ if (TINYIO_BUILD_SHARED)
 endif ()
 if (TINYIO_BUILD_STATIC)
     target_link_libraries(tinyio_static PRIVATE tinyio_warnings)
+endif ()
+
+# easylog prints a stack trace on a fatal record, and it reaches for
+# std::stacktrace when the standard library provides it. Where that cannot be
+# linked, cmake/TinyioStacktrace.cmake defines __cpp_lib_stacktrace to 0 so
+# easylog uses YLT's own backtrace helper instead. The definition is PUBLIC:
+# easylog sits in tinyio's public headers, so consumers need it as well.
+if (TINYIO_STACKTRACE_DEFINITIONS)
+    foreach (tinyio_target IN ITEMS tinyio_static tinyio_shared)
+        if (TARGET ${tinyio_target})
+            target_compile_definitions(${tinyio_target} PUBLIC
+                    ${TINYIO_STACKTRACE_DEFINITIONS})
+        endif ()
+    endforeach ()
+endif ()
+
+# easylog picks its formatting backend from __has_include(<fmt/format.h>), so
+# the backend would otherwise depend on whether the host has fmt installed.
+# cmake/TinyioFmtShim/fmt/format.h pins it to std::format, the implementation
+# the CI container already uses, and keeps the build reproducible. The shim
+# directory is on the include path of every consumer of the build tree because
+# easylog sits in tinyio's public headers. It is not installed: tinyio's
+# public headers must not shadow the real fmt for consumers.
+if (NOT TINYIO_USE_SYSTEM_FMT)
+    foreach (tinyio_target IN ITEMS tinyio_static tinyio_shared)
+        if (TARGET ${tinyio_target})
+            target_include_directories(${tinyio_target} PUBLIC
+                    "$<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/cmake/TinyioFmtShim>")
+        endif ()
+    endforeach ()
 endif ()
 
 if (TINYIO_BUILD_SHARED)

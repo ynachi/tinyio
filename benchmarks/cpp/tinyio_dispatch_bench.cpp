@@ -28,8 +28,8 @@
 #include <thread>
 #include <vector>
 
-#include <tinyio/logger.hpp>
 #include <tinyio/tcp_listener.hpp>
+#include <ylt/easylog.hpp>
 
 #include "tinyio/runtime.hpp"
 
@@ -93,18 +93,18 @@ Options parse_args(int argc, char** argv) {
 // Hot path — called inside a fiber on the handler IO
 // ---------------------------------------------------------------------------
 
-tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd,
+tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::UniqueFd& fd,
                                std::span<const std::byte> data) noexcept {
   while (!data.empty()) {
-    auto written = TRY(fio.Write(fd, data));
-    if (written == 0) return tinyio::Fail(EIO, "write");
+    TRY(written, fio.Write(fd, data));
+    if (written == 0) return tinyio::Error::fail_errno(EIO, "write");
     data = data.subspan(static_cast<size_t>(written));
   }
   return {};
 }
 
 void handle_client(tinyio::IO& fio, int raw_fd) noexcept {
-  tinyio::Fd client_fd{raw_fd};
+  tinyio::UniqueFd client_fd{raw_fd};
   std::byte buf[4096];
   const auto response =
       std::as_bytes(std::span{kHttpResponse.data(), kHttpResponse.size()});
@@ -129,20 +129,18 @@ void accept_and_dispatch(tinyio::IO& acceptor, std::vector<tinyio::IO*> handlers
                          uint16_t port) noexcept {
   auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
   if (!listener) {
-    std::cerr << "[acceptor] bind failed: " << listener.error().ErrorCode().message()
-              << '\n';
+    std::cerr << "[acceptor] bind failed: " << listener.error().message() << '\n';
     return;
   }
 
-  tinyio::Fd server_fd = std::move(*listener);
+  tinyio::UniqueFd server_fd = std::move(*listener);
   size_t next = 0;
 
   while (!g_stop_requested.load(std::memory_order_relaxed)) {
     auto client = acceptor.Accept(server_fd);
     if (!client) {
       if (!g_stop_requested.load(std::memory_order_relaxed))
-        std::cerr << "[acceptor] accept failed: " << client.error().ErrorCode().message()
-                  << '\n';
+        std::cerr << "[acceptor] accept failed: " << client.error().message() << '\n';
       return;
     }
 
@@ -177,7 +175,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGPIPE, SIG_IGN);
 
-    tinyio::log::SetLevel(tinyio::log::Level::Disabled);
+    easylog::set_console(false);
 
     const size_t n = opts.workers;
     std::cout << "tinyio_dispatch_bench port=" << opts.port << " workers=" << n

@@ -98,7 +98,7 @@ void print_result(const BenchResult& r) {
   std::cout << r.seconds << "s  " << r.mib_per_sec << " MiB/s\n";
 }
 
-tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::Fd& fd,
+tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::UniqueFd& fd,
                                             std::span<const std::byte> block,
                                             std::uint64_t bytes) {
   std::uint64_t offset = 0;
@@ -106,10 +106,10 @@ tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::Fd& fd,
     const auto len = std::min<std::uint64_t>(block.size(), bytes - offset);
     iovec iov{.iov_base = const_cast<std::byte*>(block.data()),
               .iov_len = static_cast<std::size_t>(len)};
-    auto written =
-        TRY(fio.Writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
+    TRY(written,
+        fio.Writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
     if (written != static_cast<int32_t>(len)) {
-      return tinyio::Fail(EIO, "writev");
+      return tinyio::Error::fail_errno(EIO, "writev");
     }
     offset += len;
   }
@@ -126,7 +126,7 @@ BenchResult bench_tinyio_fiber(const Options& opts, std::span<const std::byte> b
                              std::string(std::strerror(errno)));
   }
 
-  tinyio::Fd fd{raw_fd};
+  tinyio::UniqueFd fd{raw_fd};
   tinyio::IoOptions io_opts;
   tinyio::IO io(0, io_opts, {});
 
@@ -141,8 +141,7 @@ BenchResult bench_tinyio_fiber(const Options& opts, std::span<const std::byte> b
   const auto end = Clock::now();
 
   if (!result.value()) {
-    throw std::runtime_error("tinyio write failed: " +
-                             result.value().error().ErrorCode().message());
+    throw std::runtime_error("tinyio write failed: " + result.value().error().message());
   }
 
   const double seconds = std::chrono::duration<double>(end - start).count();
@@ -174,7 +173,7 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
                              std::string(std::strerror(errno)));
   }
 
-  tinyio::Fd fd{raw_fd};
+  tinyio::UniqueFd fd{raw_fd};
   tinyio::IoOptions io_opts;
   tinyio::IO io(0, io_opts, {});
 
@@ -196,8 +195,8 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
           const auto len = std::min<std::uint64_t>(block.size(), seg_end - offset);
           iovec iov{.iov_base = const_cast<std::byte*>(block.data()),
                     .iov_len = static_cast<std::size_t>(len)};
-          TRY(fio.Writev(fd, std::span<const iovec>{&iov, 1},
-                         static_cast<off_t>(offset)));
+          TRY_VOID(fio.Writev(fd, std::span<const iovec>{&iov, 1},
+                              static_cast<off_t>(offset)));
           offset += len;
         }
         return seg_end - seg_start;
@@ -227,7 +226,7 @@ int main(int argc, char** argv) {
     std::memset(ptr, 0x42, opts.block);
     std::span<const std::byte> block(static_cast<const std::byte*>(ptr), opts.block);
 
-    tinyio::log::SetLevel(tinyio::log::Level::Disabled);
+    easylog::set_console(false);
 
     std::cout << "Benchmarking disk write (O_DIRECT, sequential per fiber):\n"
               << "  Total bytes : " << opts.bytes << '\n'

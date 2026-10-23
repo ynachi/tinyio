@@ -208,7 +208,7 @@ struct Measurement {
   std::size_t corrupt;
 };
 
-void run_phase(const std::vector<tinyio::Fd>& files, std::vector<Worker>& workers,
+void run_phase(const std::vector<tinyio::UniqueFd>& files, std::vector<Worker>& workers,
                std::size_t total_ops, std::size_t blocks, unsigned flags = 0,
                int loop_style = 0) {
   const std::size_t depth = workers.size();
@@ -261,7 +261,7 @@ void run_phase(const std::vector<tinyio::Fd>& files, std::vector<Worker>& worker
 
 Measurement measure(const Config& config, const DataFile& data, std::size_t file_count,
                     std::size_t depth) {
-  std::vector<tinyio::Fd> files;
+  std::vector<tinyio::UniqueFd> files;
   files.reserve(file_count);
   for (std::size_t index = 0; index < file_count; ++index) {
     int fd = ::open(data.path().c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
@@ -406,7 +406,7 @@ int main(int argc, char** argv) {
     }
 
     DataFile data(config.file_mib * 1024 * 1024 / kBlockSize, config.file_path);
-    tinyio::log::SetLevel(tinyio::log::Level::Disabled);
+    easylog::set_console(false);
     std::printf(
         "tinyio disk bench, operations/run=%zu, repeats=%zu, file=%zu MiB, cwd=%s, "
         "uring_flags=%u\n",

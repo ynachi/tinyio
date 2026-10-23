@@ -47,7 +47,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsWaiting) {
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
   EXPECT_TRUE(fiber_ran);
-  EXPECT_EQ(fiber_err.code, ECANCELED);
+  EXPECT_EQ(fiber_err.value(), ECANCELED);
   EXPECT_LT(elapsed.count(), 2000);
 }
 
@@ -84,7 +84,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsReady) {
 
   EXPECT_TRUE(fiber_started);
   EXPECT_TRUE(fiber_finished);
-  EXPECT_EQ(yield_err.code, ECANCELED);
+  EXPECT_EQ(yield_err.value(), ECANCELED);
 }
 
 // 3. destructor_cancels_live_work
@@ -160,8 +160,8 @@ TEST(ShutdownCancellationTest, SyscallReturnsEcanceled) {
   t.join();
 
   EXPECT_TRUE(fiber_finished);
-  EXPECT_EQ(yield_err.code, ECANCELED);
-  EXPECT_EQ(sleep_err.code, ECANCELED);
+  EXPECT_EQ(yield_err.value(), ECANCELED);
+  EXPECT_EQ(sleep_err.value(), ECANCELED);
 }
 
 // 6. double_run

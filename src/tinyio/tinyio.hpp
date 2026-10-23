@@ -6,7 +6,7 @@
 ///   IO io{0, IoOptions{}, {}};
 ///   io.spawn([&listener](tinyio::IO& io) noexcept {
 ///       while (true) {
-///           auto client = TRY(io.accept(listener));
+///           TRY(client, io.Accept(listener));
 ///           // handle client ...
 ///       }
 ///   });

@@ -10,8 +10,7 @@
 #include <utility>
 
 #include <sys/eventfd.h>
-
-#include "logger.hpp"
+#include <ylt/easylog.hpp>
 
 namespace tinyio {
 IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs)
@@ -21,8 +20,8 @@ IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_co
       post_queue_(opts.post_queue_capacity) {
   if (auto res = Initialize(); !res) {
     const auto err = res.error();
-    throw std::system_error(err.ErrorCode(),
-                            std::format("tinyio::IO init failed in {}", err.op));
+    throw std::system_error(err.code,
+                            std::format("tinyio::IO init failed in {}", err.context()));
   }
 }
 
@@ -32,7 +31,7 @@ IO::~IO() noexcept {
   // Discard any tasks that were posted but not yet spawned.
   // Their destructors release any captured resources before we tear down the ring.
   {
-    ALOG_INFO("discarding ready tasks, worker {}", id_);
+    ELOGFMT(INFO, "discarding ready tasks, worker {}", id_);
     std::move_only_function<void(IO&) noexcept> fn;
     while (post_queue_.TryDequeue(fn)) {
     }
@@ -53,42 +52,43 @@ IO::~IO() noexcept {
 
   if (is_activated_ && !was_stopping && has_live_work) {
     if (!IsOwnerThread()) {
-      ALOG_ERROR(
-          "IO #{} destroyed from a non-owner thread with {} live fiber(s) "
-          "and {} op(s) in-flight — aborting to prevent kernel UAF",
-          id_, live_fibers_, inflight_ops_);
+      ELOGFMT(ERROR,
+              "IO #{} destroyed from a non-owner thread with {} live fiber(s) "
+              "and {} op(s) in-flight — aborting to prevent kernel UAF",
+              id_, live_fibers_, inflight_ops_);
       std::abort();
     }
 
-    ALOG_WARN("IO #{} destroyed with {} live fiber(s); issuing cancels and draining", id_,
-              live_fibers_);
+    ELOGFMT(WARN, "IO #{} destroyed with {} live fiber(s); issuing cancels and draining",
+            id_, live_fibers_);
     CancelAndDrain();
   }
 
   if (live_fibers_ > 0) {
-    ALOG_WARN("IO #{} teardown: {} fiber(s) still live (stuck in app logic?)", id_,
-              live_fibers_);
+    ELOGFMT(WARN, "IO #{} teardown: {} fiber(s) still live (stuck in app logic?)", id_,
+            live_fibers_);
   }
 
   if (ring_.ring_fd > 0 && buffer_pool_.IsRegistered()) {
     if (auto res = UnregisterBuffers(); !res.has_value()) {
       auto err = res.error();
-      ALOG_ERROR("Failed to unregister buffers: [{}] {}", err.op, err);
+      ELOGFMT(ERROR, "Failed to unregister buffers: [{}] {}", err.context(),
+              err.message());
     }
-    ALOG_INFO("unregistered buffers, worker: {}", id_);
+    ELOGFMT(INFO, "unregistered buffers, worker: {}", id_);
   }
 
   if (ring_.ring_fd > 0 && !direct_fds_.empty()) {
     if (const int ret = io_uring_unregister_files(&ring_); ret < 0) {
-      ALOG_ERROR("Failed to unregister files: {}", std::strerror(-ret));
+      ELOGFMT(ERROR, "Failed to unregister files: {}", std::strerror(-ret));
     }
-    ALOG_INFO("unregistered files, worker: {}", id_);
+    ELOGFMT(INFO, "unregistered files, worker: {}", id_);
   }
 
   if (ring_.ring_fd > 0) {
     io_uring_queue_exit(&ring_);
     ring_.ring_fd = -1;
-    ALOG_INFO("exited io-uring ring, worker {}", id_);
+    ELOGFMT(INFO, "exited io-uring ring, worker {}", id_);
   }
 
   if (wake_fd_ >= 0) {
@@ -125,26 +125,27 @@ Result<void> IO::Initialize() noexcept {
 
   if ((params.flags & IORING_SETUP_SQPOLL) &&
       (params.flags & IORING_SETUP_DEFER_TASKRUN)) {
-    return Fail(EINVAL,
-                "IORING_SETUP_SQPOLL is incompatible with DEFER_TASKRUN; "
-                "clear kUringDefaultAdditionalFlag bits when enabling SQPOLL");
+    return Error::fail_errno(
+        EINVAL,
+        "IORING_SETUP_SQPOLL is incompatible with DEFER_TASKRUN; "
+        "clear kUringDefaultAdditionalFlag bits when enabling SQPOLL");
   }
 
   if (const int rc = io_uring_queue_init_params(opts_.sq_entries, &ring_, &params);
       rc < 0) {
-    return Fail(-rc, "io_uring_queue_init_params");
+    return Error::fail_errno(-rc, "io_uring_queue_init_params");
   }
 
   wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (wake_fd_ < 0) {
     io_uring_queue_exit(&ring_);
-    return Fail(errno, "eventfd");
+    return Error::fail_errno(errno, "eventfd");
   }
 
   // register pool if not empty
   if (buffer_pool_.BucketCount() != 0) {
-    TRY(RegisterBuffers(buffer_pool_));
-    ALOG_INFO("the buffer pool have been registered to io_uring");
+    TRY_VOID(RegisterBuffers(buffer_pool_));
+    ELOGFMT(INFO, "the buffer pool have been registered to io_uring");
   }
 
   if (opts_.direct_fd_table_size > 0) {
@@ -152,32 +153,32 @@ Result<void> IO::Initialize() noexcept {
     if (const int ret = io_uring_register_files(
             &ring_, direct_fds_.data(), static_cast<unsigned int>(direct_fds_.size()));
         ret < 0) {
-      return Fail(-ret, "io_uring_register_files");
+      return Error::fail_errno(-ret, "io_uring_register_files");
     }
     // Populate the LIFO free-list in reverse so index 0 is popped first.
     direct_free_.reserve(opts_.direct_fd_table_size);
     for (uint32_t i = opts_.direct_fd_table_size; i-- > 0;) {
       direct_free_.push_back(i);
     }
-    ALOG_INFO("registered direct fd table of size {}", opts_.direct_fd_table_size);
+    ELOGFMT(INFO, "registered direct fd table of size {}", opts_.direct_fd_table_size);
   }
 
-  ALOG_INFO(
-      "Initialized IO context with {} submission entries (SQPOLL: {})", opts_.sq_entries,
-      (opts_.additional_uring_flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
+  ELOGFMT(INFO, "Initialized IO context with {} submission entries (SQPOLL: {})",
+          opts_.sq_entries,
+          (opts_.additional_uring_flags & IORING_SETUP_SQPOLL) ? "enabled" : "disabled");
 
   return {};
 }
 
 Result<void> IO::RegisterBuffers(FixedBufferPool& pool) noexcept {
   if (pool.IsRegistered()) {
-    return Fail(EALREADY, "register_buffers: pool already registered");
+    return Error::fail_errno(EALREADY, "register_buffers: pool already registered");
   }
 
   if (const int ret = io_uring_register_buffers(
           &ring_, pool.IovecsPtr(), static_cast<unsigned int>(pool.TotalCapacity()));
       ret < 0) {
-    return Fail(-ret, "io_uring_register_buffers");
+    return Error::fail_errno(-ret, "io_uring_register_buffers");
   }
 
   pool.SetRegistered();
@@ -187,35 +188,21 @@ Result<void> IO::RegisterBuffers(FixedBufferPool& pool) noexcept {
 
 Result<void> IO::UnregisterBuffers() noexcept {
   if (const int ret = io_uring_unregister_buffers(&ring_); ret < 0) {
-    return Fail(-ret, "io_uring_unregister_buffers");
+    return Error::fail_errno(-ret, "io_uring_unregister_buffers");
   }
   buffer_pool_.SetUnregistered();
   return {};
 }
 
-void Fd::CloseImpl() noexcept {
-  if (fd < 0) return;
-  if (!direct) {
-    ::close(fd);
-  } else {
-    ALOG_WARN(
-        "direct Fd {} closed synchronously; this leaks the direct fd index. use "
-        "io.Close(fd) instead.",
-        fd);
-  }
-  fd = -1;
-  direct = false;
-}
-
-Result<Fd> IO::RegisterFile(Fd fd) noexcept {
+Result<UniqueFd> IO::RegisterFile(UniqueFd fd) noexcept {
   assert(IsOwnerThread() && "This method must be called from the IO owner thread");
-  if (!fd.IsValid() || fd.IsDirect()) return fd;
+  if (!fd.Valid() || fd.IsDirect()) return fd;
 
   if (direct_free_.empty()) {
     if (!direct_fds_.empty()) {
-      ALOG_WARN(
-          "register_file: direct FD table full ({}/{}), fd {} will use indirect path",
-          direct_fds_.size() - direct_free_.size(), direct_fds_.size(), fd.Get());
+      ELOGFMT(WARN,
+              "register_file: direct FD table full ({}/{}), fd {} will use indirect path",
+              direct_fds_.size() - direct_free_.size(), direct_fds_.size(), fd.Get());
     }
     return fd;
   }
@@ -224,8 +211,8 @@ Result<Fd> IO::RegisterFile(Fd fd) noexcept {
   int raw_fd = fd.Get();
 
   if (const int ret = io_uring_register_files_update(&ring_, idx, &raw_fd, 1); ret < 0) {
-    ALOG_WARN("register_file: io_uring_register_files_update failed for fd {}: {}",
-              raw_fd, std::strerror(-ret));
+    ELOGFMT(WARN, "register_file: io_uring_register_files_update failed for fd {}: {}",
+            raw_fd, std::strerror(-ret));
     return fd;
   }
 
@@ -234,8 +221,10 @@ Result<Fd> IO::RegisterFile(Fd fd) noexcept {
 
   ::close(fd.Release());  // raw kernel fd is consumed
 
-  Fd direct_fd(static_cast<int>(idx));
-  direct_fd.direct = true;
+  // A direct fd holds a table index, not a descriptor: give it the no-op
+  // closer so the destructor never closes an unrelated descriptor.
+  UniqueFd direct_fd(static_cast<int>(idx), UniqueFd::NoopCloser);
+  direct_fd.SetDirect(true);
   return direct_fd;
 }
 
@@ -258,9 +247,9 @@ Result<void> IO::Close(const int fd) noexcept {
   return Syscall<void>("close", [&](io_uring_sqe* sqe) { io_uring_prep_close(sqe, fd); });
 }
 
-Result<void> IO::Close(Fd fd) noexcept {
+Result<void> IO::Close(UniqueFd fd) noexcept {
   assert(IsOwnerThread() && "This method must be called from the IO owner thread");
-  if (!fd.IsValid()) return {};
+  if (!fd.Valid()) return {};
 
   if (fd.IsDirect()) {
     UnregisterDirectFd(fd.Get());
@@ -344,7 +333,7 @@ void IO::DestroyAllFibers() noexcept {
 
 Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) noexcept {
   if (!IsOwnerThread()) {
-    return Fail(EPERM, "spawn");
+    return Error::fail_errno(EPERM, "spawn");
   }
 
   auto* fiber = idle_fibers_.PopFront();
@@ -355,12 +344,11 @@ Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) 
     std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow)
                                                     detail::fiber::Fiber());
     if (!owned) {
-      return Fail(ENOMEM, "spawn");
+      return Error::fail_errno(ENOMEM, "spawn");
     }
     owned->runtime = this;
 
-    const auto stack =
-        TRY(detail::stack::AllocateStack(opts_.stack_size, opts_.guard_size));
+    TRY(stack, detail::stack::AllocateStack(opts_.stack_size, opts_.guard_size));
     owned->stack = stack;
 
     // Only push to all_fibers_ once all allocations have succeeded.
@@ -418,14 +406,14 @@ TIO_NO_SANITIZE_ADDRESS void IO::SuspendFiber(detail::fiber::Fiber* fiber) noexc
   // Check 1: Did the user try to cheat and call this from a different OS thread?
   // Check 2: Did the user call this from main() instead of inside a fiber?
   if (!IsOwnerThread() || current_fiber_ == nullptr) {
-    return Fail(EPERM, "yield");
+    return Error::fail_errno(EPERM, "yield");
   }
 
   assert(current_fiber_->runtime == this);
   assert(current_fiber_->state == detail::fiber::FiberState::running);
 
   if (stopping_) {
-    return Fail(ECANCELED, "yield");
+    return Error::fail_errno(ECANCELED, "yield");
   }
 
   PushReady(current_fiber_);
@@ -466,8 +454,8 @@ void IO::CancelAndDrain() noexcept {
     if (fiber.wait_kind == detail::fiber::WaitKind::io) {
       auto res = GetSqe();
       if (!res) {
-        ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op,
-                   res.error().ErrorCode().message());
+        ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", res.error().context(),
+                res.error().message());
         return;
       }
       io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber.operation), 0);
@@ -480,8 +468,8 @@ void IO::CancelAndDrain() noexcept {
   for (uint64_t tagged_ptr : active_multishots_) {
     auto res = GetSqe();
     if (!res) {
-      ALOG_ERROR("cancel SQE alloc failed: [{}] {}", res.error().op,
-                 res.error().ErrorCode().message());
+      ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", res.error().context(),
+              res.error().message());
       continue;
     }
     io_uring_prep_cancel64(res.value(), tagged_ptr, 0);
@@ -505,8 +493,8 @@ void IO::CancelAndDrain() noexcept {
   drain_to_completion_ = true;
   while (inflight_ops_ > 0 || !ready_queue_.Empty()) {
     if (auto res = Tick(); !res) {
-      ALOG_ERROR("tick failed during cancel_and_drain: [{}] {}", res.error().op,
-                 res.error().ErrorCode().message());
+      ELOGFMT(ERROR, "tick failed during cancel_and_drain: [{}] {}",
+              res.error().context(), res.error().message());
       break;
     }
   }
@@ -528,11 +516,12 @@ void IO::CancelAndDrain() noexcept {
   });
 
   if (abandoned_sync_fibers) {
-    ALOG_WARN("IO #{} teardown: forcefully waking up abandoned sync-parked fibers", id_);
+    ELOGFMT(WARN, "IO #{} teardown: forcefully waking up abandoned sync-parked fibers",
+            id_);
     while (inflight_ops_ > 0 || !ready_queue_.Empty()) {
       if (auto res = Tick(); !res) {
-        ALOG_ERROR("tick failed during cancel_and_drain pass 2: [{}] {}", res.error().op,
-                   res.error().ErrorCode().message());
+        ELOGFMT(ERROR, "tick failed during cancel_and_drain pass 2: [{}] {}",
+                res.error().context(), res.error().message());
         break;
       }
     }
@@ -584,7 +573,7 @@ Result<void> IO::SubmitOrWait(const bool runnable) noexcept {
     }
 
     if (ret < 0 && ret != -EINTR) {
-      return Fail(-ret, "submit_or_wait_for.io_uring_submit");
+      return Error::fail_errno(-ret, "submit_or_wait_for.io_uring_submit");
     }
   } else {
     // Sleep until a CQE arrives, the eventfd is written, or the nearest
@@ -602,7 +591,8 @@ Result<void> IO::SubmitOrWait(const bool runnable) noexcept {
     io_uring_cqe* cqe = nullptr;
     if (const auto ret = io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
         ret < 0 && ret != -EINTR && ret != -ETIME) {
-      return Fail(-ret, "submit_or_wait_for.io_uring_submit_and_wait_timeout");
+      return Error::fail_errno(-ret,
+                               "submit_or_wait_for.io_uring_submit_and_wait_timeout");
     }
   }
 
@@ -619,7 +609,7 @@ Result<io_uring_sqe*> IO::GetSqe() noexcept {
 
   // its a fatal error if its null again
   if (sqe == nullptr) {
-    return Fail(ENOSPC, "get_sqe");
+    return Error::fail_errno(ENOSPC, "get_sqe");
   }
   return sqe;
 }
@@ -640,13 +630,13 @@ void IO::Wake() noexcept {
     if (n == -1 && errno == EINTR) {
       continue;
     }
-    ALOG_WARN("failed to wake io context with eventfd: {}", std::strerror(errno));
+    ELOGFMT(WARN, "failed to wake io context with eventfd: {}", std::strerror(errno));
     return;
   }
 }
 
 Result<void> IO::ArmWakeRead() noexcept {
-  io_uring_sqe* sqe = TRY(GetSqe());
+  TRY(sqe, GetSqe());
   io_uring_prep_read(sqe, wake_fd_, &wake_value_, sizeof(wake_value_), 0);
   io_uring_sqe_set_data64(sqe, k_wakeup_sentinel);
   io_uring_submit(&ring_);
@@ -655,7 +645,7 @@ Result<void> IO::ArmWakeRead() noexcept {
 
 Result<void> IO::Activate() noexcept {
   if (is_activated_) {
-    ALOG_DEBUG("IO is already activated, this is a noop");
+    ELOGFMT(DEBUG, "IO is already activated, this is a noop");
     return {};
   }
 
@@ -670,14 +660,13 @@ Result<void> IO::Activate() noexcept {
           static_cast<unsigned int>(ring_.ring_fd),
           static_cast<unsigned int>(IORING_REGISTER_ENABLE_RINGS), nullptr, 0);
       ret < 0) {
-    return Fail(-ret, "io_uring_register");
+    return Error::fail_errno(-ret, "io_uring_register");
   }
 
   // we need to submit a first read, and this is a good place
   if (auto res = ArmWakeRead(); !res) {
     const auto err = res.error();
-    ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op,
-              err.ErrorCode().message());
+    ELOGFMT(WARN, "failed to re-arm eventfd read: [{}] {}", err.context(), err.message());
   }
   is_activated_ = true;
 
@@ -696,11 +685,11 @@ Result<std::size_t> IO::DrainCompletions() noexcept {
     if (__builtin_expect(!!(raw_data & 1ULL), 0)) {
       auto* state = reinterpret_cast<MultishotAcceptState*>(raw_data & ~1ULL);
 
-      Result<Fd> client_res;
+      Result<UniqueFd> client_res;
       if (cqe->res >= 0) {
-        client_res = Fd{cqe->res};
+        client_res = UniqueFd{cqe->res};
       } else {
-        client_res = Fail(-cqe->res, "multishot_accept");
+        client_res = Error::fail_errno(-cqe->res, "multishot_accept");
       }
 
       // Always invoke the handler: on success, on transient errors (MORE set),
@@ -748,8 +737,8 @@ Result<std::size_t> IO::DrainCompletions() noexcept {
   if (needs_rearm) {
     if (auto res = ArmWakeRead(); !res) {
       const auto err = res.error();
-      ALOG_WARN("failed to re-arm eventfd read: [{}] {}", err.op,
-                err.ErrorCode().message());
+      ELOGFMT(WARN, "failed to re-arm eventfd read: [{}] {}", err.context(),
+              err.message());
     }
   }
 
@@ -773,8 +762,8 @@ void IO::DrainRemote() {
 
     for (size_t i = 0; i < dequeued; ++i) {
       if (auto res = SpawnTask(std::move(fns[i])); !res) {
-        ALOG_ERROR("failed to spawn posted task: [{}] {}", res.error().op,
-                   res.error().ErrorCode().message());
+        ELOGFMT(ERROR, "failed to spawn posted task: [{}] {}", res.error().context(),
+                res.error().message());
       }
     }
     total_processed += dequeued;
@@ -826,15 +815,15 @@ Result<void> IO::Tick() noexcept {
         io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || !post_queue_.Empty();
     if (auto ret = SubmitOrWait(runnable); !ret) {
       auto err = ret.error();
-      ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op,
-                 err.ErrorCode().message());
+      ELOGFMT(ERROR, "failed to submit and wait for io: [{}] {}", err.context(),
+              err.message());
     }
 
     // Phase 3: reap. Completions only mark fibers ready; the next
     // iteration's phase 1 resumes them.
-    auto count =
-        TRY_LOG_ERR(DrainCompletions(), "current tick run failed to drain completions");
-    ALOG_DEBUG("drained {} io completions", count);
+    TRY_LOG_ERR(count, DrainCompletions(),
+                "current tick run failed to drain completions");
+    ELOGFMT(DEBUG, "drained {} io completions", count);
 
     // Cancel overdue timed ops. Runs after drain_completions() on purpose:
     // ops that completed in this batch have already been disarmed, so we
@@ -849,14 +838,13 @@ Result<void> IO::Tick() noexcept {
   // sleeps the thread until the kernel wakes us via a CQE.
   if (auto ret = SubmitOrWaitFor(); !ret) {
     auto err = ret.error();
-    ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op,
-               err.ErrorCode().message());
+    ELOGFMT(ERROR, "failed to submit and wait for io: [{}] {}", err.context(),
+            err.message());
   }
 
-  auto count =
-      TRY_LOG_ERR(DrainCompletions(), "current tick run failed to drain completions");
+  TRY_LOG_ERR(count, DrainCompletions(), "current tick run failed to drain completions");
 
-  ALOG_DEBUG("drained {} io completions", count);
+  ELOGFMT(DEBUG, "drained {} io completions", count);
 
   // Cancel overdue timed ops. Runs after drain_completions() on purpose:
   // ops that completed in this batch have already been disarmed, so we
@@ -897,8 +885,8 @@ void IO::PinToCpu() const {
 
   if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
       rc != 0) {
-    ALOG_INFO("Warning: Failed to pin to physical CPU {}: {}", physical_core_id,
-              std::generic_category().message(rc));
+    ELOGFMT(INFO, "Warning: Failed to pin to physical CPU {}: {}", physical_core_id,
+            std::generic_category().message(rc));
   }
 }
 
@@ -910,7 +898,7 @@ void IO::Run(const std::stop_token& st) noexcept {
 
   if (auto res = Activate(); !res.has_value()) {
     auto err = res.error();
-    ALOG_ERROR("failed to activate io uring: [{}] {}", err.op, err.ErrorCode().message());
+    ELOGFMT(ERROR, "failed to activate io uring: [{}] {}", err.context(), err.message());
     return;
   }
 
@@ -918,19 +906,19 @@ void IO::Run(const std::stop_token& st) noexcept {
   while (!st.stop_requested()) {
     if (auto res = Tick(); !res) {
       const auto err = res.error();
-      ALOG_ERROR("tick failed: [{}] {}", err.op, err.ErrorCode().message());
+      ELOGFMT(ERROR, "tick failed: [{}] {}", err.context(), err.message());
     }
   }
 
   stopping_.store(true, std::memory_order_release);
-  ALOG_INFO("Worker {} quiescing...", id_);
+  ELOGFMT(INFO, "Worker {} quiescing...", id_);
   CancelAndDrain();
 
   is_running_ = false;
 
   if (live_fibers_ > 0) {
-    ALOG_WARN("Worker {} stopped with {} live fibers (stuck in app logic?)", id_,
-              live_fibers_);
+    ELOGFMT(WARN, "Worker {} stopped with {} live fibers (stuck in app logic?)", id_,
+            live_fibers_);
   }
 }
 
@@ -942,8 +930,7 @@ void IO::RunUntilDone() noexcept {
 
   if (auto res = Activate(); !res) {
     const auto err = res.error();
-    ALOG_ERROR("failed to activate io worker: [{}] {}", err.op,
-               err.ErrorCode().message());
+    ELOGFMT(ERROR, "failed to activate io worker: [{}] {}", err.context(), err.message());
     is_running_ = false;
     return;
   }
@@ -962,7 +949,7 @@ void IO::RunUntilDone() noexcept {
          !post_queue_.Empty()) {
     if (auto res = Tick(); !res) {
       const auto err = res.error();
-      ALOG_ERROR("io tick failed: [{}] {}", err.op, err.ErrorCode().message());
+      ELOGFMT(ERROR, "io tick failed: [{}] {}", err.context(), err.message());
       break;
     }
   }
@@ -974,7 +961,7 @@ void IO::RunUntilDone() noexcept {
 // ======================= IO Methods ==========================================
 //
 
-Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
+Result<uint32_t> IO::Read(const UniqueFd& fd, const std::span<std::byte> buf,
                           const off_t offset) noexcept {
   return Syscall("read", [&](io_uring_sqe* sqe) {
     io_uring_prep_read(sqe, fd.Get(), buf.data(), static_cast<unsigned int>(buf.size()),
@@ -983,7 +970,7 @@ Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
   });
 }
 
-Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf, const size_t len,
+Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf, const size_t len,
                                const off_t file_offset,
                                const size_t buffer_offset) noexcept {
   return Syscall("read_fixed", [&](io_uring_sqe* sqe) {
@@ -995,12 +982,12 @@ Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf, const size_t len,
   });
 }
 
-Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf,
+Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf,
                                const off_t file_offset) noexcept {
   return ReadFixed(fd, buf, buf.Size(), file_offset, 0);
 }
 
-Result<uint32_t> IO::Writev(const Fd& fd, std::span<const iovec> iovecs,
+Result<uint32_t> IO::Writev(const UniqueFd& fd, std::span<const iovec> iovecs,
                             const off_t offset) noexcept {
   return Syscall("writev", [&](io_uring_sqe* sqe) {
     io_uring_prep_writev(sqe, fd.Get(), iovecs.data(),
@@ -1010,21 +997,21 @@ Result<uint32_t> IO::Writev(const Fd& fd, std::span<const iovec> iovecs,
   });
 }
 
-Result<void> IO::Fsync(const Fd& fd, const bool datasync) noexcept {
+Result<void> IO::Fsync(const UniqueFd& fd, const bool datasync) noexcept {
   return Syscall<void>("fsync", [&](io_uring_sqe* sqe) {
     io_uring_prep_fsync(sqe, fd.Get(), datasync ? IORING_FSYNC_DATASYNC : 0);
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
 
-Result<Fd> IO::Open(const std::filesystem::path& path, const int flags,
-                    const mode_t mode) noexcept {
-  return Syscall<Fd>("open", [&](io_uring_sqe* sqe) {
+Result<UniqueFd> IO::Open(const std::filesystem::path& path, const int flags,
+                          const mode_t mode) noexcept {
+  return Syscall<UniqueFd>("open", [&](io_uring_sqe* sqe) {
     io_uring_prep_openat(sqe, AT_FDCWD, path.c_str(), flags, mode);
   });
 }
 
-Result<void> IO::Fallocate(const Fd& fd, const int mode, const off_t offset,
+Result<void> IO::Fallocate(const UniqueFd& fd, const int mode, const off_t offset,
                            const off_t len) noexcept {
   return Syscall<void>("fallocate", [&](io_uring_sqe* sqe) {
     io_uring_prep_fallocate(sqe, fd.Get(), mode, static_cast<std::uint64_t>(offset),
@@ -1033,16 +1020,16 @@ Result<void> IO::Fallocate(const Fd& fd, const int mode, const off_t offset,
   });
 }
 
-Result<void> IO::Ftruncate(const Fd& fd, const off_t len) noexcept {
+Result<void> IO::Ftruncate(const UniqueFd& fd, const off_t len) noexcept {
   return Syscall<void>("ftruncate", [&](io_uring_sqe* sqe) {
     io_uring_prep_ftruncate(sqe, fd.Get(), len);
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
 
-Result<Fd> IO::Accept(const Fd& server_fd, SocketAddress& client_addr,
-                      int flags) noexcept {
-  return Syscall<Fd>("accept", [&](io_uring_sqe* sqe) {
+Result<UniqueFd> IO::Accept(const UniqueFd& server_fd, SocketAddress& client_addr,
+                            int flags) noexcept {
+  return Syscall<UniqueFd>("accept", [&](io_uring_sqe* sqe) {
     client_addr.addrlen = sizeof(sockaddr_storage);
     io_uring_prep_accept(sqe, server_fd.Get(), client_addr.GetMutable(),
                          &client_addr.addrlen, flags);
@@ -1050,14 +1037,14 @@ Result<Fd> IO::Accept(const Fd& server_fd, SocketAddress& client_addr,
   });
 }
 
-Result<Fd> IO::Accept(const Fd& server_fd, const int flags) noexcept {
-  return Syscall<Fd>("accept", [&](io_uring_sqe* sqe) {
+Result<UniqueFd> IO::Accept(const UniqueFd& server_fd, const int flags) noexcept {
+  return Syscall<UniqueFd>("accept", [&](io_uring_sqe* sqe) {
     io_uring_prep_accept(sqe, server_fd.Get(), nullptr, nullptr, flags);
     if (server_fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
 
-Result<uint32_t> IO::Write(const Fd& fd, std::span<const std::byte> buf,
+Result<uint32_t> IO::Write(const UniqueFd& fd, std::span<const std::byte> buf,
                            const off_t offset) noexcept {
   return Syscall("write", [&](io_uring_sqe* sqe) {
     io_uring_prep_write(sqe, fd.Get(), buf.data(), static_cast<unsigned int>(buf.size()),
@@ -1066,8 +1053,8 @@ Result<uint32_t> IO::Write(const Fd& fd, std::span<const std::byte> buf,
   });
 }
 
-Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf, const size_t len,
-                                const off_t file_offset,
+Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
+                                const size_t len, const off_t file_offset,
                                 const size_t buffer_offset) noexcept {
   return Syscall("write_fixed", [&](io_uring_sqe* sqe) {
     const void* start_addr = buf.Ptr() + buffer_offset;
@@ -1078,12 +1065,12 @@ Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf, const size
   });
 }
 
-Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf,
+Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                 const off_t file_offset) noexcept {
   return WriteFixed(fd, buf, buf.Size(), file_offset, 0);
 }
 
-Result<uint32_t> IO::Readv(const Fd& fd, std::span<const iovec> iovecs,
+Result<uint32_t> IO::Readv(const UniqueFd& fd, std::span<const iovec> iovecs,
                            const off_t offset) noexcept {
   return Syscall("readv", [&](io_uring_sqe* sqe) {
     io_uring_prep_readv(sqe, fd.Get(), iovecs.data(),
@@ -1106,14 +1093,14 @@ Result<void> IO::Rename(const std::filesystem::path& from,
   });
 }
 
-Result<uint32_t> IO::Poll(const Fd& fd, const unsigned poll_mask) noexcept {
+Result<uint32_t> IO::Poll(const UniqueFd& fd, const unsigned poll_mask) noexcept {
   return Syscall("poll", [&](io_uring_sqe* sqe) {
     io_uring_prep_poll_add(sqe, fd.Get(), poll_mask);
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
 
-Result<void> IO::Connect(const Fd& fd, const SocketAddress& addr) noexcept {
+Result<void> IO::Connect(const UniqueFd& fd, const SocketAddress& addr) noexcept {
   return Syscall<void>("connect", [&](io_uring_sqe* sqe) {
     io_uring_prep_connect(sqe, fd.Get(), addr.Get(), addr.addrlen);
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
@@ -1131,8 +1118,8 @@ void IO::ProcessExpiredTimers() noexcept {
         auto res = GetSqe();
         if (!res) {
           // Could not cancel now: re-arm one tick out and retry.
-          ALOG_ERROR("timeout cancel SQE alloc failed: [{}] {}", res.error().op,
-                     res.error());
+          ELOGFMT(ERROR, "timeout cancel SQE alloc failed: [{}] {}",
+                  res.error().context(), res.error().message());
           timer_wheel_.Arm(fiber,
                            detail::MonotonicNowNs() + detail::TimerWheel::k_tick_ns);
           return;
@@ -1153,7 +1140,7 @@ void IO::ProcessExpiredTimers() noexcept {
   }
 }
 
-Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
+Result<uint32_t> IO::Read(const UniqueFd& fd, const std::span<std::byte> buf,
                           const std::chrono::nanoseconds timeout,
                           const off_t offset) noexcept {
   return SyscallTimed("read_timed", timeout, [&](io_uring_sqe* sqe) {
@@ -1163,7 +1150,7 @@ Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
   });
 }
 
-Result<uint32_t> IO::Write(const Fd& fd, const std::span<const std::byte> buf,
+Result<uint32_t> IO::Write(const UniqueFd& fd, const std::span<const std::byte> buf,
                            const std::chrono::nanoseconds timeout,
                            const off_t offset) noexcept {
   return SyscallTimed("write_timed", timeout, [&](io_uring_sqe* sqe) {
@@ -1173,15 +1160,16 @@ Result<uint32_t> IO::Write(const Fd& fd, const std::span<const std::byte> buf,
   });
 }
 
-Result<Fd> IO::Accept(const Fd& server_fd, const std::chrono::nanoseconds timeout,
-                      const int flags) noexcept {
-  return SyscallTimed<Fd>("accept_timed", timeout, [&](io_uring_sqe* sqe) {
+Result<UniqueFd> IO::Accept(const UniqueFd& server_fd,
+                            const std::chrono::nanoseconds timeout,
+                            const int flags) noexcept {
+  return SyscallTimed<UniqueFd>("accept_timed", timeout, [&](io_uring_sqe* sqe) {
     io_uring_prep_accept(sqe, server_fd.Get(), nullptr, nullptr, flags);
     if (server_fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
 
-Result<void> IO::Connect(const Fd& fd, const SocketAddress& addr,
+Result<void> IO::Connect(const UniqueFd& fd, const SocketAddress& addr,
                          const std::chrono::nanoseconds timeout) noexcept {
   return SyscallTimed<void>("connect_timed", timeout, [&](io_uring_sqe* sqe) {
     io_uring_prep_connect(sqe, fd.Get(), addr.Get(), addr.addrlen);
@@ -1189,7 +1177,7 @@ Result<void> IO::Connect(const Fd& fd, const SocketAddress& addr,
   });
 }
 
-Result<uint32_t> IO::Poll(const Fd& fd, const unsigned poll_mask,
+Result<uint32_t> IO::Poll(const UniqueFd& fd, const unsigned poll_mask,
                           const std::chrono::nanoseconds timeout) noexcept {
   return SyscallTimed("poll_timed", timeout, [&](io_uring_sqe* sqe) {
     io_uring_prep_poll_add(sqe, fd.Get(), poll_mask);
@@ -1214,7 +1202,7 @@ Result<void> IO::SleepForNs(const std::chrono::nanoseconds duration) noexcept {
   auto r = Syscall<void>(
       "sleep_for", [&](io_uring_sqe* sqe) { io_uring_prep_timeout(sqe, &ts, 0U, 0U); });
 
-  if (!r && r.error().code == ETIME) {
+  if (!r && r.error().value() == ETIME) {
     return {};
   }
 
@@ -1222,21 +1210,21 @@ Result<void> IO::SleepForNs(const std::chrono::nanoseconds duration) noexcept {
 }
 
 Result<void> IO::AcceptLoopImpl(
-    Fd server_fd,
-    std::move_only_function<void(IO&, Result<Fd>) noexcept> handler) noexcept {
-  if (stopping_) return Fail(ECANCELED, "accept_loop");
-  if (!server_fd.IsValid()) return Fail(EBADF, "accept_loop: invalid fd");
+    UniqueFd server_fd,
+    std::move_only_function<void(IO&, Result<UniqueFd>) noexcept> handler) noexcept {
+  if (stopping_) return Error::fail_errno(ECANCELED, "accept_loop");
+  if (!server_fd.Valid()) return Error::fail_errno(EBADF, "accept_loop: invalid fd");
 
   auto* state = new (std::nothrow) MultishotAcceptState{.server_fd = std::move(server_fd),
                                                         .handler = std::move(handler)};
-  if (!state) return Fail(ENOMEM, "accept_loop: OOM allocating state");
+  if (!state) return Error::fail_errno(ENOMEM, "accept_loop: OOM allocating state");
   static_assert(alignof(MultishotAcceptState) >= 2,
                 "tagged pointer requires even alignment");
 
   auto* sqe = GetSqe().value_or(nullptr);
   if (!sqe) {
     delete state;
-    return Fail(EAGAIN, "accept_loop: ring full");
+    return Error::fail_errno(EAGAIN, "accept_loop: ring full");
   }
 
   io_uring_prep_multishot_accept(sqe, state->server_fd.Get(), nullptr, nullptr, 0);

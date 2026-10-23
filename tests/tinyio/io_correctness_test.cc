@@ -25,7 +25,7 @@ TEST(IOCorrectnessTest, FileWriteReadRoundtrip) {
 
     auto fd_res = fio.Open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
     ASSERT_TRUE(fd_res.has_value());
-    Fd fd = std::move(*fd_res);
+    UniqueFd fd = std::move(*fd_res);
 
     std::string_view test_data = "Hello, tinyio!";
     auto write_res = fio.Write(fd, std::as_bytes(std::span(test_data)), 0);
@@ -72,7 +72,7 @@ TEST(IOCorrectnessTest, FixedBufferWriteRead) {
     auto file_path = std::filesystem::temp_directory_path() / "tinyio_test_fixed.txt";
     auto fd_res = fio.Open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
     ASSERT_TRUE(fd_res.has_value());
-    Fd fd = std::move(*fd_res);
+    UniqueFd fd = std::move(*fd_res);
 
     auto buf_res = pool.Take(4096);
     ASSERT_TRUE(buf_res.has_value());
@@ -105,7 +105,7 @@ TEST(IOCorrectnessTest, TcpAcceptEcho) {
 
   auto server_fd_res = TcpListener::Bind(0, "127.0.0.1");
   ASSERT_TRUE(server_fd_res.has_value());
-  Fd server_fd = std::move(*server_fd_res);
+  UniqueFd server_fd = std::move(*server_fd_res);
 
   struct sockaddr_in sin;
   socklen_t len = sizeof(sin);
@@ -118,7 +118,8 @@ TEST(IOCorrectnessTest, TcpAcceptEcho) {
 
   (void)io.Spawn([server_fd = std::move(server_fd)](IO& fio) mutable noexcept {
     (void)fio.AcceptLoop(
-        std::move(server_fd), [](IO& accept_fio, Result<Fd> client_fd_res) noexcept {
+        std::move(server_fd),
+        [](IO& accept_fio, Result<UniqueFd> client_fd_res) noexcept {
           if (!client_fd_res.has_value()) return;
           (void)accept_fio.Spawn(
               [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
@@ -135,7 +136,7 @@ TEST(IOCorrectnessTest, TcpAcceptEcho) {
   });
 
   (void)io.Spawn([port, stop_source](IO& fio) mutable noexcept {
-    Fd client_fd(socket(AF_INET, SOCK_STREAM, 0));
+    UniqueFd client_fd(socket(AF_INET, SOCK_STREAM, 0));
     SocketAddress addr = SocketAddress::V4(static_cast<std::uint16_t>(port), "127.0.0.1");
     auto conn_res = fio.Connect(client_fd, addr);
     ASSERT_TRUE(conn_res.has_value());

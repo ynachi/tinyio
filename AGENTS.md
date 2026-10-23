@@ -23,6 +23,86 @@ command per task.
   formatting, the same way kio excludes its `include/libs`.
 - tinyio is Linux-only (liburing + boost::context); verify on srv401, not on
   macOS.
+- Dependencies are fetched: liburing, googletest, and **YLT** (yalantinglibs)
+  for logging and serialization. YLT is header-only here and only the easylog
+  and struct_pack modules are reachable — `cmake/TinyioDependencies.cmake`
+  turns every optional YLT backend off with the `YLT_ENABLE_*` switches.
+
+## Errors and logging
+
+tinyio uses kio's error handling and YLT's easylog for logging.
+
+### Errors
+
+`src/tinyio/error.hpp` carries kio's `Error`: a `std::error_code` plus the
+operation that failed, wrapped in `std::expected` as `Result<T>`.
+
+```cpp
+auto listener = TcpListener::Bind(8080);
+if (!listener) {
+  ELOGFMT(ERROR, "bind failed: {}", listener.error().message());
+  return std::unexpected(listener.error());
+}
+```
+
+kio's macros are how an error propagates:
+
+| Macro | What it does |
+|-------|--------------|
+| `TRY(var, expr)` | binds the value of a `Result<T>`, returns the error if there is none |
+| `TRY_VOID(expr)` | the same for a `Result<void>` |
+| `TRY_LOG_ERR(var, expr, fmt, ...)` | like `TRY`, but logs the failure first |
+| `TRY_LOG_ERR_VOID(expr, fmt, ...)` | like `TRY_VOID`, but logs the failure first |
+
+`TRY_LOG_ERR` earns its extra characters: the log line points at the exact
+source location that failed.
+
+### Logging
+
+Log with easylog's macros directly — `ELOGFMT(INFO, "… {}", value)` — there is
+no tinyio logging wrapper. `ELOGFMT` is the format style, `ELOG`/`ELOGV` the
+stream style. Use `ELOGFMT` when the message needs format specs (`{:<24}`,
+`{:>6.1f}`) and the stream style otherwise.
+
+Three things are worth knowing before touching a log call:
+
+- **easylog has to be initialized.** `src/tinyio/logging.hpp` does it once,
+  before `main`, with INFO and above on the console, no log file and
+  synchronous writes; every public header that pulls in easylog includes it,
+  so logging works out of the box. A program that wants other settings calls
+  `easylog::init_log()` in `main`, which replaces them. Without an
+  `init_log()` call easylog silently drops every record: its default logger
+  never starts the writer thread.
+- **The format backend is pinned to `std::format`.**
+  `cmake/TinyioFmtShim/fmt/format.h` shadows the system fmt so easylog always
+  takes the `std::format` path. Otherwise the backend would depend on whether
+  the host happens to have fmt installed, and the fmt that ships with Ubuntu
+  25.04 (10.1.1) does not compile with clang 21 in the header-only mode
+  easylog forces. `TINYIO_USE_SYSTEM_FMT=ON` opts out.
+- **YLT is pinned to the `0.6.1` release tag**, not to a branch. 0.6.1 has the
+  easylog fix for a lost wakeup in `appender::stop()`: the old code set the
+  stop flag while holding the file mutex instead of the queue mutex the writer
+  thread waits on, so the notification could be dropped and `~appender()`
+  would block forever in `join()` — any tinyio program that logged and exited
+  could hang at exit. The same release dropped the `start_thread()` call from
+  easylog's default logger, which is why the initialization above matters.
+
+### Stack traces
+
+easylog prints a stack trace on a fatal record, from `std::stacktrace` when
+the standard library can link it and from YLT's own backtrace helper
+otherwise. `cmake/TinyioStacktrace.cmake` probes which one works at configure
+time: some toolchains ship the `<stacktrace>` header without the matching
+runtime support (GCC 15 headers on a GCC 16 runtime), and then every
+translation unit that reaches easylog's fatal path fails to link.
+
+On srv401 the probe fails — that box runs GCC 15 headers on a GCC 16 runtime,
+and GCC 16's libstdc++ exports no stacktrace symbols at all — so the fallback
+is used and the trace shows bare addresses: YLT's `b_stacktrace` zeroes the
+module base before handing the address to `addr2line`, so nothing resolves.
+On a box whose headers and runtime match, `std::stacktrace` is used instead
+and the trace carries function names. The executables are linked with
+`-rdynamic` so the main binary's symbols are in the dynamic symbol table.
 
 ## Performance work: tinyio is the baseline
 
