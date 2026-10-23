@@ -14,7 +14,6 @@
 using namespace tinyio;
 
 namespace {
-constexpr bool kUseRemoteDispatch = false;
 volatile std::sig_atomic_t g_stop_requested = 0;
 
 struct Options {
@@ -35,6 +34,18 @@ constexpr std::string_view kHttpResponse =
     "\r\n"
     "Hello, io_uring!";
 
+// Write the whole buffer, retrying on partial writes
+static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> data) {
+  while (!data.empty()) {
+    const auto written = TRY(fio.Write(fd, data));
+    if (written == 0) {
+      return Fail(EIO, "write");
+    }
+    data = data.subspan(written);
+  }
+  return {};
+}
+
 // Handle a single client connection
 static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
   std::byte buf[1024];
@@ -50,9 +61,8 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
     const std::span out_buf(reinterpret_cast<const std::byte*>(kHttpResponse.data()),
                             kHttpResponse.size());
 
-    if (const auto w_n =
-            TRY_LOG_ERR(fio.Write(client_fd, out_buf), "failed to write to client");
-        w_n == 0) {
+    if (auto res = write_all(fio, client_fd, out_buf); !res) {
+      ALOG_ERROR("failed to write response: {}", res.error());
       break;
     }
   }
@@ -60,18 +70,8 @@ static Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
   return {};
 }
 
-static Result<void> write_all(IO& fio, const Fd& fd, std::span<const std::byte> data) {
-  while (!data.empty()) {
-    const auto written = TRY(fio.Write(fd, data));
-    if (written == 0) {
-      return Fail(EIO, "write");
-    }
-    data = data.subspan(written);
-  }
-  return {};
-}
 // Accept incoming connections on a single worker
-static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st) {
+static Result<void> server_loop(IO& fio, uint16_t port) {
   auto server_fd =
       TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "failed to bind");
 
@@ -85,8 +85,8 @@ static Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st) {
         }
 
         (void)worker_fio.Spawn(
-            [client_fd = std::move(*client_fd_res)](IO& worker_fio) mutable noexcept {
-              if (auto res = handle_client(worker_fio, std::move(client_fd)); !res) {
+            [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
+              if (auto res = handle_client(client_fio, std::move(client_fd)); !res) {
                 ALOG_ERROR("Client handler failed: {}", res.error());
               }
             });
@@ -123,7 +123,7 @@ int main() {
 
       // Spawn the initial accept loop fiber onto this worker
       (void)worker.Spawn([st](IO& fio) noexcept {
-        if (auto res = server_loop(fio, port, st); !res) {
+        if (auto res = server_loop(fio, port); !res) {
           ALOG_ERROR("Server loop failed: {}", res.error());
         }
       });

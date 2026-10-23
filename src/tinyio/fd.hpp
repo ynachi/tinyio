@@ -84,7 +84,7 @@ struct Fd {
   template <SocketOption... Opts>
   [[nodiscard]] Result<void> SetOptions(Opts&&... opts) const noexcept {
     Result<void> r;
-    ((r = std::forward<Opts>(opts).Apply(fd), r.has_value()) && ...);
+    static_cast<void>(((r = std::forward<Opts>(opts).Apply(fd), r.has_value()) && ...));
     return r;
   }
 };

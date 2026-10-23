@@ -156,10 +156,19 @@ TEST_F(SingleBucketPoolTest, SelfMoveAssignmentIsNoOp) {
   ASSERT_TRUE(buf.has_value());
 
   auto* raw = &*buf;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wself-move"
+#if defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wself-move"
+#else
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wself-move"
+#endif
   *raw = std::move(*raw);
-#pragma clang diagnostic pop
+#if defined(__clang__)
+#  pragma clang diagnostic pop
+#else
+#  pragma GCC diagnostic pop
+#endif
 
   // Buffer must still be valid after self-move.
   EXPECT_TRUE(buf->Valid());

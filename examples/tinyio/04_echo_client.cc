@@ -18,8 +18,7 @@ using tinyio::IO;
 using tinyio::Result;
 using tinyio::SocketAddress;
 
-namespace
-{
+namespace {
 DEFINE_string(ip, "127.0.0.1", "IP address to connect to");
 DEFINE_uint64(port, 8080, "Port to connect to");
 DEFINE_uint64(threads, 4, "Number of OS threads");
@@ -29,103 +28,91 @@ DEFINE_uint64(messages, 100, "Number of messages per client");
 std::atomic<uint64_t> total_success{0};
 std::atomic<uint64_t> total_errors{0};
 
-Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_id)
-{
-    const auto addr = SocketAddress::V4(FLAGS_port, FLAGS_ip.c_str());
-    Fd sock{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
-    if (!sock.IsValid())
-    {
-        return tinyio::Fail(errno, "socket");
+Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_id) {
+  const auto addr =
+      SocketAddress::V4(static_cast<uint16_t>(FLAGS_port), FLAGS_ip.c_str());
+  Fd sock{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+  if (!sock.IsValid()) {
+    return tinyio::Fail(errno, "socket");
+  }
+
+  if (auto err = io.Connect(sock, addr); !err.has_value()) {
+    return err;
+  }
+
+  const std::string msg = "Hello from thread " + std::to_string(thread_id) + " client " +
+                          std::to_string(client_id);
+  std::byte buf[4096];
+
+  for (uint64_t i = 0; i < FLAGS_messages; ++i) {
+    std::span to_write(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
+    while (!to_write.empty()) {
+      const auto written = TRY_LOG_ERR(io.Write(sock, to_write), "write to server");
+      if (written == 0) return tinyio::Fail(EIO, "write closed");
+      to_write = to_write.subspan(written);
     }
 
-    if (auto err = io.connect(sock, addr); !err.has_value())
-    {
-        return err;
+    const size_t expected = msg.size();
+    size_t received = 0;
+    while (received < expected) {
+      std::span<std::byte> read_buf(buf);
+      const auto n =
+          TRY_LOG_ERR(io.Read(sock, read_buf.subspan(received)), "read from server");
+      if (n == 0) return tinyio::Fail(EIO, "read closed");
+      received += n;
     }
 
-    const std::string msg = "Hello from thread " + std::to_string(thread_id) + " client " + std::to_string(client_id);
-    std::byte buf[4096];
-
-    for (uint64_t i = 0; i < FLAGS_messages; ++i)
-    {
-        std::span to_write(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        while (!to_write.empty())
-        {
-            const auto written = TRY_LOG_ERR(io.write(sock, to_write), "write to server");
-            if (written == 0)
-                return tinyio::Fail(EIO, "write closed");
-            to_write = to_write.subspan(written);
-        }
-
-        const size_t expected = msg.size();
-        size_t received = 0;
-        while (received < expected)
-        {
-            std::span<std::byte> read_buf(buf);
-            const auto n = TRY_LOG_ERR(io.read(sock, read_buf.subspan(received)), "read from server");
-            if (n == 0)
-                return tinyio::Fail(EIO, "read closed");
-            received += n;
-        }
-
-        std::string_view rec_msg(reinterpret_cast<const char*>(buf), received);
-        if (rec_msg != msg)
-        {
-            return tinyio::Fail(EBADMSG, "corrupted message");
-        }
+    std::string_view rec_msg(reinterpret_cast<const char*>(buf), received);
+    if (rec_msg != msg) {
+      return tinyio::Fail(EBADMSG, "corrupted message");
     }
+  }
 
-    ++total_success;
-    TRY_LOG_ERR(io.close(std::move(sock)), "close sock");
-    return {};
+  ++total_success;
+  TRY_LOG_ERR(io.Close(std::move(sock)), "close sock");
+  return {};
 }
 
-void thread_worker(uint64_t thread_id)
-{
-    IO io{static_cast<uint16_t>(thread_id), tinyio::IoOptions{}, {}};
+void thread_worker(uint64_t thread_id) {
+  IO io{static_cast<uint16_t>(thread_id), tinyio::IoOptions{}, {}};
 
-    for (uint64_t c = 0; c < FLAGS_clients_per_thread; ++c)
-    {
-        std::move_only_function<void(IO&) noexcept> task = [thread_id, c](IO& nio) mutable noexcept -> void
-        {
-            if (auto err = run_client(nio, thread_id, c); !err.has_value())
-            {
-                ++total_errors;
-                ALOG_ERROR("Client {}-{} error: {}", thread_id, c, err.error());
-            }
-        };
+  for (uint64_t c = 0; c < FLAGS_clients_per_thread; ++c) {
+    std::move_only_function<void(IO&) noexcept> task =
+        [thread_id, c](IO& nio) mutable noexcept -> void {
+      if (auto err = run_client(nio, thread_id, c); !err.has_value()) {
+        ++total_errors;
+        ALOG_ERROR("Client {}-{} error: {}", thread_id, c, err.error());
+      }
+    };
 
-        if (auto res = io.spawn(std::move(task)); !res.has_value())
-        {
-            ++total_errors;
-            ALOG_ERROR("Failed to spawn client {}-{}", thread_id, c);
-        }
+    if (auto res = io.Spawn(std::move(task)); !res.has_value()) {
+      ++total_errors;
+      ALOG_ERROR("Failed to spawn client {}-{}", thread_id, c);
     }
+  }
 
-    io.run_until_done();
+  io.RunUntilDone();
 }
 }  // namespace
 
-int main(int argc, char** argv)
-{
-    gflags::ParseCommandLineFlags(&argc, &argv, true);
+int main(int argc, char** argv) {
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    ALOG_INFO("Starting client with {} threads, {} clients per thread, {} messages per client", FLAGS_threads,
-              FLAGS_clients_per_thread, FLAGS_messages);
+  ALOG_INFO(
+      "Starting client with {} threads, {} clients per thread, {} messages per client",
+      FLAGS_threads, FLAGS_clients_per_thread, FLAGS_messages);
 
-    std::vector<std::thread> threads;
-    for (uint64_t i = 0; i < FLAGS_threads; ++i)
-    {
-        threads.emplace_back(thread_worker, i);
-    }
+  std::vector<std::thread> threads;
+  for (uint64_t i = 0; i < FLAGS_threads; ++i) {
+    threads.emplace_back(thread_worker, i);
+  }
 
-    for (auto& t : threads)
-    {
-        t.join();
-    }
+  for (auto& t : threads) {
+    t.join();
+  }
 
-    ALOG_INFO("Total success: {}", total_success.load());
-    ALOG_INFO("Total errors: {}", total_errors.load());
+  ALOG_INFO("Total success: {}", total_success.load());
+  ALOG_INFO("Total errors: {}", total_errors.load());
 
-    return total_errors.load() == 0 ? 0 : 1;
+  return total_errors.load() == 0 ? 0 : 1;
 }

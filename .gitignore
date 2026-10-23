@@ -121,3 +121,5 @@ dump.rdb
 go-benchmark.iml
 /testdata
 **/*/.rustc_info.json
+# The root Makefile is part of the build machinery: one command per task.
+!/Makefile

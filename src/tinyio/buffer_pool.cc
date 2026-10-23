@@ -45,7 +45,7 @@ FixedBufferPool::Bucket::Bucket(const size_t size, const size_t count,
 
   free_stack.reserve(count);
   for (uint32_t i = 0; i < count; ++i) {
-    free_stack.push_back(start + (count - 1 - i));
+    free_stack.push_back(start + static_cast<uint32_t>(count - 1 - i));
   }
 }
 
@@ -87,7 +87,7 @@ FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs) {
       global_iovecs_.push_back(
           {.iov_base = &buckets_.back().slab[i * config.size], .iov_len = config.size});
     }
-    current_global_index += config.count;
+    current_global_index += static_cast<uint32_t>(config.count);
   }
 
   ALOG_INFO("MultiSizeFixedBufferPool: {} buckets, {} total slots, {} MB allocated",

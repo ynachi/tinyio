@@ -1,5 +1,6 @@
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <iostream>
 #include <random>
 #include <thread>
@@ -16,22 +17,22 @@ void signal_handler(int) { g_stop_requested = 1; }
 }  // namespace
 
 Result<void> DoWrite(IO& fio, const std::string& filename) {
-  auto fd = TRY_LOG_ERR(fio.open(filename, O_CREAT | O_WRONLY | O_TRUNC, 0644), "open");
+  auto fd = TRY_LOG_ERR(fio.Open(filename, O_CREAT | O_WRONLY | O_TRUNC, 0644), "open");
 
   std::vector<uint8_t> block(64 * 1024, 'A');
-  const size_t total_size = 1024 * 1024 * 1024;
+  constexpr std::int64_t total_size = 1024LL * 1024 * 1024;
 
   auto start = steady_clock::now();
-  off_t offset = 0;
+  std::int64_t offset = 0;
   while (offset < total_size) {
     TRY_LOG_ERR(
-        fio.write(
+        fio.Write(
             fd, std::span{reinterpret_cast<const std::byte*>(block.data()), block.size()},
             offset),
         "write");
-    offset += block.size();
+    offset += static_cast<std::int64_t>(block.size());
   }
-  TRY(fio.close(std::move(fd)));
+  TRY(fio.Close(std::move(fd)));
 
   auto end = steady_clock::now();
   std::cout << "Sequential Write (1GB): "
@@ -40,12 +41,12 @@ Result<void> DoWrite(IO& fio, const std::string& filename) {
 }
 
 Result<void> DoRead(IO& fio, const std::string& filename) {
-  auto raw_fd = TRY_LOG_ERR(fio.open(filename, O_RDONLY), "open");
-  auto fd = TRY_LOG_ERR(fio.register_file(std::move(raw_fd)), "register_file");
+  auto raw_fd = TRY_LOG_ERR(fio.Open(filename, O_RDONLY), "open");
+  auto fd = TRY_LOG_ERR(fio.RegisterFile(std::move(raw_fd)), "register_file");
 
   std::vector<uint8_t> block(4096);
-  const size_t total_size = 1024 * 1024 * 1024;
-  const size_t num_reads = 100000;
+  constexpr std::int64_t total_size = 1024LL * 1024 * 1024;
+  constexpr size_t num_reads = 100000;
 
   std::mt19937_64 rng(42);
   std::uniform_int_distribution<off_t> dist(0, total_size - 4096);
@@ -54,11 +55,11 @@ Result<void> DoRead(IO& fio, const std::string& filename) {
   for (size_t i = 0; i < num_reads; ++i) {
     off_t offset = dist(rng);
     TRY_LOG_ERR(
-        fio.read(fd, std::span{reinterpret_cast<std::byte*>(block.data()), block.size()},
+        fio.Read(fd, std::span{reinterpret_cast<std::byte*>(block.data()), block.size()},
                  offset),
         "read");
   }
-  TRY(fio.close(std::move(fd)));
+  TRY(fio.Close(std::move(fd)));
 
   auto end = steady_clock::now();
   std::cout << "Random Read (100k 4KB reads): "
@@ -66,16 +67,16 @@ Result<void> DoRead(IO& fio, const std::string& filename) {
   return {};
 }
 
-Result<void> handle_client(IO& fio, Fd client_fd, const std::string& filename) noexcept {
+Result<void> handle_client(IO& fio, Fd client_fd) noexcept {
   std::byte buf[4096];
   while (true) {
-    auto r_n = TRY(fio.read(client_fd, std::span{buf}));
+    auto r_n = TRY(fio.Read(client_fd, std::span{buf}));
     if (r_n == 0) break;
 
     const std::string response =
         "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, "
         "World!";
-    if (!fio.write(client_fd,
+    if (!fio.Write(client_fd,
                    std::span{reinterpret_cast<const std::byte*>(response.data()),
                              response.size()}))
       break;
@@ -83,21 +84,20 @@ Result<void> handle_client(IO& fio, Fd client_fd, const std::string& filename) n
   return {};
 }
 
-Result<void> server_loop(IO& fio, uint16_t port, std::stop_token st,
-                         const std::string& filename) {
-  auto server_fd = TRY_LOG_ERR(TcpListener::bind(port, "0.0.0.0", 4096), "bind");
-  ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.id(), port);
+Result<void> server_loop(IO& fio, uint16_t port) {
+  auto server_fd = TRY_LOG_ERR(TcpListener::Bind(port, "0.0.0.0", 4096), "bind");
+  ALOG_INFO("[Worker {}] Listening on http://0.0.0.0:{}", fio.Id(), port);
 
-  return fio.accept_loop(
-      std::move(server_fd), [filename](IO& worker_fio, Result<Fd> client_fd) noexcept {
-        if (client_fd) {
-          (void)handle_client(worker_fio, std::move(*client_fd), filename);
-        }
-      });
+  return fio.AcceptLoop(std::move(server_fd),
+                        [](IO& worker_fio, Result<Fd> client_fd) noexcept {
+                          if (client_fd) {
+                            (void)handle_client(worker_fio, std::move(*client_fd));
+                          }
+                        });
 }
 
 int main(int argc, char* argv[]) {
-  tinyio::log::set_level(log::Level::Disabled);
+  tinyio::log::SetLevel(log::Level::Disabled);
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
   std::signal(SIGPIPE, SIG_IGN);
@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
 
   if (mode == "write" || mode == "read") {
     IO worker(0, opts, {});
-    worker.spawn([&](IO& fio) noexcept {
+    (void)worker.Spawn([&](IO& fio) noexcept {
       if (mode == "write")
         (void)DoWrite(fio, filename);
       else if (mode == "read")
@@ -123,7 +123,7 @@ int main(int argc, char* argv[]) {
       while (!g_stop_requested) std::this_thread::sleep_for(milliseconds(100));
       st.request_stop();
     });
-    worker.run(st.get_token());
+    worker.Run(st.get_token());
     t.join();
   } else if (mode == "server") {
     constexpr size_t num_threads = 4;
@@ -134,12 +134,11 @@ int main(int argc, char* argv[]) {
     for (std::size_t i = 0; i < num_threads; ++i) {
       stop_sources.emplace_back();
       auto st = stop_sources.back().get_token();
-      threads.emplace_back([i, port, st, filename, opts] {
+      threads.emplace_back([i, st, opts] {
         IO worker(i, opts, {});
-        (void)worker.spawn([port, st, filename](IO& fio) noexcept {
-          (void)server_loop(fio, port, st, filename);
-        });
-        worker.run(st);
+        // port is constexpr, so the inner lambda does not have to capture it.
+        (void)worker.Spawn([](IO& fio) noexcept { (void)server_loop(fio, port); });
+        worker.Run(st);
       });
     }
 

@@ -92,8 +92,12 @@ IO::~IO() noexcept {
   }
 
   if (wake_fd_ >= 0) {
-    ::close(wake_fd_);
-    wake_fd_ = -1;
+    // Take the same lock Wake() uses: a poster may still be inside write().
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    if (wake_fd_ >= 0) {
+      ::close(wake_fd_);
+      wake_fd_ = -1;
+    }
   }
 
   // Release all fiber stacks and Fiber objects (both live and idle).
@@ -115,7 +119,7 @@ Result<void> IO::Initialize() noexcept {
     params.sq_thread_idle = opts_.sq_thread_idle_ms;
     if (opts_.sq_thread_cpu >= 0) {
       params.flags |= IORING_SETUP_SQ_AFF;
-      params.sq_thread_cpu = opts_.sq_thread_cpu;
+      params.sq_thread_cpu = static_cast<std::uint32_t>(opts_.sq_thread_cpu);
     }
   }
 
@@ -145,8 +149,8 @@ Result<void> IO::Initialize() noexcept {
 
   if (opts_.direct_fd_table_size > 0) {
     direct_fds_.resize(opts_.direct_fd_table_size, -1);
-    if (const int ret =
-            io_uring_register_files(&ring_, direct_fds_.data(), direct_fds_.size());
+    if (const int ret = io_uring_register_files(
+            &ring_, direct_fds_.data(), static_cast<unsigned int>(direct_fds_.size()));
         ret < 0) {
       return Fail(-ret, "io_uring_register_files");
     }
@@ -170,8 +174,8 @@ Result<void> IO::RegisterBuffers(FixedBufferPool& pool) noexcept {
     return Fail(EALREADY, "register_buffers: pool already registered");
   }
 
-  if (const int ret =
-          io_uring_register_buffers(&ring_, pool.IovecsPtr(), pool.TotalCapacity());
+  if (const int ret = io_uring_register_buffers(
+          &ring_, pool.IovecsPtr(), static_cast<unsigned int>(pool.TotalCapacity()));
       ret < 0) {
     return Fail(-ret, "io_uring_register_buffers");
   }
@@ -230,7 +234,7 @@ Result<Fd> IO::RegisterFile(Fd fd) noexcept {
 
   ::close(fd.Release());  // raw kernel fd is consumed
 
-  Fd direct_fd(idx);
+  Fd direct_fd(static_cast<int>(idx));
   direct_fd.direct = true;
   return direct_fd;
 }
@@ -242,9 +246,10 @@ void IO::UnregisterDirectFd(const int direct_idx) noexcept {
   }
 
   constexpr int empty_fd = -1;
-  if (const int ret = io_uring_register_files_update(&ring_, direct_idx, &empty_fd, 1);
+  if (const int ret = io_uring_register_files_update(
+          &ring_, static_cast<unsigned int>(direct_idx), &empty_fd, 1);
       ret >= 0) {
-    direct_fds_[direct_idx] = -1;
+    direct_fds_[static_cast<std::size_t>(direct_idx)] = -1;
     direct_free_.push_back(static_cast<uint32_t>(direct_idx));
   }
 }
@@ -622,6 +627,12 @@ Result<io_uring_sqe*> IO::GetSqe() noexcept {
 void IO::Wake() noexcept {
   constexpr uint64_t one = 1;
   for (;;) {
+    // The lock keeps the write from racing with the destructor's close().
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    if (wake_fd_ < 0) {
+      // The IO is being torn down; there is nobody left to wake up.
+      return;
+    }
     const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
     if (n == sizeof(one) || (n == -1 && errno == EAGAIN)) {
       return;
@@ -655,8 +666,9 @@ Result<void> IO::Activate() noexcept {
   // shadow state diverges from reality on the first suspend - SEGV.
   detail::ToolsCaptureCurrentThread(scheduler_tools_);
 
-  if (const int ret =
-          io_uring_register(ring_.ring_fd, IORING_REGISTER_ENABLE_RINGS, nullptr, 0);
+  if (const int ret = io_uring_register(
+          static_cast<unsigned int>(ring_.ring_fd),
+          static_cast<unsigned int>(IORING_REGISTER_ENABLE_RINGS), nullptr, 0);
       ret < 0) {
     return Fail(-ret, "io_uring_register");
   }
@@ -810,8 +822,8 @@ Result<void> IO::Tick() noexcept {
     }
 
     // Phase 2: submit. Sleep only when there is genuinely nothing runnable.
-    const bool runnable = io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() ||
-                          !post_queue_.Empty();
+    const bool runnable =
+        io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || !post_queue_.Empty();
     if (auto ret = SubmitOrWait(runnable); !ret) {
       auto err = ret.error();
       ALOG_ERROR("failed to submit and wait for io: [{}] {}", err.op,
@@ -875,10 +887,13 @@ void IO::PinToCpu() const {
   }
 
   int physical_core_id = opts_.worker_cpu_affinity[id_ % size];
+  if (physical_core_id < 0) {
+    return;
+  }
 
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
-  CPU_SET(physical_core_id, &cpuset);
+  CPU_SET(static_cast<unsigned int>(physical_core_id), &cpuset);
 
   if (const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
       rc != 0) {
@@ -962,7 +977,8 @@ void IO::RunUntilDone() noexcept {
 Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
                           const off_t offset) noexcept {
   return Syscall("read", [&](io_uring_sqe* sqe) {
-    io_uring_prep_read(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    io_uring_prep_read(sqe, fd.Get(), buf.data(), static_cast<unsigned int>(buf.size()),
+                       static_cast<std::uint64_t>(offset));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -972,7 +988,9 @@ Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf, const size_t len,
                                const size_t buffer_offset) noexcept {
   return Syscall("read_fixed", [&](io_uring_sqe* sqe) {
     void* start_addr = static_cast<std::byte*>(buf.Ptr()) + buffer_offset;
-    io_uring_prep_read_fixed(sqe, fd.Get(), start_addr, len, file_offset, buf.Index());
+    io_uring_prep_read_fixed(sqe, fd.Get(), start_addr, static_cast<unsigned int>(len),
+                             static_cast<std::uint64_t>(file_offset),
+                             static_cast<int>(buf.Index()));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -985,7 +1003,9 @@ Result<uint32_t> IO::ReadFixed(const Fd& fd, FixedBuffer& buf,
 Result<uint32_t> IO::Writev(const Fd& fd, std::span<const iovec> iovecs,
                             const off_t offset) noexcept {
   return Syscall("writev", [&](io_uring_sqe* sqe) {
-    io_uring_prep_writev(sqe, fd.Get(), iovecs.data(), iovecs.size(), offset);
+    io_uring_prep_writev(sqe, fd.Get(), iovecs.data(),
+                         static_cast<unsigned int>(iovecs.size()),
+                         static_cast<std::uint64_t>(offset));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1007,7 +1027,8 @@ Result<Fd> IO::Open(const std::filesystem::path& path, const int flags,
 Result<void> IO::Fallocate(const Fd& fd, const int mode, const off_t offset,
                            const off_t len) noexcept {
   return Syscall<void>("fallocate", [&](io_uring_sqe* sqe) {
-    io_uring_prep_fallocate(sqe, fd.Get(), mode, offset, len);
+    io_uring_prep_fallocate(sqe, fd.Get(), mode, static_cast<std::uint64_t>(offset),
+                            static_cast<std::uint64_t>(len));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1039,7 +1060,8 @@ Result<Fd> IO::Accept(const Fd& server_fd, const int flags) noexcept {
 Result<uint32_t> IO::Write(const Fd& fd, std::span<const std::byte> buf,
                            const off_t offset) noexcept {
   return Syscall("write", [&](io_uring_sqe* sqe) {
-    io_uring_prep_write(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    io_uring_prep_write(sqe, fd.Get(), buf.data(), static_cast<unsigned int>(buf.size()),
+                        static_cast<std::uint64_t>(offset));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1049,7 +1071,9 @@ Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf, const size
                                 const size_t buffer_offset) noexcept {
   return Syscall("write_fixed", [&](io_uring_sqe* sqe) {
     const void* start_addr = buf.Ptr() + buffer_offset;
-    io_uring_prep_write_fixed(sqe, fd.Get(), start_addr, len, file_offset, buf.Index());
+    io_uring_prep_write_fixed(sqe, fd.Get(), start_addr, static_cast<unsigned int>(len),
+                              static_cast<std::uint64_t>(file_offset),
+                              static_cast<int>(buf.Index()));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1062,7 +1086,9 @@ Result<uint32_t> IO::WriteFixed(const Fd& fd, const FixedBuffer& buf,
 Result<uint32_t> IO::Readv(const Fd& fd, std::span<const iovec> iovecs,
                            const off_t offset) noexcept {
   return Syscall("readv", [&](io_uring_sqe* sqe) {
-    io_uring_prep_readv(sqe, fd.Get(), iovecs.data(), iovecs.size(), offset);
+    io_uring_prep_readv(sqe, fd.Get(), iovecs.data(),
+                        static_cast<unsigned int>(iovecs.size()),
+                        static_cast<std::uint64_t>(offset));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1131,7 +1157,8 @@ Result<uint32_t> IO::Read(const Fd& fd, const std::span<std::byte> buf,
                           const std::chrono::nanoseconds timeout,
                           const off_t offset) noexcept {
   return SyscallTimed("read_timed", timeout, [&](io_uring_sqe* sqe) {
-    io_uring_prep_read(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    io_uring_prep_read(sqe, fd.Get(), buf.data(), static_cast<unsigned int>(buf.size()),
+                       static_cast<std::uint64_t>(offset));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1140,7 +1167,8 @@ Result<uint32_t> IO::Write(const Fd& fd, const std::span<const std::byte> buf,
                            const std::chrono::nanoseconds timeout,
                            const off_t offset) noexcept {
   return SyscallTimed("write_timed", timeout, [&](io_uring_sqe* sqe) {
-    io_uring_prep_write(sqe, fd.Get(), buf.data(), buf.size(), offset);
+    io_uring_prep_write(sqe, fd.Get(), buf.data(), static_cast<unsigned int>(buf.size()),
+                        static_cast<std::uint64_t>(offset));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }

@@ -15,9 +15,9 @@
 using tinyio::Fd;
 using tinyio::IO;
 using tinyio::Result;
-using tinyio::TaskGroup;
 using tinyio::Semaphore;
 using tinyio::SocketAddress;
+using tinyio::TaskGroup;
 
 using namespace std::chrono_literals;
 
@@ -32,17 +32,17 @@ struct Target {
 std::vector<Target> targets;
 
 Result<double> probe_target(IO& io, const Target& t, Semaphore& gate) noexcept {
-  TRY_LOG_ERR(gate.acquire(), "semaphore acquire");
+  TRY_LOG_ERR(gate.Acquire(), "semaphore acquire");
   const auto t0 = std::chrono::steady_clock::now();
   const Fd sock{::socket(t.addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0)};
 
   if (!sock.IsValid()) {
-    gate.release();
+    gate.Release();
     return tinyio::Fail(errno, "socket");
   }
 
-  const auto r = io.connect(sock, t.addr, 2s);
-  gate.release();
+  const auto r = io.Connect(sock, t.addr, 2s);
+  gate.Release();
   TRY_LOG_ERR(r, "connect");
 
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
@@ -54,7 +54,7 @@ void run_probes(IO& io) noexcept {
   TaskGroup<double> probes(io, targets.size());
 
   for (const auto& t : targets) {
-    if (auto res = probes.spawn([&gate, &t](IO& fio) noexcept -> Result<double> {
+    if (auto res = probes.Spawn([&gate, &t](IO& fio) noexcept -> Result<double> {
           return probe_target(fio, t, gate);
         });
         !res) {
@@ -63,12 +63,12 @@ void run_probes(IO& io) noexcept {
   }
 
   // everyone wait here, the line completed before we move on
-  if (auto res = probes.wait(); !res) {
+  if (auto res = probes.Wait(); !res) {
     ALOG_ERROR("probe group interrupted: {}", res.error());
   }
 
   for (size_t i = 0; i < targets.size(); ++i) {
-    if (const auto& slot = probes.results()[i]; slot && slot->has_value()) {
+    if (const auto& slot = probes.Results()[i]; slot && slot->has_value()) {
       ALOG_INFO("{:<24} UP    {:>6.1f} ms", targets[i].host, slot->value());
     } else if (slot) {
       ALOG_INFO("{:<24} DOWN  ({})", targets[i].host,
@@ -106,10 +106,10 @@ int main(int argc, char** argv) {
 
   IO io{0, tinyio::IoOptions{}, {}};
 
-  if (auto res = io.spawn(run_probes); !res.has_value()) {
+  if (auto res = io.Spawn(run_probes); !res.has_value()) {
     ALOG_ERROR("failed to spawn: {}", res.error());
     return 1;
   }
 
-  io.run_until_done();
+  io.RunUntilDone();
 }

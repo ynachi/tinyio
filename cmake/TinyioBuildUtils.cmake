@@ -130,9 +130,6 @@ function(add_tinyio_lib LIB_NAME)
                 "$<INSTALL_INTERFACE:${ARG_SHARED_INSTALL_INTERFACE_LIBS}>"
                 PRIVATE ${ARG_SHARED_PRIVATE_LINK_LIBS})
 
-        target_link_libraries(${LIB_NAME}_shared
-                PUBLIC "$<BUILD_INTERFACE:tinyio_sanitizer_flags>")
-
         string(TOUPPER ${LIB_NAME} VISIBILITY_NAME)
         target_compile_definitions(${LIB_NAME}_shared PRIVATE ${VISIBILITY_NAME}_EXPORTING)
         set_target_properties(${LIB_NAME}_shared
@@ -199,9 +196,6 @@ function(add_tinyio_lib LIB_NAME)
             target_link_libraries(${LIB_NAME}_static
                     PUBLIC "$<BUILD_INTERFACE:${ARG_STATIC_LINK_LIBS}>")
         endif()
-
-        target_link_libraries(${LIB_NAME}_static
-                PUBLIC "$<BUILD_INTERFACE:tinyio_sanitizer_flags>")
 
         if(WIN32)
             string(TOUPPER ${LIB_NAME} VISIBILITY_NAME)

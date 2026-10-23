@@ -1,5 +1,3 @@
-#include "tinyio/runtime.hpp"
-
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -15,8 +13,9 @@
 #include <tinyio/logger.hpp>
 #include <tinyio/tcp_listener.hpp>
 
-namespace
-{
+#include "tinyio/runtime.hpp"
+
+namespace {
 std::atomic_bool g_stop_requested{false};
 
 constexpr std::string_view kHttpResponse =
@@ -27,184 +26,151 @@ constexpr std::string_view kHttpResponse =
     "\r\n"
     "Hello, io_uring!";
 
-struct Options
-{
-    uint16_t port = 8080;
-    size_t workers = 4;
-    size_t stack_size = 64 * 1024;
+struct Options {
+  uint16_t port = 8080;
+  size_t workers = 4;
+  size_t stack_size = 64 * 1024;
 };
 
-void signal_handler(int)
-{
-    g_stop_requested.store(true, std::memory_order_relaxed);
+void signal_handler(int) { g_stop_requested.store(true, std::memory_order_relaxed); }
+
+uint64_t parse_u64(std::string_view text) {
+  uint64_t value = 0;
+  const auto* first = text.data();
+  const auto* last = text.data() + text.size();
+  const auto [ptr, ec] = std::from_chars(first, last, value);
+  if (ec != std::errc{} || ptr != last) {
+    throw std::invalid_argument("invalid integer argument");
+  }
+  return value;
 }
 
-uint64_t parse_u64(std::string_view text)
-{
-    uint64_t value = 0;
-    const auto* first = text.data();
-    const auto* last = text.data() + text.size();
-    const auto [ptr, ec] = std::from_chars(first, last, value);
-    if (ec != std::errc{} || ptr != last)
-    {
-        throw std::invalid_argument("invalid integer argument");
+Options parse_args(int argc, char** argv) {
+  Options opts;
+  for (int i = 1; i < argc; ++i) {
+    std::string_view arg = argv[i];
+    auto value_for = [&](std::string_view name) -> std::string_view {
+      if (!arg.starts_with(name) || arg.size() <= name.size() ||
+          arg[name.size()] != '=') {
+        return {};
+      }
+      return arg.substr(name.size() + 1);
+    };
+
+    if (auto value = value_for("--port"); !value.empty()) {
+      opts.port = static_cast<uint16_t>(parse_u64(value));
+    } else if (auto value = value_for("--workers"); !value.empty()) {
+      opts.workers = static_cast<size_t>(parse_u64(value));
+    } else if (auto value = value_for("--stack-size"); !value.empty()) {
+      opts.stack_size = static_cast<size_t>(parse_u64(value));
+    } else {
+      throw std::invalid_argument("unknown argument");
     }
-    return value;
+  }
+
+  if (opts.workers == 0 || opts.stack_size == 0) {
+    throw std::invalid_argument("workers and stack-size must be positive");
+  }
+  return opts;
 }
 
-Options parse_args(int argc, char** argv)
-{
-    Options opts;
-    for (int i = 1; i < argc; ++i)
-    {
-        std::string_view arg = argv[i];
-        auto value_for = [&](std::string_view name) -> std::string_view
-        {
-            if (!arg.starts_with(name) || arg.size() <= name.size() || arg[name.size()] != '=')
-            {
-                return {};
-            }
-            return arg.substr(name.size() + 1);
-        };
-
-        if (auto value = value_for("--port"); !value.empty())
-        {
-            opts.port = static_cast<uint16_t>(parse_u64(value));
-        }
-        else if (auto value = value_for("--workers"); !value.empty())
-        {
-            opts.workers = static_cast<size_t>(parse_u64(value));
-        }
-        else if (auto value = value_for("--stack-size"); !value.empty())
-        {
-            opts.stack_size = static_cast<size_t>(parse_u64(value));
-        }
-        else
-        {
-            throw std::invalid_argument("unknown argument");
-        }
+tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd,
+                               std::span<const std::byte> data) {
+  while (!data.empty()) {
+    auto written = TRY(fio.Write(fd, data));
+    if (written == 0) {
+      return tinyio::Fail(EIO, "write");
     }
-
-    if (opts.workers == 0 || opts.stack_size == 0)
-    {
-        throw std::invalid_argument("workers and stack-size must be positive");
-    }
-    return opts;
+    data = data.subspan(written);
+  }
+  return {};
 }
 
-tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::Fd& fd, std::span<const std::byte> data)
-{
-    while (!data.empty())
-    {
-        auto written = TRY(fio.Write(fd, data));
-        if (written == 0)
-        {
-            return tinyio::Fail(EIO, "write");
-        }
-        data = data.subspan(written);
+void handle_client(tinyio::IO& fio, int raw_fd) {
+  tinyio::Fd client_fd{raw_fd};
+  std::byte buf[4096];
+  const auto response =
+      std::as_bytes(std::span{kHttpResponse.data(), kHttpResponse.size()});
+
+  while (!g_stop_requested.load(std::memory_order_relaxed)) {
+    auto read_res = fio.Read(client_fd, std::span{buf});
+    if (!read_res || *read_res == 0) {
+      return;
     }
-    return {};
+
+    auto write_res = write_all(fio, client_fd, response);
+    if (!write_res) {
+      return;
+    }
+  }
 }
 
-void handle_client(tinyio::IO& fio, int raw_fd)
-{
-    tinyio::Fd client_fd{raw_fd};
-    std::byte buf[4096];
-    const auto response = std::as_bytes(std::span{kHttpResponse.data(), kHttpResponse.size()});
+void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size) {
+  auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
+  if (!listener) {
+    std::cerr << "bind failed: " << listener.error().ErrorCode().message() << '\n';
+    return;
+  }
 
-    while (!g_stop_requested.load(std::memory_order_relaxed))
-    {
-        auto read_res = fio.Read(client_fd, std::span{buf});
-        if (!read_res || *read_res == 0)
-        {
-            return;
-        }
-
-        auto write_res = write_all(fio, client_fd, response);
-        if (!write_res)
-        {
-            return;
-        }
-    }
-}
-
-void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size)
-{
-    auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
-    if (!listener)
-    {
-        std::cerr << "bind failed: " << listener.error().ErrorCode().message() << '\n';
-        return;
+  tinyio::Fd server_fd = std::move(*listener);
+  while (!g_stop_requested.load(std::memory_order_relaxed)) {
+    auto client_res = worker.Accept(server_fd);
+    if (!client_res) {
+      if (!g_stop_requested.load(std::memory_order_relaxed)) {
+        std::cerr << "accept failed: " << client_res.error().ErrorCode().message()
+                  << '\n';
+      }
+      return;
     }
 
-    tinyio::Fd server_fd = std::move(*listener);
-    while (!g_stop_requested.load(std::memory_order_relaxed))
-    {
-        auto client_res = worker.Accept(server_fd);
-        if (!client_res)
-        {
-            if (!g_stop_requested.load(std::memory_order_relaxed))
-            {
-                std::cerr << "accept failed: " << client_res.error().ErrorCode().message() << '\n';
-            }
-            return;
-        }
-
-        const int raw_fd = client_res->Release();
-        (void)worker.Spawn([raw_fd](tinyio::IO& fio) noexcept { handle_client(fio, raw_fd); });
-    }
+    const int raw_fd = client_res->Release();
+    (void)worker.Spawn(
+        [raw_fd](tinyio::IO& fio) noexcept { handle_client(fio, raw_fd); });
+  }
 }
 }  // namespace
 
-int main(int argc, char** argv)
-{
-    try
-    {
-        const Options opts = parse_args(argc, argv);
-        std::signal(SIGINT, signal_handler);
-        std::signal(SIGTERM, signal_handler);
-        std::signal(SIGPIPE, SIG_IGN);
+int main(int argc, char** argv) {
+  try {
+    const Options opts = parse_args(argc, argv);
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGPIPE, SIG_IGN);
 
-        tinyio::log::SetLevel(tinyio::log::Level::Disabled);
+    tinyio::log::SetLevel(tinyio::log::Level::Disabled);
 
-        std::vector<std::jthread> threads;
-        std::vector<std::stop_source> stop_sources;
+    std::vector<std::jthread> threads;
+    std::vector<std::stop_source> stop_sources;
 
-        std::cout << "tinyio_http_bench listening on port " << opts.port << " workers=" << opts.workers
-                  << " stack_size=" << opts.stack_size << '\n';
+    std::cout << "tinyio_http_bench listening on port " << opts.port
+              << " workers=" << opts.workers << " stack_size=" << opts.stack_size << '\n';
 
-        for (size_t i = 0; i < opts.workers; ++i)
-        {
-            stop_sources.emplace_back();
-            auto st = stop_sources.back().get_token();
-            threads.emplace_back(
-                [i, opts, st]
-                {
-                    tinyio::IoOptions io_opts;
-                    io_opts.stack_size = opts.stack_size;
-                    tinyio::IO worker(i, io_opts, {});
+    for (size_t i = 0; i < opts.workers; ++i) {
+      stop_sources.emplace_back();
+      auto st = stop_sources.back().get_token();
+      threads.emplace_back([i, opts, st] {
+        tinyio::IoOptions io_opts;
+        io_opts.stack_size = opts.stack_size;
+        tinyio::IO worker(i, io_opts, {});
 
-                    (void)worker.Spawn([opts](tinyio::IO& io) noexcept
-                                       { accept_loop(io, opts.port, opts.stack_size); });
+        (void)worker.Spawn([opts](tinyio::IO& io) noexcept {
+          accept_loop(io, opts.port, opts.stack_size);
+        });
 
-                    worker.Run(st);
-                });
-        }
-
-        while (!g_stop_requested.load(std::memory_order_relaxed))
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        for (auto& source : stop_sources)
-        {
-            source.request_stop();
-        }
+        worker.Run(st);
+      });
     }
-    catch (const std::exception& e)
-    {
-        std::cerr << "error: " << e.what() << '\n';
-        return 1;
+
+    while (!g_stop_requested.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    return 0;
+
+    for (auto& source : stop_sources) {
+      source.request_stop();
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << '\n';
+    return 1;
+  }
+  return 0;
 }

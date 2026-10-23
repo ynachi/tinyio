@@ -6,8 +6,10 @@
 #include <atomic>
 #include <cassert>
 #include <concepts>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -55,8 +57,7 @@ struct IoOptions {
   std::size_t batch_max_size = 128;
 
   /// Event-loop ordering.
-  enum class LoopStyle
-  {
+  enum class LoopStyle {
     /// submit/wait -> drain -> resume.
     ///
     /// SQEs armed by a resumed fiber are carried into the kernel by the
@@ -576,8 +577,13 @@ class IO final {
   //
   // event fd for cross-thread signaling
   //
+  // wake_mutex_ serializes Wake() against the destructor: a thread that is
+  // still inside Wake() must not write to an eventfd the destructor has
+  // already closed (and whose number may already have been recycled).
+  //
   int wake_fd_{-1};
   uint64_t wake_value_{0};
+  std::mutex wake_mutex_;
 
   // Direct FD Table Management
   std::vector<int> direct_fds_;
@@ -649,17 +655,18 @@ class IO final {
       std::move_only_function<void(IO&) noexcept> task) noexcept;
 
   void PinToCpu() const;
-  Result<void> AcceptLoopImpl(Fd server_fd,
-                              std::move_only_function<void(IO&, Result<Fd>) noexcept> handler) noexcept;
+  Result<void> AcceptLoopImpl(
+      Fd server_fd,
+      std::move_only_function<void(IO&, Result<Fd>) noexcept> handler) noexcept;
 };
 
 template <class Fn>
   requires std::constructible_from<
       std::move_only_function<void(IO&, Result<Fd>) noexcept>, Fn>
 [[nodiscard]] Result<void> IO::AcceptLoop(Fd server_fd, Fn&& handler) noexcept {
-  return AcceptLoopImpl(std::move(server_fd),
-                        std::move_only_function<void(IO&, Result<Fd>) noexcept>(
-                            std::forward<Fn>(handler)));
+  return AcceptLoopImpl(
+      std::move(server_fd),
+      std::move_only_function<void(IO&, Result<Fd>) noexcept>(std::forward<Fn>(handler)));
 }
 
 }  // namespace tinyio

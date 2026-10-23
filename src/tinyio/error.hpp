@@ -71,6 +71,10 @@ decltype(auto) UnwrapExpected(std::expected<T, E>& result) noexcept {
 
 // ---------------------------------------------------------------------------
 // Propagation macros (GNU statement-expression; Linux-first, GCC/Clang only).
+//
+// __extension__ marks the statement expression as a deliberate GNU
+// extension, so -Wpedantic (and therefore -Werror) does not reject it. The
+// build applies the same strict warning set as the rest of the project.
 // ---------------------------------------------------------------------------
 
 /// \brief Rust `?`-style propagation.
@@ -83,7 +87,7 @@ decltype(auto) UnwrapExpected(std::expected<T, E>& result) noexcept {
 ///   TRY(io.sleep_for(10ms));          // Result<void>: just propagate
 /// \endcode
 #define TRY(EXPR)                                  \
-  ({                                               \
+  __extension__({                                  \
     auto _tinyio_res = (EXPR);                     \
     if (!_tinyio_res) {                            \
       return std::unexpected(_tinyio_res.error()); \
@@ -94,12 +98,12 @@ decltype(auto) UnwrapExpected(std::expected<T, E>& result) noexcept {
 /// \param expr A \c Result<T>.
 /// \param msg  A \c const \c char* description logged on failure.
 #define TRY_LOG_ERR(EXPR, FMT, ...)                                                      \
-  ({                                                                                     \
+  __extension__({                                                                        \
     auto _tinyio_res = (EXPR);                                                           \
     if (!_tinyio_res) {                                                                  \
       const auto _tinyio_err = _tinyio_res.error();                                      \
       ALOG_ERROR("{} failed: code={} " FMT, _tinyio_err.op ? _tinyio_err.op : "unknown", \
-                 _tinyio_err.code, ##__VA_ARGS__);                                       \
+                 _tinyio_err.code __VA_OPT__(, ) __VA_ARGS__);                           \
       return std::unexpected(_tinyio_err);                                               \
     }                                                                                    \
     ::tinyio::detail::UnwrapExpected(_tinyio_res);                                       \
