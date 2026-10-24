@@ -271,6 +271,63 @@ INSTANTIATE_TEST_SUITE_P(LoopStyles, AbandonedParkTest,
                          ::testing::Values(IoOptions::LoopStyle::kResumeFirst,
                                            IoOptions::LoopStyle::kSubmitFirst));
 
+// 7b. The shutdown abort names the primitive the fiber is stuck on. The
+// reason lives in the fiber that is parked, so there is no counter to keep
+// and the report does not have to guess.
+TEST(ShutdownCancellationTest, AbortNamesTheStuckPrimitive) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        // easylog writes the fatal record to stdout; a death test captures
+        // stderr.
+        (void)::dup2(STDERR_FILENO, STDOUT_FILENO);
+        IoOptions opts;
+        IO io(0, opts);
+        Mutex mu(io);
+        // The holder takes the mutex and never gives it back.
+        (void)io.Spawn([&](IO& rt) noexcept {
+          (void)mu.Lock();
+          (void)rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));
+        });
+        // The waiter parks on the mutex, and nobody will ever wake it.
+        (void)io.Spawn([&](IO&) noexcept { (void)mu.Lock(); });
+        RunAndStopAfter50ms(io);
+      },
+      DiedWithoutHanging, "1 on Mutex \\(fiber [0-9]+\\)");
+}
+
+// A pool with a single slot: the holder takes it and the waiter parks.
+// Built by a function because a designated initializer has a comma, and the
+// preprocessor would read it as another macro argument.
+static BufferPoolConfig OneSlotPool() {
+  return BufferPoolConfig{.slot_size = 4096, .slots = 1};
+}
+
+// Two primitives stuck at once are reported separately, each with its fiber
+// ids: the pool waiter and the latch waiter are told apart.
+TEST(ShutdownCancellationTest, AbortNamesEveryStuckPrimitive) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        (void)::dup2(STDERR_FILENO, STDOUT_FILENO);
+        IoOptions opts;
+        opts.buffer_pool = OneSlotPool();
+        IO io(0, opts);
+        Latch never(io, 1);
+        // Holds the only slot, then parks on the latch forever.
+        (void)io.Spawn([&](IO& rt) noexcept {
+          auto buf = rt.TakeFixedBuffer();
+          ASSERT_TRUE(buf.has_value());
+          (void)never.Wait();
+        });
+        // Parks on the pool: the slot is never released.
+        (void)io.Spawn([&](IO& rt) noexcept { (void)rt.AcquireFixedBuffer(); });
+        RunAndStopAfter50ms(io);
+      },
+      DiedWithoutHanging,
+      "1 on Latch \\(fiber [0-9]+\\), 1 on FixedBufferPool \\(fiber [0-9]+\\)");
+}
+
 // 8. A Mutex handed over during shutdown is owned by the woken fiber: Lock()
 // succeeds, so the waiter unlocks and the mutex ends up free.
 TEST(ShutdownCancellationTest, MutexHandoffDuringShutdownSucceeds) {

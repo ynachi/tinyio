@@ -29,7 +29,48 @@ enum class FiberState : std::uint8_t {
 };
 
 /// \brief Indicates why a fiber is suspended.
-enum class WaitKind : std::uint8_t { none, io, sync };
+///
+/// A fiber that parks on a synchronization primitive records WHICH primitive
+/// it is waiting for, so a runtime that quiesces with parked fibers can name
+/// the culprit instead of printing a count. There is no counter to maintain:
+/// the reason lives in the fiber that is parked, which is the one place that
+/// cannot lose it.
+enum class WaitKind : std::uint8_t {
+  none,
+  /// Parked on an io_uring completion.
+  io,
+  /// Parked on a Mutex.
+  mutex,
+  /// Parked on a Semaphore.
+  semaphore,
+  /// Parked on a Latch.
+  latch,
+  /// Parked on a TaskGroup.
+  task_group,
+  /// Parked waiting for a fixed buffer slot.
+  buffer_pool,
+};
+
+/// @brief The human-readable name of a wait reason, for diagnostics.
+[[nodiscard]] constexpr const char* WaitKindName(const WaitKind kind) noexcept {
+  switch (kind) {
+    case WaitKind::none:
+      return "none";
+    case WaitKind::io:
+      return "I/O";
+    case WaitKind::mutex:
+      return "Mutex";
+    case WaitKind::semaphore:
+      return "Semaphore";
+    case WaitKind::latch:
+      return "Latch";
+    case WaitKind::task_group:
+      return "TaskGroup";
+    case WaitKind::buffer_pool:
+      return "FixedBufferPool";
+  }
+  return "unknown";
+}
 
 struct Fiber;
 

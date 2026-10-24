@@ -293,6 +293,12 @@ Invariants worth knowing before touching this code:
   runtime has quiesced nothing can release a slot to it, so
   `AbortIfParkedFibers()` aborts. A leaked lease is a bug, not a shutdown
   path.
+- **The abort names the primitive.** Every parked fiber records what it is
+  waiting on (`WaitKind`: `Mutex`, `Semaphore`, `Latch`, `TaskGroup`,
+  `FixedBufferPool`), so the message is "1 on Latch (fiber 3), 1 on
+  FixedBufferPool (fiber 4)" instead of a count plus guesses. The reason lives in the
+  parked fiber, so there is no counter to keep — a coroutine runtime needs
+  one, a stackful runtime does not.
 - **`ReadFixed`/`WriteFixed` only take this runtime's slots.** The kernel
   resolves `buf_index` against this ring's table, so a slot from any other
   pool is a CHECK failure. A buffer offset outside the slot or a zero length
@@ -301,6 +307,8 @@ Invariants worth knowing before touching this code:
   the waiters and the owner link, so the pool's destructor wakes nobody.
 - **Leases must not outlive the runtime.** The runtime owns the pool; a
   lease destroyed after it returns its slot to freed memory.
+
+The reasoning behind all of this is in `docs/buffer-pool.md`.
 
 ## Known knobs
 
@@ -314,5 +322,23 @@ Invariants worth knowing before touching this code:
   `SINGLE_ISSUER|DEFER_TASKRUN|TASKRUN_FLAG` — note it does **not** include
   `IORING_SETUP_COOP_TASKRUN`, unlike kio's default. The kernel rejects
   `TASKRUN_FLAG` without `COOP_TASKRUN` unless `DEFER_TASKRUN` is also set.
+- **The kernel floor is 6.1**, and it is not negotiable: `DEFER_TASKRUN` is
+  in the default flags (6.1) and the shutdown path cancels every request
+  with `IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY` (5.19). There is
+  no fallback for an older kernel — raise the documented minimum instead.
+- **The submit path survives `EBUSY`/`EAGAIN`.** The kernel could not flush
+  the completion queue; the documented recovery is to reap and submit again,
+  which `SubmitSqes()` does, and the blocking wait in `SubmitOrWait()` reaps
+  and returns to the loop. Reaping only happens on the scheduler
+  (`ReapOverflow()` asserts it): `GetSqe()` runs inside a fiber's
+  `Syscall()`, and reaping there would run multishot accept handlers on that
+  fiber. From a fiber, the error goes back to the caller. A tick that failed here used to abandon a
+  shutdown drain with operations still in flight, and the ring was then torn
+  down under them — a kernel use-after-free.
+- **A drain never gives up on a tick error.** `CancelAndDrain()` and
+  `RunUntilDone()` retry and only abort after `k_max_tick_errors`
+  *consecutive* failures. Returning early would leave operations in flight;
+  the ring teardown would then free the `Operation` objects the kernel still
+  points at.
 - Always run the test suite (`ctest`) against a change to the event loop;
   the shutdown/cancellation paths are where loop reordering breaks.

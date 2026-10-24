@@ -8,6 +8,7 @@
 #include <cstring>
 #include <format>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include <sys/eventfd.h>
@@ -164,7 +165,8 @@ Result<void> IO::Initialize() noexcept {
     if (const int ret = io_uring_register_buffers(
             &ring_, table.data(), static_cast<unsigned int>(table.size()));
         ret < 0) {
-      ELOGFMT(ERROR, "io_uring_register_buffers failed: {} ({} regions, {} bytes pinned){}",
+      ELOGFMT(ERROR,
+              "io_uring_register_buffers failed: {} ({} regions, {} bytes pinned){}",
               std::strerror(-ret), table.size(), buffer_pool_->AllocatedBytes(),
               ret == -ENOMEM ? "; check `ulimit -l` (RLIMIT_MEMLOCK) or LimitMEMLOCK= "
                                "in the unit file"
@@ -466,42 +468,34 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
 void IO::CancelAndDrain() noexcept {
   bool issued_cancels = false;
 
-  // Cancel all in-flight IO operations.
+  // Cancel every in-flight IO operation with ONE SQE.
+  //
+  // IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY matches every request
+  // in the ring, whatever its user_data. There is no need to walk the fibers
+  // and cancel them one at a time: at this point every request in the ring
+  // belongs to the runtime, and every one of them has to die.
+  //
+  // The wake-read is in the ring too. Its completion arrives with
+  // k_wakeup_sentinel and DrainCompletions re-arms it, so cancelling it
+  // costs one extra completion and nothing else.
+  //
   // Sync-parked fibers are never woken by the runtime. They might be waiting
   // for the IO fibers to finish (e.g., TaskGroup::Wait, Latch::Wait), and
   // waking them early would let them destroy synchronization primitives
   // while the IO fibers are still unwinding, causing Use-After-Free.
-  for (detail::fiber::Fiber* fiber : all_fibers_) {
-    if (fiber->state != detail::fiber::FiberState::waiting ||
-        fiber->wait_kind != detail::fiber::WaitKind::io) {
-      continue;
-    }
-
+  if (inflight_ops_ > 0) {
     auto res = GetSqe();
     if (!res) {
       ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", res.error().context(),
               res.error().message());
-      continue;
+    } else {
+      io_uring_prep_cancel64(res.value(), 0,
+                             IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY);
+      io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
+      ++inflight_ops_;
+      issued_cancels = true;
     }
-    io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber->operation), 0);
-    io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
-    ++inflight_ops_;
-    issued_cancels = true;
   }
-
-  for (uint64_t tagged_ptr : active_multishots_) {
-    auto res = GetSqe();
-    if (!res) {
-      ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", res.error().context(),
-              res.error().message());
-      continue;
-    }
-    io_uring_prep_cancel64(res.value(), tagged_ptr, 0);
-    io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
-    ++inflight_ops_;
-    issued_cancels = true;
-  }
-  active_multishots_.clear();
 
   if (issued_cancels) {
     io_uring_submit(&ring_);
@@ -515,13 +509,27 @@ void IO::CancelAndDrain() noexcept {
   // that blocked here would wait for a completion that can never arrive.
   const bool prev_drain_to_completion = drain_to_completion_;
   drain_to_completion_ = true;
+  // A tick error must NOT abandon the drain. Operations would still be in
+  // flight when the ring is torn down, and the kernel would then reference
+  // Operation objects that live inside the fibers about to be freed. Retry
+  // instead, and only give up when the ring stops making progress at all.
+  int consecutive_errors = 0;
   while (inflight_ops_ > 0 || !ready_queue_.Empty()) {
     if (auto res = Tick(); !res) {
-      ELOGFMT(ERROR, "tick failed during cancel_and_drain: [{}] {}",
-              res.error().context(), res.error().message());
-      drain_to_completion_ = prev_drain_to_completion;
-      return;
+      const auto err = res.error();
+      ELOGFMT(ERROR, "tick failed during cancel_and_drain: [{}] {}", err.context(),
+              err.message());
+      if (++consecutive_errors >= k_max_tick_errors) {
+        ELOGFMT(FATAL,
+                "IO #{} cannot drain: {} operation(s) still in flight after {} "
+                "failed ticks; tearing the ring down now would be a kernel "
+                "use-after-free",
+                id_, inflight_ops_, consecutive_errors);
+        std::abort();
+      }
+      continue;
     }
+    consecutive_errors = 0;
   }
   drain_to_completion_ = prev_drain_to_completion;
 
@@ -532,14 +540,46 @@ void IO::AbortIfParkedFibers() const noexcept {
   // Called once quiesced: nothing ready, nothing in flight. A fiber still
   // live is parked on a sync primitive or on the buffer pool, and nothing
   // can ever wake it.
-  if (live_fibers_ > 0) {
-    ELOGFMT(FATAL,
-            "IO #{} quiesced with {} parked fiber(s) and no one left to wake them "
-            "(latch never counted down? mutex never unlocked? fixed buffer never "
-            "released?)",
-            id_, live_fibers_);
-    std::abort();
+  if (live_fibers_ == 0) {
+    return;
   }
+
+  // Name the culprit. Every parked fiber records what it is waiting on, so
+  // the report can say "2 fibers on Mutex (4, 9)" instead of a count plus a
+  // list of guesses. There is no counter to keep: the reason lives in the
+  // fiber that is parked, which is the one place that cannot lose it.
+  std::string report;
+  for (const auto kind :
+       {detail::fiber::WaitKind::mutex, detail::fiber::WaitKind::semaphore,
+        detail::fiber::WaitKind::latch, detail::fiber::WaitKind::task_group,
+        detail::fiber::WaitKind::buffer_pool, detail::fiber::WaitKind::io}) {
+    std::string ids;
+    size_t count = 0;
+    for (const detail::fiber::Fiber* fiber : all_fibers_) {
+      if (fiber->state != detail::fiber::FiberState::waiting ||
+          fiber->wait_kind != kind) {
+        continue;
+      }
+      ++count;
+      if (!ids.empty()) {
+        ids += ", ";
+      }
+      ids += std::to_string(fiber->id);
+    }
+    if (count == 0) {
+      continue;
+    }
+    if (!report.empty()) {
+      report += ", ";
+    }
+    report += std::to_string(count) + " on " + detail::fiber::WaitKindName(kind) +
+              " (fiber" + (count == 1 ? " " : "s ") + ids + ")";
+  }
+
+  ELOGFMT(FATAL,
+          "IO #{} quiesced with {} parked fiber(s) and no one left to wake them: {}", id_,
+          live_fibers_, report.empty() ? "unknown" : report);
+  std::abort();
 }
 
 // First code a new fiber runs, on its own stack, reached through the
@@ -573,14 +613,10 @@ Result<void> IO::SubmitOrWaitFor() noexcept {
 
 Result<void> IO::SubmitOrWait(const bool runnable) noexcept {
   if (runnable) {
-    int ret = 0;
-    if (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN) {
-      ret = io_uring_submit_and_get_events(&ring_);
-    } else {
-      ret = io_uring_submit(&ring_);
-    }
-
-    if (ret < 0 && ret != -EINTR) {
+    const bool get_events =
+        (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN) != 0;
+    const int ret = SubmitSqes(get_events);
+    if (ret < 0) {
       return Error::fail_errno(-ret, "submit_or_wait_for.io_uring_submit");
     }
   } else {
@@ -599,6 +635,14 @@ Result<void> IO::SubmitOrWait(const bool runnable) noexcept {
     io_uring_cqe* cqe = nullptr;
     if (const auto ret = io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
         ret < 0 && ret != -EINTR && ret != -ETIME) {
+      // The same transient failures SubmitSqes() survives, and this is the
+      // GETEVENTS path the man page names for EBUSY. Reap so the kernel can
+      // flush its overflow, and let the next tick wait again. Safe here:
+      // SubmitOrWait() only runs on the scheduler.
+      if (ret == -EBUSY || ret == -EAGAIN) {
+        ReapOverflow();
+        return {};
+      }
       return Error::fail_errno(-ret,
                                "submit_or_wait_for.io_uring_submit_and_wait_timeout");
     }
@@ -607,15 +651,66 @@ Result<void> IO::SubmitOrWait(const bool runnable) noexcept {
   return {};
 }
 
+int IO::SubmitSqes(const bool get_events) noexcept {
+  // Two failures are transient and the requests stay queued:
+  //
+  //   -EINTR            the syscall was interrupted before it did anything.
+  //   -EBUSY/-EAGAIN    the kernel could not flush the completion queue:
+  //                      the CQ ring is full and the overflow list could not
+  //                      be extended. The documented recovery is to reap the
+  //                      completions and submit again.
+  //
+  // The reaping matters more than it looks: a tick that failed here used to
+  // abort the shutdown drain with operations still in flight, and the ring
+  // was then torn down under them.
+  //
+  // Reaping only happens on the scheduler. GetSqe() reaches this from
+  // Syscall(), inside a fiber that is still preparing its own SQE, and
+  // reaping there would run the multishot accept handlers on that fiber: any
+  // I/O they did would overwrite the fiber's embedded Operation. From a
+  // fiber, the error goes back to the caller instead.
+  const bool can_reap = current_fiber_ == nullptr;
+  bool reaped = false;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const int ret =
+        get_events ? io_uring_submit_and_get_events(&ring_) : io_uring_submit(&ring_);
+    if (ret >= 0) {
+      return ret;
+    }
+    if (ret == -EINTR) {
+      continue;
+    }
+    if ((ret == -EBUSY || ret == -EAGAIN) && can_reap && !reaped) {
+      reaped = true;
+      ReapOverflow();
+      continue;
+    }
+    return ret;
+  }
+  return -EAGAIN;
+}
+
+void IO::ReapOverflow() noexcept {
+  assert(current_fiber_ == nullptr && "completions are reaped on the scheduler only");
+  // Flush the kernel-side overflow into the CQ, then reap it so the CQ head
+  // advances and the kernel has room for the next completion.
+  (void)io_uring_get_events(&ring_);
+  (void)DrainCompletions();
+}
+
 Result<io_uring_sqe*> IO::GetSqe() noexcept {
   io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
   if (sqe == nullptr) {
-    // SQ is full. Try one submit to clear space.
-    io_uring_submit(&ring_);
+    // The SQ is full: submit what is queued so the kernel can consume the
+    // entries. Reaping would not help here: it frees CQ space, not SQ slots.
+    const int ret = SubmitSqes(false);
+    if (ret < 0) {
+      return Error::fail_errno(-ret, "get_sqe.submit");
+    }
     sqe = io_uring_get_sqe(&ring_);
   }
 
-  // its a fatal error if its null again
+  // It's a fatal error if it's still null.
   if (sqe == nullptr) {
     return Error::fail_errno(ENOSPC, "get_sqe");
   }
@@ -706,8 +801,6 @@ Result<std::size_t> IO::DrainCompletions() noexcept {
       state->handler(*this, std::move(client_res));
 
       if (!(cqe->flags & IORING_CQE_F_MORE)) {
-        // Erase from active list
-        std::erase(active_multishots_, raw_data);
         delete state;
         --inflight_ops_;
       }
@@ -912,11 +1005,23 @@ void IO::Run(const std::stop_token& st) noexcept {
   }
 
   std::stop_callback wake_on_stop{st, [this] { Wake(); }};
+  // A tick error must not spin the loop forever and flood the log. Stop
+  // after a run of consecutive failures and let the drain below decide
+  // whether the ring can still be emptied: it is the one that knows what
+  // "operations still in flight" costs.
+  int consecutive_errors = 0;
   while (!st.stop_requested()) {
     if (auto res = Tick(); !res) {
       const auto err = res.error();
       ELOGFMT(ERROR, "tick failed: [{}] {}", err.context(), err.message());
+      if (++consecutive_errors >= k_max_tick_errors) {
+        ELOGFMT(ERROR, "{} consecutive tick failures; stopping the loop to drain",
+                consecutive_errors);
+        break;
+      }
+      continue;
     }
+    consecutive_errors = 0;
   }
 
   stopping_.store(true, std::memory_order_release);
@@ -951,14 +1056,25 @@ void IO::RunUntilDone() noexcept {
   // Run until quiesced: nothing ready, nothing in flight, nothing posted.
   // inflight_ops_ tracks user I/O ops and cancel SQEs only (the wake_fd_
   // read is not counted).
+  //
+  // A tick error must not abandon the loop: the runtime would be left with
+  // operations in flight, and the ring would then be torn down under them.
+  // Retry, and only give up when the ring stops making progress.
+  int consecutive_errors = 0;
   while (inflight_ops_ > 0 || !ready_queue_.Empty() || !post_queue_.Empty()) {
     if (auto res = Tick(); !res) {
       const auto err = res.error();
       ELOGFMT(ERROR, "io tick failed: [{}] {}", err.context(), err.message());
-      drain_to_completion_ = false;
-      is_running_ = false;
-      return;
+      if (++consecutive_errors >= k_max_tick_errors) {
+        ELOGFMT(FATAL,
+                "IO #{} cannot run to quiescence: {} operation(s) still in flight "
+                "after {} failed ticks",
+                id_, inflight_ops_, consecutive_errors);
+        std::abort();
+      }
+      continue;
     }
+    consecutive_errors = 0;
   }
 
   drain_to_completion_ = false;
@@ -1267,7 +1383,6 @@ Result<void> IO::AcceptLoopImpl(
   // Tag the lowest bit to indicate a MultishotAcceptState
   const uint64_t tagged_ptr = reinterpret_cast<uint64_t>(state) | 1ULL;
   io_uring_sqe_set_data64(sqe, tagged_ptr);
-  active_multishots_.push_back(tagged_ptr);
 
   inflight_ops_++;
   return {};

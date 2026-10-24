@@ -114,7 +114,7 @@ Result<FixedBuffer> FixedBufferPool::Acquire(IO& io) noexcept {
 
   // Park until a slot is handed to us, or the pool is closed.
   waiters_.Push(fiber);
-  io.ParkRunning();
+  io.ParkRunning(detail::fiber::WaitKind::buffer_pool);
 
   // Resumed. A slot handed over is ours even if the pool closed before we
   // ran: checking closed_ first would strand it in handed_ for good.

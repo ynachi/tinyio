@@ -30,11 +30,25 @@ and Valgrind to catch memory errors and leaks and fix them.
 
 | Item               | Minimum           | Recommended |
 |--------------------|-------------------|-------------|
-| Linux kernel       | 5.11              | 6.1+        |
+| Linux kernel       | 6.1               | 6.6+        |
 | liburing           | 2.8               | 2.12+       |
 | Compiler (x86-64)  | Clang 20 / GCC 15 | Clang 22    |
 | Compiler (aarch64) | Clang 20 / GCC 16 | Clang 22    |
 | C++ standard       | C++23             | —           |
+
+The kernel floor is set by the io_uring features the runtime actually uses,
+not by what io_uring could do:
+
+| Feature                                    | Needs |
+|--------------------------------------------|-------|
+| `IORING_SETUP_SINGLE_ISSUER`               | 6.0   |
+| `IORING_SETUP_DEFER_TASKRUN`               | 6.1   |
+| `IORING_SETUP_TASKRUN_FLAG`                | 5.19  |
+| `IORING_ASYNC_CANCEL_ALL` / `_ANY`         | 5.19  |
+
+`DEFER_TASKRUN` is in the default ring flags, and the shutdown path cancels
+every in-flight request with a single `IORING_ASYNC_CANCEL_ALL |
+IORING_ASYNC_CANCEL_ANY`. There is no fallback for an older kernel.
 
 ---
 

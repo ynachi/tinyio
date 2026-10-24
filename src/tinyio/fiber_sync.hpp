@@ -32,9 +32,13 @@ class FiberWaitQueue {
 /// A park is not cancelled by shutdown: only the primitive wakes it. A fiber
 /// still parked once the runtime has quiesced has no one left to wake it,
 /// and the runtime aborts (see IO::AbortIfParkedFibers()).
-inline void ParkOn(IO& io, FiberWaitQueue& waiters) noexcept {
+///
+/// @p reason names the primitive the fiber is parked on, so a runtime that
+/// aborts can say WHICH primitive is stuck instead of printing a count.
+inline void ParkOn(IO& io, FiberWaitQueue& waiters,
+                   const detail::fiber::WaitKind reason) noexcept {
   waiters.PushBack(io.RunningFiber());
-  io.ParkRunning();
+  io.ParkRunning(reason);
 }
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds
@@ -71,7 +75,7 @@ struct Latch {
   [[nodiscard]] Result<void> Wait() noexcept {
     assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
     if (count_ > 0) {
-      ParkOn(io_, waiters_);
+      ParkOn(io_, waiters_, detail::fiber::WaitKind::latch);
     }
     return {};
   }
@@ -120,7 +124,7 @@ struct Semaphore {
       --count_;
       return {};
     }
-    ParkOn(io_, waiters_);
+    ParkOn(io_, waiters_, detail::fiber::WaitKind::semaphore);
     return {};
   }
 
@@ -179,7 +183,7 @@ struct Mutex {
       held_ = true;
       return {};
     }
-    ParkOn(io_, waiters_);
+    ParkOn(io_, waiters_, detail::fiber::WaitKind::mutex);
     return {};
   }
 
@@ -289,7 +293,7 @@ struct TaskGroup<void> {
   [[nodiscard]] Result<void> Wait() noexcept {
     assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
     if (active_tasks_ > 0) {
-      ParkOn(io_, waiters_);
+      ParkOn(io_, waiters_, detail::fiber::WaitKind::task_group);
     }
     return {};
   }

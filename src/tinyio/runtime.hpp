@@ -129,11 +129,15 @@ class IO final {
   }
 
   /// Park the running fiber. Caller must have enqueued it on a wait list first.
+  ///
+  /// @p reason says WHAT the fiber is parked on. It costs nothing: the
+  /// reason is written into the fiber that is parking, and a runtime that
+  /// quiesces with parked fibers reports it instead of guessing.
   /// @note Not for application code. Owner-thread only.
-  void ParkRunning() noexcept {
+  void ParkRunning(const detail::fiber::WaitKind reason) noexcept {
     assert(current_fiber_ != nullptr && IsOwnerThread());
     current_fiber_->state = detail::fiber::FiberState::waiting;
-    current_fiber_->wait_kind = detail::fiber::WaitKind::sync;
+    current_fiber_->wait_kind = reason;
     SuspendFiber(current_fiber_);
   }
 
@@ -184,6 +188,11 @@ class IO final {
   ///
   /// This method is owner-thread-only. It blocks the owner thread only when no fiber is
   /// ready and the runtime is waiting for io_uring completions.
+  ///
+  /// Run() can also return WITHOUT a stop request: after k_max_tick_errors
+  /// consecutive failed ticks it stops the loop, cancels and drains like a
+  /// normal stop, and returns. Tasks Post()ed after that are never run, so a
+  /// supervisor that needs the worker alive has to check for this return.
   void Run(const std::stop_token& st) noexcept;
 
   std::size_t Id() const noexcept { return id_; }
@@ -480,6 +489,12 @@ class IO final {
  private:
   static constexpr uint64_t k_wakeup_sentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
   static constexpr uint64_t k_fiber_cancel_sentinel = 0xDEAD'C0DE'DEAD'C0CCULL;
+
+  /// Consecutive tick failures tolerated before the runtime gives up on a
+  /// drain. A tick error used to abandon the drain on the first one, which
+  /// left operations in flight while the ring was torn down.
+  static constexpr int k_max_tick_errors = 3;
+
   //
   // IO Uring management
   //
@@ -488,6 +503,13 @@ class IO final {
   /// Submits pending SQEs and, when @p runnable is false, sleeps until a
   /// completion arrives.
   Result<void> SubmitOrWait(bool runnable) noexcept;
+  /// Submits the queued SQEs, surviving the transient failures the ring can
+  /// produce. @p get_events selects the DEFER_TASKRUN-safe entry point.
+  /// @return The number of SQEs submitted, or a negative errno.
+  int SubmitSqes(bool get_events) noexcept;
+  /// Flushes the kernel's CQ overflow and reaps it, after a submit failed
+  /// with EBUSY/EAGAIN. Scheduler only: reaping runs completion handlers.
+  void ReapOverflow() noexcept;
   Result<io_uring_sqe*> GetSqe() noexcept;
 
   Result<void> Activate() noexcept;
@@ -501,7 +523,6 @@ class IO final {
     UniqueFd server_fd;
     std::move_only_function<void(IO&, Result<UniqueFd>) noexcept> handler;
   };
-  std::vector<uint64_t> active_multishots_;
 
   Result<std::size_t> DrainCompletions() noexcept;
   void DrainRemote();
