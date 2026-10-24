@@ -23,30 +23,18 @@ class FiberWaitQueue {
     return fibers_.Pop(fiber) ? fiber : nullptr;
   }
 
-  /// O(n). Only for a fiber that leaves before being popped (teardown).
-  void Remove(detail::fiber::Fiber* fiber) noexcept { fibers_.Erase(fiber); }
-
  private:
   detail::RingBuffer<detail::fiber::Fiber*> fibers_{8};
 };
 
 /// Parks the running fiber on @p waiters until someone pops and unparks it.
 ///
-/// During teardown the runtime may instead wake a parked fiber directly
-/// (IO::CancelAndDrain, pass 2) while it is still in @p waiters. The fiber
-/// then sees Stopping() and removes itself, so the primitive is not left
-/// holding a pointer to a fiber that is gone. A fiber that was popped
-/// normally is no longer in the queue, and Remove() does nothing.
-[[nodiscard]] inline Result<void> ParkOn(IO& io, FiberWaitQueue& waiters,
-                                         const char* op_name) noexcept {
-  auto* self = io.RunningFiber();
-  waiters.PushBack(self);
+/// A park is not cancelled by shutdown: only the primitive wakes it. A fiber
+/// still parked once the runtime has quiesced has no one left to wake it,
+/// and the runtime aborts (see IO::AbortIfParkedFibers()).
+inline void ParkOn(IO& io, FiberWaitQueue& waiters) noexcept {
+  waiters.PushBack(io.RunningFiber());
   io.ParkRunning();
-  if (io.Stopping()) {
-    waiters.Remove(self);
-    return Error::fail_errno(ECANCELED, op_name);
-  }
-  return {};
 }
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds
@@ -83,7 +71,7 @@ struct Latch {
   [[nodiscard]] Result<void> Wait() noexcept {
     assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
     if (count_ > 0) {
-      return ParkOn(io_, waiters_, "latch.wait");
+      ParkOn(io_, waiters_);
     }
     return {};
   }
@@ -132,7 +120,8 @@ struct Semaphore {
       --count_;
       return {};
     }
-    return ParkOn(io_, waiters_, "semaphore.acquire");
+    ParkOn(io_, waiters_);
+    return {};
   }
 
   // Increments count. Wakes one waiter if any.
@@ -190,7 +179,8 @@ struct Mutex {
       held_ = true;
       return {};
     }
-    return ParkOn(io_, waiters_, "mutex.lock");
+    ParkOn(io_, waiters_);
+    return {};
   }
 
   void Unlock() noexcept {
@@ -299,7 +289,7 @@ struct TaskGroup<void> {
   [[nodiscard]] Result<void> Wait() noexcept {
     assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
     if (active_tasks_ > 0) {
-      return ParkOn(io_, waiters_, "taskgroup.wait");
+      ParkOn(io_, waiters_);
     }
     return {};
   }

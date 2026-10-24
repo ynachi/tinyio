@@ -1,8 +1,14 @@
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <thread>
 
 #include <gtest/gtest.h>
 
+#include "tinyio/fiber_sync.hpp"
 #include "tinyio/runtime.hpp"
 
 using namespace tinyio;
@@ -178,4 +184,145 @@ TEST(ShutdownCancellationTest, DoubleRun) {
   (void)io.Spawn([&](IO&) noexcept { pass2 = true; });
   io.RunUntilDone();
   EXPECT_TRUE(pass2);
+}
+
+// Shutdown must not hang. Kills the process if it is still alive after 5s,
+// so a regression fails fast instead of waiting for the ctest timeout.
+constexpr int k_hung_exit_code = 99;
+
+class ShutdownWatchdog {
+ public:
+  ShutdownWatchdog()
+      : t_([this] {
+          for (int i = 0; i < 50 && !done_; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+          if (!done_) {
+            std::fputs("shutdown hung for 5s\n", stderr);
+            ::_exit(k_hung_exit_code);
+          }
+        }) {}
+  ~ShutdownWatchdog() {
+    done_ = true;
+    t_.join();
+  }
+
+ private:
+  std::atomic<bool> done_{false};
+  std::thread t_;
+};
+
+static void RunAndStopAfter50ms(IO& io) {
+  std::stop_source ss;
+  std::thread t([&ss]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ss.request_stop();
+  });
+  ShutdownWatchdog watchdog;
+  io.Run(ss.get_token());
+  t.join();
+}
+
+// The runtime's FATAL path exits through easylog's handler, which may turn
+// the abort into a plain non-zero exit: accept any death but a hang.
+static bool DiedWithoutHanging(const int status) {
+  return !WIFEXITED(status) ||
+         (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != k_hung_exit_code);
+}
+
+// 7. A fiber parked on a sync primitive nobody will signal is a deadlock:
+// once the I/O fibers are cancelled the runtime quiesces and aborts. It used
+// to block forever on the eventfd under kResumeFirst.
+class AbandonedParkTest : public ::testing::TestWithParam<IoOptions::LoopStyle> {};
+
+TEST_P(AbandonedParkTest, StopAbortsInsteadOfHanging) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        IoOptions opts;
+        opts.loop_style = GetParam();
+        IO io(0, opts, {});
+        Latch never(io, 1);
+        (void)io.Spawn([&](IO&) noexcept { (void)never.Wait(); });
+        (void)io.Spawn([](IO& rt) noexcept {
+          (void)rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
+        });
+        RunAndStopAfter50ms(io);
+      },
+      DiedWithoutHanging, "");
+}
+
+TEST_P(AbandonedParkTest, RunUntilDoneAbortsInsteadOfHanging) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        IoOptions opts;
+        opts.loop_style = GetParam();
+        IO io(0, opts, {});
+        Latch never(io, 1);
+        (void)io.Spawn([&](IO&) noexcept { (void)never.Wait(); });
+        ShutdownWatchdog watchdog;
+        io.RunUntilDone();
+      },
+      DiedWithoutHanging, "");
+}
+
+INSTANTIATE_TEST_SUITE_P(LoopStyles, AbandonedParkTest,
+                         ::testing::Values(IoOptions::LoopStyle::kResumeFirst,
+                                           IoOptions::LoopStyle::kSubmitFirst));
+
+// 8. A Mutex handed over during shutdown is owned by the woken fiber: Lock()
+// succeeds, so the waiter unlocks and the mutex ends up free.
+TEST(ShutdownCancellationTest, MutexHandoffDuringShutdownSucceeds) {
+  IoOptions opts;
+  IO io(0, opts, {});
+  Mutex mu(io);
+  bool waiter_locked = false;
+
+  (void)io.Spawn([&](IO& rt) noexcept {
+    (void)mu.Lock();
+    (void)rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
+    mu.Unlock();
+  });
+  (void)io.Spawn([&](IO&) noexcept {
+    if (mu.Lock()) {
+      waiter_locked = true;
+      mu.Unlock();
+    }
+  });
+
+  RunAndStopAfter50ms(io);
+
+  EXPECT_TRUE(waiter_locked);
+  EXPECT_TRUE(mu.TryLock());
+  mu.Unlock();
+}
+
+// 9. A parent waiting on a TaskGroup is woken by its cancelled children, not
+// by the runtime, and leaves its scope with the group empty.
+TEST(ShutdownCancellationTest, TaskGroupParentWokenByCancelledChildren) {
+  IoOptions opts;
+  IO io(0, opts, {});
+  int cancelled_children = 0;
+  bool parent_done = false;
+
+  (void)io.Spawn([&](IO& rt) noexcept {
+    TaskGroup group(rt);
+    for (int i = 0; i < 3; ++i) {
+      (void)group.Spawn([&](IO& child) noexcept {
+        auto res = child.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
+        if (!res && res.error().value() == ECANCELED) {
+          ++cancelled_children;
+        }
+      });
+    }
+    (void)group.Wait();
+    parent_done = true;
+  });
+
+  RunAndStopAfter50ms(io);
+
+  EXPECT_EQ(cancelled_children, 3);
+  EXPECT_TRUE(parent_done);
+  EXPECT_FALSE(io.HasLiveFibers());
 }

@@ -151,21 +151,22 @@ Concretely, when measuring a change to tinyio:
 
 ### Reference numbers for the current baseline
 
-Disk — one thread, one shared **pre-created** 64 MiB file, 4 KiB `O_DIRECT`,
-random offsets, median of 5 rounds:
+Disk — one thread, one shared **pre-created** 64 MiB file (recreated right
+before the run, see below), 4 KiB `O_DIRECT`, random offsets, median of 12
+rounds:
 
 | QD | IOPS | mean µs | p50 µs | p99 µs |
 |----|------|---------|--------|--------|
-| 1   | 11,749 | 81.2 | 80.9 | 90.9 |
-| 32  | 119,254 | 264.7 | 260.4 | 355.2 |
-| 128 | 133,772 | 945.1 | 922.0 | 1,143.0 |
+| 1   | 12,102 | 79.1 | 78.4 | 89.1 |
+| 32  | 120,060 | 263.1 | 259.5 | 349.2 |
+| 128 | 133,889 | 944.0 | 921.3 | 1,143.5 |
 
 Network — 512 connections, 15 s, 4 worker threads, saturation, median of 17
-interleaved samples:
+interleaved samples, **fast-tier median** (the link is tri-modal, see below):
 
 | req/s | p50 | p90 | p99 |
 |-------|-----|-----|-----|
-| 333,441 | 1.486 ms | 1.871 ms | 2.501 ms |
+| 332,771 | 1.483 ms | 1.877 ms | 2.672 ms |
 
 ## Measuring on srv401 (192.168.1.155)
 
@@ -189,14 +190,41 @@ Therefore, for any disk A/B:
 
 1. Use a **pre-created fixed data file** (`--file PATH`), so file placement on
    the NVMe cannot vary between arms.
-2. **Interleave** baseline and candidate round-by-round; never run all of A
+2. **Recreate that file immediately before the run** (e.g. `mkpattern`): the
+   NVMe keeps recently written data in its SLC cache, and a file whose pages
+   have aged out of it reads about **twice as slow** — QD 1 drops from ~83 µs
+   to ~155 µs, which silently invalidates every absolute number. A fresh
+   copy of an old file is fast again; the content does not matter, only how
+   recently the file was written. Check the pre-flight QD 1 number against
+   the table below before trusting a run.
+3. **Interleave** baseline and candidate round-by-round; never run all of A
    then all of B.
-3. Report the **median over ≥9 rounds**, and state how many runs landed in
+4. Report the **median over ≥9 rounds**, and state how many runs landed in
    the slow mode.
-4. Keep fio on the same file as a **device control** — it is how you know
-   whether a shift is the box or the code.
+5. Keep fio on the same file as a **device control** — it is how you know
+   whether a shift is the box or the code. fio needs `--time_based=1`,
+   otherwise it stops after one pass over the file and reports nonsense.
 
 A single run means nothing here.
+
+### The network link is tri-modal — split before you compare
+
+The HTTP path lands in one of three tiers, and **which tier a given sample
+lands in is decided by the box, not by the code**: the tier changes from
+sample to sample *and* from arm to arm inside the same sample.
+
+| tier | req/s | p99 | tail |
+|------|-------|-----|------|
+| A fast | ~333,000 | ~2.6 ms | clean |
+| B mid | ~324,000 | ~8–10 ms | one bad tail |
+| C slow | ~303,000 | ~11–14 ms | bad tail |
+
+A plain median over 17 samples straddles the gap differently for each arm, so
+it is **not** a valid estimator: in the 2026-10 run the two arms' medians
+landed on opposite sides of the gap and produced an apparent −2.5 % that was
+pure mix. Bucket the samples by tier first (the largest gap in the sorted p99
+values splits them cleanly: ~3.3 ms → ~7.8 ms), then compare the arms inside
+each tier. Per tier the arms agree to well under 1 %.
 
 ## Known knobs
 

@@ -447,11 +447,11 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
 void IO::CancelAndDrain() noexcept {
   bool issued_cancels = false;
 
-  // Pass 1: Cancel all in-flight IO operations.
-  // We do NOT wake up sync-parked fibers here. They might be waiting for
-  // the IO fibers to finish (e.g., TaskGroup::Wait, Latch::Wait).
-  // Waking them up prematurely would cause them to destroy synchronization
-  // primitives while the IO fibers are still unwinding, causing Use-After-Free.
+  // Cancel all in-flight IO operations.
+  // Sync-parked fibers are never woken by the runtime. They might be waiting
+  // for the IO fibers to finish (e.g., TaskGroup::Wait, Latch::Wait), and
+  // waking them early would let them destroy synchronization primitives
+  // while the IO fibers are still unwinding, causing Use-After-Free.
   for (detail::fiber::Fiber* fiber : all_fibers_) {
     if (fiber->state != detail::fiber::FiberState::waiting ||
         fiber->wait_kind != detail::fiber::WaitKind::io) {
@@ -500,42 +500,24 @@ void IO::CancelAndDrain() noexcept {
     if (auto res = Tick(); !res) {
       ELOGFMT(ERROR, "tick failed during cancel_and_drain: [{}] {}",
               res.error().context(), res.error().message());
-      break;
+      drain_to_completion_ = prev_drain_to_completion;
+      return;
     }
   }
   drain_to_completion_ = prev_drain_to_completion;
 
-  // Pass 2: Forcefully wake up any abandoned sync-parked fibers.
-  // At this point, there are no active IO operations. Any fiber still
-  // waiting is permanently deadlocked (e.g., waiting on a Latch that no
-  // one will count down because the counting fiber propagated an ECANCELED).
-  // We MUST wake them up so their stacks unwind and RAII destructors run.
-  //
-  // Each one is still in its primitive's wait queue. It removes itself when
-  // it wakes up and sees Stopping() (see ParkOn() in fiber_sync.hpp), so
-  // the primitive's destructor finds an empty queue.
-  //
-  // Iterating all_fibers_ while waking fibers is safe: PushReady() only
-  // touches the ready queue, and the fibers run later, in Tick().
-  bool abandoned_sync_fibers = false;
-  for (detail::fiber::Fiber* fiber : all_fibers_) {
-    if (fiber->state == detail::fiber::FiberState::waiting &&
-        fiber->wait_kind == detail::fiber::WaitKind::sync) {
-      PushReady(fiber);
-      abandoned_sync_fibers = true;
-    }
-  }
+  AbortIfParkedFibers();
+}
 
-  if (abandoned_sync_fibers) {
-    ELOGFMT(WARN, "IO #{} teardown: forcefully waking up abandoned sync-parked fibers",
-            id_);
-    while (inflight_ops_ > 0 || !ready_queue_.Empty()) {
-      if (auto res = Tick(); !res) {
-        ELOGFMT(ERROR, "tick failed during cancel_and_drain pass 2: [{}] {}",
-                res.error().context(), res.error().message());
-        break;
-      }
-    }
+void IO::AbortIfParkedFibers() const noexcept {
+  // Called once quiesced: nothing ready, nothing in flight. A fiber still
+  // live is parked on a sync primitive and nothing can ever wake it.
+  if (live_fibers_ > 0) {
+    ELOGFMT(FATAL,
+            "IO #{} quiesced with {} parked fiber(s) and no one left to wake them "
+            "(latch never counted down? mutex never unlocked?)",
+            id_, live_fibers_);
+    std::abort();
   }
 }
 
@@ -809,9 +791,10 @@ Result<void> IO::Tick() noexcept {
     // sleep with zero outstanding operations BEFORE it blocks in
     // submit_and_wait -- otherwise it waits for a completion that can
     // never arrive. The same hazard exists here because phase 1 may have
-    // just finished the last fiber.
-    if (drain_to_completion_ && !HasLiveFibers() && inflight_ops_ == 0 &&
-        ready_queue_.Empty() && post_queue_.Empty()) {
+    // just finished the last fiber. Live fibers do not count: one parked on
+    // a sync primitive waits for no completion either.
+    if (drain_to_completion_ && inflight_ops_ == 0 && ready_queue_.Empty() &&
+        post_queue_.Empty()) {
       return {};
     }
 
@@ -944,23 +927,23 @@ void IO::RunUntilDone() noexcept {
   // the runtime is quiesced.
   drain_to_completion_ = true;
 
-  // Also drain the cross-thread post queue: tasks posted before run_until_done()
-  // is called would be silently dropped if we only checked live_fibers_.
+  // Run until quiesced: nothing ready, nothing in flight, nothing posted.
   // inflight_ops_ tracks user I/O ops and cancel SQEs only (the wake_fd_
-  // read is not counted). HasLiveFibers() already covers waiting fibers,
-  // but the > 0 check defends against future code paths where an op is
-  // in-flight without a corresponding live fiber.
-  while (HasLiveFibers() || inflight_ops_ > 0 || !ready_queue_.Empty() ||
-         !post_queue_.Empty()) {
+  // read is not counted).
+  while (inflight_ops_ > 0 || !ready_queue_.Empty() || !post_queue_.Empty()) {
     if (auto res = Tick(); !res) {
       const auto err = res.error();
       ELOGFMT(ERROR, "io tick failed: [{}] {}", err.context(), err.message());
-      break;
+      drain_to_completion_ = false;
+      is_running_ = false;
+      return;
     }
   }
 
   drain_to_completion_ = false;
   is_running_ = false;
+
+  AbortIfParkedFibers();
 }
 //
 // ======================= IO Methods ==========================================

@@ -658,6 +658,10 @@ class IO final {
   /// tick() until all in-flight ops and ready fibers are drained.
   void CancelAndDrain() noexcept;
 
+  /// Aborts if a fiber is still live once the runtime has quiesced: it is
+  /// parked on a sync primitive that nothing can ever signal (a deadlock).
+  void AbortIfParkedFibers() const noexcept;
+
   /// Spawns a fiber from an already-erased task object.
   [[nodiscard]] Result<FiberId> SpawnTask(
       std::move_only_function<void(IO&) noexcept> task) noexcept;
