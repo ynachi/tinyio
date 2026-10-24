@@ -9,7 +9,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-#include "error.hpp"
+#include "tinyio/error.hpp"
 
 namespace tinyio {
 template <typename Opt>

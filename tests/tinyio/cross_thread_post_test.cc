@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 using namespace tinyio;
 

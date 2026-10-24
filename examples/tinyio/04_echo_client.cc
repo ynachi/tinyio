@@ -11,7 +11,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "../../src/tinyio/tinyio.hpp"
+#include "tinyio/tinyio.hpp"
 
 using tinyio::IO;
 using tinyio::Result;

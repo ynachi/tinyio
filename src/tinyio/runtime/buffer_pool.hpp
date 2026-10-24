@@ -9,10 +9,10 @@
 
 #include <sys/uio.h>
 
-#include "check.hpp"
-#include "detail/fiber.hpp"
-#include "detail/ring_buffer.hpp"
-#include "error.hpp"
+#include "tinyio/check.hpp"
+#include "tinyio/detail/fiber.hpp"
+#include "tinyio/detail/ring_buffer.hpp"
+#include "tinyio/error.hpp"
 
 namespace tinyio {
 

@@ -1,8 +1,8 @@
 #include <chrono>
 #include <iostream>
 
-#include "tinyio/fiber_sync.hpp"
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/fiber_sync.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 void bench_mutex(tinyio::IO& io, size_t iterations) {
   tinyio::Mutex mutex(io);

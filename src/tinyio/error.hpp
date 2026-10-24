@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "logging.hpp"
+#include "tinyio/logging.hpp"
 
 namespace tinyio {
 // A deliberately small error value. `operation` is diagnostic context and

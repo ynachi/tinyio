@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <functional>
 
-#include "context.hpp"
-#include "sanitizer_hooks.hpp"
+#include "tinyio/detail/context.hpp"
+#include "tinyio/detail/sanitizer_hooks.hpp"
 
 namespace tinyio {
 class IO;

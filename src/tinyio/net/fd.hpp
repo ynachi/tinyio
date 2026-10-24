@@ -1,8 +1,8 @@
 #pragma once
 #include <unistd.h>
 
-#include "error.hpp"
-#include "net.hpp"
+#include "tinyio/error.hpp"
+#include "tinyio/net/net.hpp"
 
 namespace tinyio {
 class IO;  // forward declaration for typed back-pointer

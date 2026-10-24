@@ -1,7 +1,7 @@
 #include <chrono>
 #include <iostream>
 
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 int main() {
   tinyio::IoOptions opts;

@@ -28,10 +28,10 @@
 #include <thread>
 #include <vector>
 
-#include <tinyio/tcp_listener.hpp>
+#include <tinyio/net/tcp_listener.hpp>
 #include <ylt/easylog.hpp>
 
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 namespace {
 

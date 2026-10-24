@@ -1,7 +1,7 @@
 #pragma once
 
-#include "fd.hpp"
-#include "net.hpp"
+#include "tinyio/net/fd.hpp"
+#include "tinyio/net/net.hpp"
 
 namespace tinyio {
 struct TcpListener {

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "logging.hpp"
+#include "tinyio/logging.hpp"
 
 // Abseil is gone from tinyio, and with it absl::CHECK. easylog has no
 // equivalent of its own, so this is the same contract on top of easylog's

@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-#include "stack.hpp"
+#include "tinyio/detail/stack.hpp"
 
 #if defined(__has_feature)
 #  if __has_feature(address_sanitizer)

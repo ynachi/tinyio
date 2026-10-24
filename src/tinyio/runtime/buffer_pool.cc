@@ -1,4 +1,4 @@
-#include "buffer_pool.hpp"
+#include "tinyio/runtime/buffer_pool.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -7,7 +7,7 @@
 
 #include <sys/mman.h>
 
-#include "runtime.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 namespace tinyio {
 

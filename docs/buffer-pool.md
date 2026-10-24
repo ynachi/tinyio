@@ -2,7 +2,8 @@
 
 Status: **LIVING DOCUMENT** — written 2026-10-24, right after the port from
 kio landed, while the reasoning was still fresh. Code:
-`src/tinyio/buffer_pool.{hpp,cc}`, `src/tinyio/runtime.{hpp,cc}`, tests in
+`src/tinyio/runtime/buffer_pool.{hpp,cc}`,
+`src/tinyio/runtime/runtime.{hpp,cc}`, tests in
 `tests/tinyio/buffer_pool_test.cc` and
 `tests/tinyio/shutdown_cancellation_test.cc`.
 

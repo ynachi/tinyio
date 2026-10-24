@@ -19,10 +19,10 @@ files, plus the headers they lean on:
 
 | File | Lines | What lives there |
 |------|-------|------------------|
-| `src/tinyio/runtime.cc` | 371 | construction, activation, the run loop, shutdown |
-| `src/tinyio/scheduler.cc` | 173 | fibers: spawn, resume, suspend, destroy, yield |
-| `src/tinyio/event_loop.cc` | 295 | the tick, submit/wait, reap, timers, the eventfd wakeup |
-| `src/tinyio/io_ops.cc` | 233 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
+| `src/tinyio/runtime/runtime.cc` | 371 | construction, activation, the run loop, shutdown |
+| `src/tinyio/runtime/scheduler.cc` | 173 | fibers: spawn, resume, suspend, destroy, yield |
+| `src/tinyio/runtime/event_loop.cc` | 295 | the tick, submit/wait, reap, timers, the eventfd wakeup |
+| `src/tinyio/runtime/io_ops.cc` | 233 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
 
 The class is still one `IO`: these are translation units, not layers, and a
 single operation crosses several of them.

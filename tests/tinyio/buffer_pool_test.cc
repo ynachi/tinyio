@@ -1,4 +1,4 @@
-#include "tinyio/buffer_pool.hpp"
+#include "tinyio/runtime/buffer_pool.hpp"
 
 #include <unistd.h>
 
@@ -13,7 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "tinyio/error.hpp"
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 using namespace tinyio;
 

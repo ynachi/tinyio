@@ -8,8 +8,8 @@
 #include <gtest/gtest.h>
 #include <sys/wait.h>
 
-#include "tinyio/fiber_sync.hpp"
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/fiber_sync.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 using namespace tinyio;
 

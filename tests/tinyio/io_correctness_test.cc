@@ -17,8 +17,8 @@
 #include <sys/socket.h>
 
 #include "tinyio/detail/sanitizer_hooks.hpp"
-#include "tinyio/runtime.hpp"
-#include "tinyio/tcp_listener.hpp"
+#include "tinyio/net/tcp_listener.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 using namespace tinyio;
 using namespace std::chrono_literals;

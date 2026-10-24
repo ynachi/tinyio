@@ -39,9 +39,9 @@
 
 #include <sys/resource.h>
 #include <tinyio/error.hpp>
-#include <tinyio/fd.hpp>
-#include <tinyio/fiber_sync.hpp>
-#include <tinyio/runtime.hpp>
+#include <tinyio/net/fd.hpp>
+#include <tinyio/runtime/fiber_sync.hpp>
+#include <tinyio/runtime/runtime.hpp>
 
 namespace {
 using Clock = std::chrono::steady_clock;

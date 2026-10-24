@@ -2,15 +2,15 @@ set(TINYIO_INCLUDES "$<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/src>"
         "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>")
 
 set(TINYIO_SOURCES
-        buffer_pool.cc
         detail/context.cc
         detail/stack.cc
-        event_loop.cc
-        io_ops.cc
-        net.cc
-        runtime.cc
-        scheduler.cc
-        tcp_listener.cc)
+        net/net.cc
+        net/tcp_listener.cc
+        runtime/buffer_pool.cc
+        runtime/event_loop.cc
+        runtime/io_ops.cc
+        runtime/runtime.cc
+        runtime/scheduler.cc)
 
 # mimalloc is optional: TINYIO_USE_MIMALLOC turns it on, and the release
 # preset does. The sanitizers refuse to run with it, because mimalloc
@@ -122,11 +122,16 @@ foreach (tinyio_target IN ITEMS tinyio_static tinyio_shared)
     endif ()
 endforeach ()
 
-# Public headers. The detail/ headers are not API, but the public ones include
-# them, so they have to travel with them. version.h is generated into the
-# build tree and comes from there.
+# Public headers. Each folder installs under the same path it has in src/, so
+# an include line resolves the same way in the build tree and the installed
+# one. The detail/ headers are not API, but the public ones include them, so
+# they have to travel with them. version.h is generated into the build tree
+# and comes from there.
 tinyio_install_all_headers(tinyio)
-tinyio_install_all_headers(tinyio/detail SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/detail")
+foreach (tinyio_header_dir IN ITEMS detail net runtime)
+    tinyio_install_all_headers(tinyio/${tinyio_header_dir}
+            SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${tinyio_header_dir}")
+endforeach ()
 install(FILES "${PROJECT_BINARY_DIR}/src/tinyio/version.h"
         DESTINATION "${TINYIO_INSTALL_INCLUDEDIR}/tinyio")
 

@@ -29,12 +29,28 @@ command per task.
 
 ## Layout
 
-`src/tinyio/runtime.{hpp,cc}` is still **one class**, spread over four
+`src/tinyio/` holds the umbrella `tinyio.hpp` and the leaf headers every
+other one leans on (`error.hpp`, `check.hpp`, `logging.hpp`). Below it:
+
+- `runtime/` — the `IO` class, the fiber synchronization primitives in
+  `fiber_sync.hpp`, and the fixed buffer pool, which is owned by and
+  registered with one `IO`.
+- `net/` — sockets and descriptors: `SocketAddress`, `UniqueFd`,
+  `TcpListener`. It depends on nothing but `error.hpp`.
+- `detail/` — the mechanism: context switch, stacks, fibers, queues, the
+  timer wheel. Not API.
+
+`src/tinyio/runtime/runtime.{hpp,cc}` is still **one class**, spread over four
 translation units: `runtime.cc` (construction, activation, the run loop,
 shutdown), `scheduler.cc` (fibers: spawn, resume, suspend, destroy),
 `event_loop.cc` (the tick, submit/wait, reap, timers, the eventfd wakeup)
 and `io_ops.cc` (the thin `Read`/`Write`/`Open`/… wrappers). The headers
 under `src/tinyio/detail/` sit next to their implementations.
+
+Every project header is included by its rooted path, `"tinyio/error.hpp"` or
+`"tinyio/detail/fiber.hpp"`, never relative to the including file. The source
+tree under `src/` and the installed tree under `include/` have the same shape,
+so the same include line resolves in both.
 
 `docs/core-reading-guide.md` is the reading order, and the invariants it
 lists are the specification.
@@ -43,8 +59,9 @@ lists are the specification.
 
 `cmake --install build/<preset> --prefix <dir>` produces:
 
-- `include/tinyio/` — the public headers, `include/tinyio/detail/` — the ones
-  they include, and the generated `version.h`.
+- `include/tinyio/` — the public headers, in the same `runtime/` and `net/`
+  folders as in `src/`, `include/tinyio/detail/` — the ones they include, and
+  the generated `version.h`.
 - `include/ylt/` — YLT's own headers, because the public headers include
   `<ylt/easylog.hpp>`. YLT's thirdparty and standalone trees (asio, frozen,
   cinatra, iguana) are not installed.

@@ -5,7 +5,7 @@
 #include <optional>
 #include <vector>
 
-#include "fiber.hpp"
+#include "tinyio/detail/fiber.hpp"
 
 namespace tinyio::detail {
 
