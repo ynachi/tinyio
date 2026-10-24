@@ -53,7 +53,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsWaiting) {
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
   EXPECT_TRUE(fiber_ran);
-  EXPECT_EQ(fiber_err.value(), ECANCELED);
+  EXPECT_EQ(fiber_err.Value(), ECANCELED);
   EXPECT_LT(elapsed.count(), 2000);
 }
 
@@ -90,7 +90,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsReady) {
 
   EXPECT_TRUE(fiber_started);
   EXPECT_TRUE(fiber_finished);
-  EXPECT_EQ(yield_err.value(), ECANCELED);
+  EXPECT_EQ(yield_err.Value(), ECANCELED);
 }
 
 // 3. destructor_cancels_live_work
@@ -166,8 +166,8 @@ TEST(ShutdownCancellationTest, SyscallReturnsEcanceled) {
   t.join();
 
   EXPECT_TRUE(fiber_finished);
-  EXPECT_EQ(yield_err.value(), ECANCELED);
-  EXPECT_EQ(sleep_err.value(), ECANCELED);
+  EXPECT_EQ(yield_err.Value(), ECANCELED);
+  EXPECT_EQ(sleep_err.Value(), ECANCELED);
 }
 
 // 6. double_run
@@ -358,7 +358,7 @@ TEST(ShutdownCancellationTest, TaskGroupParentWokenByCancelledChildren) {
     for (int i = 0; i < 3; ++i) {
       (void)group.Spawn([&](IO& child) noexcept {
         auto res = child.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
-        if (!res && res.error().value() == ECANCELED) {
+        if (!res && res.error().Value() == ECANCELED) {
           ++cancelled_children;
         }
       });

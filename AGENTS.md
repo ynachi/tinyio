@@ -102,7 +102,7 @@ operation that failed, wrapped in `std::expected` as `Result<T>`.
 ```cpp
 auto listener = TcpListener::Bind(8080);
 if (!listener) {
-  ELOGFMT(ERROR, "bind failed: {}", listener.error().message());
+  ELOGFMT(ERROR, "bind failed: {}", listener.error().Message());
   return std::unexpected(listener.error());
 }
 ```

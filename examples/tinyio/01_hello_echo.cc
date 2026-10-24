@@ -24,7 +24,7 @@ Result<void> write_all(IO& fio, const UniqueFd& fd, std::span<const std::byte> d
   while (!data.empty()) {
     TRY_LOG_ERR(written, fio.Write(fd, data), "failed to write to client");
     if (written == 0) {
-      return tinyio::Error::fail_errno(EIO, "write");
+      return tinyio::Error::FailErrno(EIO, "write");
     }
     data = data.subspan(written);
   }
@@ -54,8 +54,8 @@ Result<void> handle_client(IO& io, UniqueFd client) {
     // another way to manage error
     if (auto err = write_all(io, client, std::span<const std::byte>(buf).first(n));
         !err.has_value()) {
-      ELOGFMT(ERROR, "failed to write to client, err = [{}] {}", err.error().context(),
-              err.error().message());
+      ELOGFMT(ERROR, "failed to write to client, err = [{}] {}", err.error().Context(),
+              err.error().Message());
       break;
     }
   }
@@ -71,7 +71,7 @@ void server_loop(IO& io) noexcept {
       tinyio::TcpListener::Bind(static_cast<uint16_t>(FLAGS_port), FLAGS_ip.c_str());
   if (!listener) {
     ELOGFMT(ERROR, "failed to bind tcp listener: {}", FLAGS_port);
-    ELOGFMT(ERROR, "[{}] {}", listener.error().context(), listener.error().message());
+    ELOGFMT(ERROR, "[{}] {}", listener.error().Context(), listener.error().Message());
     return;
   }
 
@@ -80,7 +80,7 @@ void server_loop(IO& io) noexcept {
     auto client = io.Accept(*listener, tinyio::k_default_accept_flags, 30s);
     if (!client) {
       ELOGFMT(ERROR, "failed to accept connexion: {}", FLAGS_port);
-      ELOGFMT(ERROR, "[{}] {}", client.error().context(), client.error().message());
+      ELOGFMT(ERROR, "[{}] {}", client.error().Context(), client.error().Message());
       return;
     }
 
@@ -89,8 +89,8 @@ void server_loop(IO& io) noexcept {
               return handle_client(nio, std::move(c));
             });
         !err.has_value()) {
-      ELOGFMT(ERROR, "failed to accept client: [{}] {}", err.error().context(),
-              err.error().message());
+      ELOGFMT(ERROR, "failed to accept client: [{}] {}", err.error().Context(),
+              err.error().Message());
     }
   }
 }
@@ -104,8 +104,8 @@ int main(int argc, char** argv) {
   IO io{0, tinyio::IoOptions{}};
 
   if (auto res = io.Spawn(server_loop); !res.has_value()) {
-    ELOGFMT(ERROR, "failed to spawn server: [{}] {}", res.error().context(),
-            res.error().message());
+    ELOGFMT(ERROR, "failed to spawn server: [{}] {}", res.error().Context(),
+            res.error().Message());
     std::abort();
   }
 

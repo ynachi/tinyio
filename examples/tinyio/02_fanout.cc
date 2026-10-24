@@ -38,7 +38,7 @@ Result<double> probe_target(IO& io, const Target& t, Semaphore& gate) noexcept {
 
   if (!sock.Valid()) {
     gate.Release();
-    return tinyio::Error::fail_errno(errno, "socket");
+    return tinyio::Error::FailErrno(errno, "socket");
   }
 
   const auto r = io.Connect(sock, t.addr, 2s);
@@ -59,14 +59,14 @@ void run_probes(IO& io) noexcept {
         });
         !res) {
       ELOGFMT(ERROR, "failed to spawn probe for {}: [{}] {}", t.host,
-              res.error().context(), res.error().message());
+              res.error().Context(), res.error().Message());
     }
   }
 
   // everyone wait here, the line completed before we move on
   if (auto res = probes.Wait(); !res) {
-    ELOGFMT(ERROR, "probe group interrupted: [{}] {}", res.error().context(),
-            res.error().message());
+    ELOGFMT(ERROR, "probe group interrupted: [{}] {}", res.error().Context(),
+            res.error().Message());
   }
 
   for (size_t i = 0; i < targets.size(); ++i) {
@@ -74,7 +74,7 @@ void run_probes(IO& io) noexcept {
       ELOGFMT(INFO, "{:<24} UP    {:>6.1f} ms", targets[i].host, slot->value());
     } else if (slot) {
       ELOGFMT(INFO, "{:<24} DOWN  ({})", targets[i].host,
-              slot->error().value() == ETIMEDOUT ? "timeout" : "refused");
+              slot->error().Value() == ETIMEDOUT ? "timeout" : "refused");
     }
   }
 }
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     std::string host = argv[i];
     auto a = tinyio::ResolveIp(host, static_cast<uint16_t>(FLAGS_port));
     if (!a) {
-      ELOGFMT(ERROR, "{:<24} resolve failed ({})", host, a.error().value());
+      ELOGFMT(ERROR, "{:<24} resolve failed ({})", host, a.error().Value());
       continue;
     }
     targets.push_back({std::move(host), *a});
@@ -109,8 +109,8 @@ int main(int argc, char** argv) {
   IO io{0, tinyio::IoOptions{}};
 
   if (auto res = io.Spawn(run_probes); !res.has_value()) {
-    ELOGFMT(ERROR, "failed to spawn: [{}] {}", res.error().context(),
-            res.error().message());
+    ELOGFMT(ERROR, "failed to spawn: [{}] {}", res.error().Context(),
+            res.error().Message());
     return 1;
   }
 

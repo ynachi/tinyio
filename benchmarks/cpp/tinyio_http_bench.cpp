@@ -79,7 +79,7 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::UniqueFd& fd,
   while (!data.empty()) {
     TRY(written, fio.Write(fd, data));
     if (written == 0) {
-      return tinyio::Error::fail_errno(EIO, "write");
+      return tinyio::Error::FailErrno(EIO, "write");
     }
     data = data.subspan(written);
   }
@@ -108,7 +108,7 @@ void handle_client(tinyio::IO& fio, int raw_fd) {
 void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size) {
   auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
   if (!listener) {
-    std::cerr << "bind failed: " << listener.error().message() << '\n';
+    std::cerr << "bind failed: " << listener.error().Message() << '\n';
     return;
   }
 
@@ -117,7 +117,7 @@ void accept_loop(tinyio::IO& worker, uint16_t port, size_t stack_size) {
     auto client_res = worker.Accept(server_fd);
     if (!client_res) {
       if (!g_stop_requested.load(std::memory_order_relaxed)) {
-        std::cerr << "accept failed: " << client_res.error().message() << '\n';
+        std::cerr << "accept failed: " << client_res.error().Message() << '\n';
       }
       return;
     }

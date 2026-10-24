@@ -68,9 +68,9 @@ int main() {
 
         std::string_view msg = "hello from a fiber\n";
         std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        TRY(io.Write(fd, buf));
+        TRY_VOID(io.Write(fd, buf));
 
-        TRY(io.Close(std::move(fd)));
+        TRY_VOID(io.Close(std::move(fd)));
     });
 
     io.RunUntilDone();
@@ -85,19 +85,19 @@ Each thread owns one `IO` instance. All threads bind to the same port via `SO_RE
 #include "tinyio/tinyio.hpp"
 using namespace tinyio;
 
-static Result<void> handle_client(IO& io, Fd client) noexcept {
+static Result<void> handle_client(IO& io, UniqueFd client) noexcept {
     std::byte buf[4096];
     while (true) {
         auto n = TRY(io.Read(client, std::span{buf}));
         if (n == 0) break;
         // write response ...
-        TRY(io.Write(client, response));
+        TRY_VOID(io.Write(client, response));
     }
     return {};
 }
 
 static Result<void> accept_loop(IO& io, uint16_t port, std::stop_token st) noexcept {
-    auto server = TRY(TcpListener::bind(port, "0.0.0.0"));
+    auto server = TRY(TcpListener::Bind(port, "0.0.0.0"));
 
     while (!st.stop_requested()) {
         auto client = TRY(io.Accept(server));
@@ -224,14 +224,14 @@ static context string.
 // Manual check
 auto res = io.Read(fd, buf);
 if (!res) {
-    // res.error().code      — errno value
-    // res.error().error_code().message() — human-readable string
-    // res.error().op        — operation name, e.g. "read"
+    // res.error().Value()   — errno value
+    // res.error().Message() — human-readable string
+    // res.error().Context() — operation name, e.g. "read"
 }
 
-// Rust ?-style propagation (GNU statement expression, Clang/GCC only)
-auto n = TRY(io.Read(fd, buf));   // returns error to caller on failure
-TRY(io.Fsync(fd));                // Result<void>: just propagate
+// Rust ?-style propagation: bind the value, propagate the error on failure.
+auto n = TRY(io.Read(fd, buf));   // returns the error to the caller on failure
+TRY_VOID(io.Fsync(fd));           // Result<void>: just propagate
 ```
 
 ### Fixed buffer pool

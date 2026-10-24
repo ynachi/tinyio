@@ -29,7 +29,7 @@ Result<unsigned int> IO::FixedRange(const FixedBuffer& buf, const size_t len,
   // clamped to what is left of it, so the kernel never touches the next
   // slot.
   if (buffer_offset >= buf.Size() || len == 0) {
-    return Error::fail_errno(EINVAL, op_name);
+    return Error::FailErrno(EINVAL, op_name);
   }
   return static_cast<unsigned int>(
       std::min({len, buf.Size() - buffer_offset, kMaxRwLen}));
@@ -225,7 +225,7 @@ Result<void> IO::SleepForNs(const std::chrono::nanoseconds duration) noexcept {
   // A timeout SQE completes with -ETIME when it fires: that is success here.
   auto r = Syscall<void>(
       "sleep_for", [&](io_uring_sqe* sqe) { io_uring_prep_timeout(sqe, &ts, 0U, 0U); });
-  if (!r && r.error().value() == ETIME) {
+  if (!r && r.error().Value() == ETIME) {
     return {};
   }
   return r;

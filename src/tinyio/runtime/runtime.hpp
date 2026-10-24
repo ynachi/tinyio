@@ -152,9 +152,9 @@ class IO final {
     try {
       return SpawnTask(std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
     } catch (const std::bad_alloc&) {
-      return Error::fail_errno(ENOMEM, "spawn");
+      return Error::FailErrno(ENOMEM, "spawn");
     } catch (...) {
-      return Error::fail_errno(EINVAL, "spawn");
+      return Error::FailErrno(EINVAL, "spawn");
     }
   }
 
@@ -496,7 +496,7 @@ class IO final {
     CheckCanSubmit(op_name);
 
     if (stopping_) {
-      return Error::fail_errno(ECANCELED, op_name);
+      return Error::FailErrno(ECANCELED, op_name);
     }
 
     assert(current_fiber_->state == detail::fiber::FiberState::running);
@@ -526,7 +526,7 @@ class IO final {
     if (op.cqe_res < 0) {
       const int err =
           (op.cqe_res == -ECANCELED && op.timed_out) ? ETIMEDOUT : -op.cqe_res;
-      return Error::fail_errno(err, op_name);
+      return Error::FailErrno(err, op_name);
     }
 
     if constexpr (std::is_same_v<T, void>) {

@@ -16,7 +16,7 @@ Result<SocketAddress> SocketAddress::V4(const uint16_t port, const char* ip) {
     // inet_pton leaves the destination zeroed on failure, and a zeroed
     // sin_addr IS INADDR_ANY: an unchecked failure silently widens the bind.
     if (::inet_pton(AF_INET, ip, &in->sin_addr) != 1) {
-      return Error::fail_errno(EINVAL, "inet_pton v4");
+      return Error::FailErrno(EINVAL, "inet_pton v4");
     }
   } else {
     in->sin_addr.s_addr = INADDR_ANY;
@@ -33,7 +33,7 @@ Result<SocketAddress> SocketAddress::V6(const uint16_t port, const char* ip) {
   if (ip && *ip) {
     // Same as V4: a failed parse would zero sin6_addr == in6addr_any (::).
     if (::inet_pton(AF_INET6, ip, &in6->sin6_addr) != 1) {
-      return Error::fail_errno(EINVAL, "inet_pton v6");
+      return Error::FailErrno(EINVAL, "inet_pton v6");
     }
   } else {
     in6->sin6_addr = in6addr_any;
@@ -82,11 +82,11 @@ Result<SocketAddress> ResolveIp(const std::string_view host, const uint16_t port
   if (const int rc = getaddrinfo(hostname.c_str(), service.c_str(), &hints, &res);
       rc != 0) {
     // EAI_SYSTEM means check errno; all other EAI_* codes map to EIO.
-    return Error::fail_errno(rc == EAI_SYSTEM ? errno : EIO, "getaddrinfo");
+    return Error::FailErrno(rc == EAI_SYSTEM ? errno : EIO, "getaddrinfo");
   }
 
   if (!res) {
-    return Error::fail_errno(EIO, "getaddrinfo_null_result");
+    return Error::FailErrno(EIO, "getaddrinfo_null_result");
   }
 
   SocketAddress out;

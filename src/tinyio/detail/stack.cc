@@ -34,7 +34,7 @@ namespace {
 Result<Stack> AllocateStack(std::size_t usable_size, std::size_t guard_size) noexcept {
   const long page_long = ::sysconf(_SC_PAGESIZE);
   if (page_long <= 0) {
-    return Error::fail_errno(EINVAL, "allocate_stack");
+    return Error::FailErrno(EINVAL, "allocate_stack");
   }
   const auto page = static_cast<std::size_t>(page_long);
   usable_size = std::max<std::size_t>(usable_size, page * 4U);
@@ -43,7 +43,7 @@ Result<Stack> AllocateStack(std::size_t usable_size, std::size_t guard_size) noe
 
   if (usable_size > static_cast<std::size_t>(PTRDIFF_MAX) ||
       guard_size > static_cast<std::size_t>(PTRDIFF_MAX) - usable_size) {
-    return Error::fail_errno(ENOMEM, "allocate_stack");
+    return Error::FailErrno(ENOMEM, "allocate_stack");
   }
 
   const std::size_t mapping_size = guard_size + usable_size;
@@ -54,7 +54,7 @@ Result<Stack> AllocateStack(std::size_t usable_size, std::size_t guard_size) noe
 
   void* mapping = ::mmap(nullptr, mapping_size, PROT_NONE, flags, -1, 0);
   if (mapping == MAP_FAILED) {
-    return Error::fail_errno(errno, "mmap_stack");
+    return Error::FailErrno(errno, "mmap_stack");
   }
 
   auto* base = static_cast<std::byte*>(mapping);
@@ -62,7 +62,7 @@ Result<Stack> AllocateStack(std::size_t usable_size, std::size_t guard_size) noe
   if (::mprotect(low, usable_size, PROT_READ | PROT_WRITE) != 0) {
     const int err = errno;
     (void)::munmap(mapping, mapping_size);
-    return Error::fail_errno(err, "mprotect_stack");
+    return Error::FailErrno(err, "mprotect_stack");
   }
 
   Stack stack;

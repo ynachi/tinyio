@@ -195,7 +195,7 @@ TEST(FixedBufferPoolTest, OrdinalsAreUniqueAndDense) {
   // Exhausted: the next non-blocking take fails with EAGAIN.
   auto extra = pool.Take();
   ASSERT_FALSE(extra.has_value());
-  EXPECT_EQ(extra.error().value(), EAGAIN);
+  EXPECT_EQ(extra.error().Value(), EAGAIN);
   EXPECT_EQ(pool.Available(), 0u);
 }
 
@@ -511,7 +511,7 @@ TEST(FixedBufferPoolRuntimeTest, ExhaustedPoolReturnsEagain) {
 
   auto extra = io.TakeFixedBuffer();
   ASSERT_FALSE(extra.has_value());
-  EXPECT_EQ(extra.error().value(), EAGAIN);
+  EXPECT_EQ(extra.error().Value(), EAGAIN);
 }
 
 // Asking a runtime without a pool for a fixed buffer is a programming error.

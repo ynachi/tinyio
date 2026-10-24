@@ -32,7 +32,7 @@ Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_
   TRY(addr, SocketAddress::V4(static_cast<uint16_t>(FLAGS_port), FLAGS_ip.c_str()));
   UniqueFd sock{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
   if (!sock.Valid()) {
-    return tinyio::Error::fail_errno(errno, "socket");
+    return tinyio::Error::FailErrno(errno, "socket");
   }
 
   if (auto err = io.Connect(sock, addr); !err.has_value()) {
@@ -47,7 +47,7 @@ Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_
     std::span to_write(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
     while (!to_write.empty()) {
       TRY_LOG_ERR(written, io.Write(sock, to_write), "write to server");
-      if (written == 0) return tinyio::Error::fail_errno(EIO, "write closed");
+      if (written == 0) return tinyio::Error::FailErrno(EIO, "write closed");
       to_write = to_write.subspan(written);
     }
 
@@ -56,13 +56,13 @@ Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_
     while (received < expected) {
       std::span<std::byte> read_buf(buf);
       TRY_LOG_ERR(n, io.Read(sock, read_buf.subspan(received)), "read from server");
-      if (n == 0) return tinyio::Error::fail_errno(EIO, "read closed");
+      if (n == 0) return tinyio::Error::FailErrno(EIO, "read closed");
       received += n;
     }
 
     std::string_view rec_msg(reinterpret_cast<const char*>(buf), received);
     if (rec_msg != msg) {
-      return tinyio::Error::fail_errno(EBADMSG, "corrupted message");
+      return tinyio::Error::FailErrno(EBADMSG, "corrupted message");
     }
   }
 
@@ -79,8 +79,8 @@ void thread_worker(uint64_t thread_id) {
         [thread_id, c](IO& nio) mutable noexcept -> void {
       if (auto err = run_client(nio, thread_id, c); !err.has_value()) {
         ++total_errors;
-        ELOGFMT(ERROR, "Client {}-{} error: [{}] {}", thread_id, c, err.error().context(),
-                err.error().message());
+        ELOGFMT(ERROR, "Client {}-{} error: [{}] {}", thread_id, c, err.error().Context(),
+                err.error().Message());
       }
     };
 

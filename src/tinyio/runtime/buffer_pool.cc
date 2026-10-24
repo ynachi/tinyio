@@ -82,10 +82,10 @@ FixedBufferPool::~FixedBufferPool() noexcept {
 
 Result<FixedBuffer> FixedBufferPool::Take() noexcept {
   if (closed_) {
-    return Error::fail_errc(std::errc::operation_canceled, "pool closed");
+    return Error::FailErrc(std::errc::operation_canceled, "pool closed");
   }
   if (free_slots_.empty()) {
-    return Error::fail_errno(EAGAIN, "fixed_buffer_pool.take");
+    return Error::FailErrno(EAGAIN, "fixed_buffer_pool.take");
   }
 
   // LIFO pop: the most recently used slot is the hot one in cache.
@@ -106,7 +106,7 @@ Result<FixedBuffer> FixedBufferPool::Acquire(IO& io) noexcept {
     return buffer;
   }
   if (closed_) {
-    return Error::fail_errc(std::errc::operation_canceled, "pool closed");
+    return Error::FailErrc(std::errc::operation_canceled, "pool closed");
   }
 
   auto* fiber = io.RunningFiber();
@@ -123,7 +123,7 @@ Result<FixedBuffer> FixedBufferPool::Acquire(IO& io) noexcept {
     return MakeLease(ordinal);
   }
   // Woken without a slot: only Close() does that.
-  return Error::fail_errc(std::errc::operation_canceled, "pool closed");
+  return Error::FailErrc(std::errc::operation_canceled, "pool closed");
 }
 
 void FixedBufferPool::Close() noexcept {

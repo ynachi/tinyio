@@ -19,29 +19,29 @@ struct Error {
   const char* operation = "";
 
   /// Build an error from a positive errno value (POSIX category).
-  [[nodiscard]] static Error from_errno(const int value,
-                                        const char* operation = "") noexcept {
+  [[nodiscard]] static Error FromErrno(const int value,
+                                       const char* operation = "") noexcept {
     return {.code = {value, std::generic_category()},
             .operation = operation != nullptr ? operation : ""};
   }
 
   /// Build an error from a std::errc value.
-  [[nodiscard]] static Error from_errc(const std::errc value,
-                                       const char* operation = "") noexcept {
+  [[nodiscard]] static Error FromErrc(const std::errc value,
+                                      const char* operation = "") noexcept {
     return {.code = std::make_error_code(value),
             .operation = operation != nullptr ? operation : ""};
   }
 
   /// Build a failed Result from a std::errc value.
-  [[nodiscard]] static std::unexpected<Error> fail_errc(
+  [[nodiscard]] static std::unexpected<Error> FailErrc(
       const std::errc value, const char* operation = "") noexcept {
-    return std::unexpected(from_errc(value, operation));
+    return std::unexpected(FromErrc(value, operation));
   }
 
   /// Build a failed Result from a positive errno value.
-  [[nodiscard]] static std::unexpected<Error> fail_errno(
+  [[nodiscard]] static std::unexpected<Error> FailErrno(
       const int code, const char* operation = "") noexcept {
-    return std::unexpected(from_errno(code, operation));
+    return std::unexpected(FromErrno(code, operation));
   }
 
   /// True when this object carries a failure.
@@ -49,15 +49,15 @@ struct Error {
     return static_cast<bool>(code);
   }
 
-  /// The raw error value: the errno for from_errno, the errc value for
-  /// from_errc.
-  [[nodiscard]] int value() const noexcept { return code.value(); }
+  /// The raw error value: the errno for FromErrno, the errc value for
+  /// FromErrc.
+  [[nodiscard]] int Value() const noexcept { return code.value(); }
 
   /// The system message for this error.
-  [[nodiscard]] std::string message() const { return code.message(); }
+  [[nodiscard]] std::string Message() const { return code.message(); }
 
   /// The diagnostic context ("operation") this error was raised with.
-  [[nodiscard]] std::string_view context() const noexcept {
+  [[nodiscard]] std::string_view Context() const noexcept {
     return operation != nullptr ? operation : "";
   }
 
@@ -81,7 +81,7 @@ using Result = std::expected<T, Error>;
 
 /// Stream an error as "<message> (<value>) [<context>]".
 inline std::ostream& operator<<(std::ostream& os, const Error& err) {
-  return os << err.message() << " (" << err.value() << ") [" << err.context() << "]";
+  return os << err.Message() << " (" << err.Value() << ") [" << err.Context() << "]";
 }
 }  // namespace tinyio
 
@@ -90,7 +90,7 @@ struct std::formatter<tinyio::Error> : std::formatter<std::string> {
   template <typename FormatContext>
   auto format(const tinyio::Error& err, FormatContext& ctx) const {
     return std::formatter<std::string>::format(
-        std::format("{} ({}) [{}]", err.message(), err.value(), err.context()), ctx);
+        std::format("{} ({}) [{}]", err.Message(), err.Value(), err.Context()), ctx);
   }
 };
 
@@ -162,8 +162,8 @@ auto UnwrapExpected(Exp&& exp) noexcept {
   auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (expr);                     \
   if (!TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] {     \
     const auto& _tinyio_err = TINYIO_DETAIL_CAT(_tinyio_try_, id).error(); \
-    ELOGFMT(ERROR, "{} failed: code={} " fmt, _tinyio_err.context(),       \
-            _tinyio_err.value() __VA_OPT__(, ) __VA_ARGS__);               \
+    ELOGFMT(ERROR, "{} failed: code={} " fmt, _tinyio_err.Context(),       \
+            _tinyio_err.Value() __VA_OPT__(, ) __VA_ARGS__);               \
     return std::unexpected(_tinyio_err);                                   \
   }                                                                        \
   auto var =                                                               \
@@ -177,7 +177,7 @@ auto UnwrapExpected(Exp&& exp) noexcept {
   if (auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (expr);                 \
       !TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] {     \
     const auto& _tinyio_err = TINYIO_DETAIL_CAT(_tinyio_try_, id).error(); \
-    ELOGFMT(ERROR, "{} failed: code={} " fmt, _tinyio_err.context(),       \
-            _tinyio_err.value() __VA_OPT__(, ) __VA_ARGS__);               \
+    ELOGFMT(ERROR, "{} failed: code={} " fmt, _tinyio_err.Context(),       \
+            _tinyio_err.Value() __VA_OPT__(, ) __VA_ARGS__);               \
     return std::unexpected(_tinyio_err);                                   \
   }

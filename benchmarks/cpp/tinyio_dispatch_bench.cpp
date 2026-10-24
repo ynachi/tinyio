@@ -97,7 +97,7 @@ tinyio::Result<void> write_all(tinyio::IO& fio, tinyio::UniqueFd& fd,
                                std::span<const std::byte> data) noexcept {
   while (!data.empty()) {
     TRY(written, fio.Write(fd, data));
-    if (written == 0) return tinyio::Error::fail_errno(EIO, "write");
+    if (written == 0) return tinyio::Error::FailErrno(EIO, "write");
     data = data.subspan(static_cast<size_t>(written));
   }
   return {};
@@ -129,7 +129,7 @@ void accept_and_dispatch(tinyio::IO& acceptor, std::vector<tinyio::IO*> handlers
                          uint16_t port) noexcept {
   auto listener = tinyio::TcpListener::Bind(port, "0.0.0.0", 4096);
   if (!listener) {
-    std::cerr << "[acceptor] bind failed: " << listener.error().message() << '\n';
+    std::cerr << "[acceptor] bind failed: " << listener.error().Message() << '\n';
     return;
   }
 
@@ -140,7 +140,7 @@ void accept_and_dispatch(tinyio::IO& acceptor, std::vector<tinyio::IO*> handlers
     auto client = acceptor.Accept(server_fd);
     if (!client) {
       if (!g_stop_requested.load(std::memory_order_relaxed))
-        std::cerr << "[acceptor] accept failed: " << client.error().message() << '\n';
+        std::cerr << "[acceptor] accept failed: " << client.error().Message() << '\n';
       return;
     }
 

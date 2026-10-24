@@ -1,0 +1,14 @@
+# Editor-only configuration for clangd. Builds are governed by
+# cmake/TinyioWarnings.cmake; this file exists because clangd replays the
+# compile database verbatim and does not re-run CMake.
+#
+# Why -Wno-c2y-extensions: newer clangd (Homebrew ships 23.x) classifies
+# __COUNTER__ as a C2y extension, and the -Wpedantic carried by the compile
+# database turns that into a squiggle on every TRY/TRY_VOID expansion site
+# (the diagnostic fires where the macro EXPANDS, in every translation unit,
+# so it cannot be pragma-suppressed at the definition in error.hpp). The
+# pinned toolchain clang (20) does not have the diagnostic at all, and
+# TinyioWarnings.cmake adds the matching -Wno- for toolchains that do; this
+# covers the editor in between.
+CompileFlags:
+  Add: [-Wno-c2y-extensions]

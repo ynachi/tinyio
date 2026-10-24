@@ -9,7 +9,7 @@ using namespace tinyio;
 
 inline Result<int> dummy_success() { return 42; }
 
-inline Result<int> dummy_error() { return Error::fail_errno(EINVAL, "dummy"); }
+inline Result<int> dummy_error() { return Error::FailErrno(EINVAL, "dummy"); }
 
 inline Result<int> test_try_success() {
   TRY(n, dummy_success());
@@ -38,7 +38,7 @@ inline Result<int> test_go_style_log_success() {
   auto res = dummy_success();
   if (!res) {
     const auto err = res.error();
-    ELOGFMT(ERROR, "{} failed: code={} failed", err.context(), err.value());
+    ELOGFMT(ERROR, "{} failed: code={} failed", err.Context(), err.Value());
     return std::unexpected(err);
   }
   return *res;
@@ -66,7 +66,7 @@ inline Result<int> test_go_style_log_error() {
   auto res = dummy_error();
   if (!res) {
     const auto err = res.error();
-    ELOGFMT(ERROR, "{} failed: code={} failed", err.context(), err.value());
+    ELOGFMT(ERROR, "{} failed: code={} failed", err.Context(), err.Value());
     return std::unexpected(err);
   }
   return *res;

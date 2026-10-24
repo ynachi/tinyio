@@ -40,7 +40,7 @@ static Result<void> write_all(IO& fio, const UniqueFd& fd,
   while (!data.empty()) {
     TRY(written, fio.Write(fd, data));
     if (written == 0) {
-      return Error::fail_errno(EIO, "write");
+      return Error::FailErrno(EIO, "write");
     }
     data = data.subspan(written);
   }
@@ -62,8 +62,8 @@ static Result<void> handle_client(IO& fio, UniqueFd client_fd) noexcept {
                             kHttpResponse.size());
 
     if (auto res = write_all(fio, client_fd, out_buf); !res) {
-      ELOGFMT(ERROR, "failed to write response: [{}] {}", res.error().context(),
-              res.error().message());
+      ELOGFMT(ERROR, "failed to write response: [{}] {}", res.error().Context(),
+              res.error().Message());
       break;
     }
   }
@@ -83,16 +83,16 @@ static Result<void> server_loop(IO& fio, uint16_t port) {
     auto client_fd_res = fio.Accept(server_fd);
     if (!client_fd_res) {
       if (fio.Stopping()) return {};
-      ELOGFMT(ERROR, "Accept failed: [{}] {}", client_fd_res.error().context(),
-              client_fd_res.error().message());
+      ELOGFMT(ERROR, "Accept failed: [{}] {}", client_fd_res.error().Context(),
+              client_fd_res.error().Message());
       continue;
     }
 
     (void)fio.Spawn(
         [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
           if (auto res = handle_client(client_fio, std::move(client_fd)); !res) {
-            ELOGFMT(ERROR, "Client handler failed: [{}] {}", res.error().context(),
-                    res.error().message());
+            ELOGFMT(ERROR, "Client handler failed: [{}] {}", res.error().Context(),
+                    res.error().Message());
           }
         });
   }
@@ -129,8 +129,8 @@ int main() {
       // Spawn the initial accept loop fiber onto this worker
       (void)worker.Spawn([st](IO& fio) noexcept {
         if (auto res = server_loop(fio, port); !res) {
-          ELOGFMT(ERROR, "Server loop failed: [{}] {}", res.error().context(),
-                  res.error().message());
+          ELOGFMT(ERROR, "Server loop failed: [{}] {}", res.error().Context(),
+                  res.error().Message());
         }
       });
 

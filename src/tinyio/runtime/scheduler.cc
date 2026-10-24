@@ -72,7 +72,7 @@ void IO::DestroyAllFibers() noexcept {
 
 Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) noexcept {
   if (!IsOwnerThread()) {
-    return Error::fail_errno(EPERM, "spawn");
+    return Error::FailErrno(EPERM, "spawn");
   }
 
   detail::fiber::Fiber* fiber = nullptr;
@@ -85,7 +85,7 @@ Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) 
     std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow)
                                                     detail::fiber::Fiber());
     if (!owned) {
-      return Error::fail_errno(ENOMEM, "spawn");
+      return Error::FailErrno(ENOMEM, "spawn");
     }
     TRY(const stack, detail::stack::AllocateStack(opts_.stack_size, opts_.guard_size));
     owned->runtime = this;
@@ -132,7 +132,7 @@ TIO_NO_SANITIZE_ADDRESS void IO::SuspendFiber(detail::fiber::Fiber* fiber) noexc
   CheckCanSubmit("yield");
 
   if (stopping_) {
-    return Error::fail_errno(ECANCELED, "yield");
+    return Error::FailErrno(ECANCELED, "yield");
   }
 
   PushReady(current_fiber_);

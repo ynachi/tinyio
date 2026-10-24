@@ -127,12 +127,12 @@ TEST(IOCorrectnessTest, FixedBufferRangeOutsideTheSlotIsRejected) {
     // ReadFixed(fd, buf, len, file_offset, buffer_offset).
     auto read_res = fio.ReadFixed(fd, fixed_buf, 16, 0, 4096);
     ASSERT_FALSE(read_res.has_value());
-    EXPECT_EQ(read_res.error().value(), EINVAL);
+    EXPECT_EQ(read_res.error().Value(), EINVAL);
 
     // The length is zero.
     auto write_res = fio.WriteFixed(fd, fixed_buf, 0, 0);
     ASSERT_FALSE(write_res.has_value());
-    EXPECT_EQ(write_res.error().value(), EINVAL);
+    EXPECT_EQ(write_res.error().Value(), EINVAL);
 
     // A length that runs past the end of the slot is clamped to what is
     // left of it, so the transfer stays inside the registered buffer.

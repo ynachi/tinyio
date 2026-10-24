@@ -109,7 +109,7 @@ tinyio::Result<void> tinyio_fiber_write_all(tinyio::IO& fio, tinyio::UniqueFd& f
     TRY(written,
         fio.Writev(fd, std::span<const iovec>{&iov, 1}, static_cast<off_t>(offset)));
     if (written != static_cast<int32_t>(len)) {
-      return tinyio::Error::fail_errno(EIO, "writev");
+      return tinyio::Error::FailErrno(EIO, "writev");
     }
     offset += len;
   }
@@ -141,7 +141,7 @@ BenchResult bench_tinyio_fiber(const Options& opts, std::span<const std::byte> b
   const auto end = Clock::now();
 
   if (!result.value()) {
-    throw std::runtime_error("tinyio write failed: " + result.value().error().message());
+    throw std::runtime_error("tinyio write failed: " + result.value().error().Message());
   }
 
   const double seconds = std::chrono::duration<double>(end - start).count();

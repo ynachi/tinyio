@@ -39,7 +39,7 @@ IO::IO(const size_t id, const IoOptions& opts)
     }
     const auto err = res.error();
     throw std::system_error(err.code,
-                            std::format("tinyio::IO init failed in {}", err.context()));
+                            std::format("tinyio::IO init failed in {}", err.Context()));
   }
 }
 
@@ -132,7 +132,7 @@ Result<void> IO::Initialize() noexcept {
   // The kernel rejects this pair with a bare EINVAL; say why instead.
   if ((params.flags & IORING_SETUP_SQPOLL) &&
       (params.flags & IORING_SETUP_DEFER_TASKRUN)) {
-    return Error::fail_errno(
+    return Error::FailErrno(
         EINVAL,
         "IORING_SETUP_SQPOLL is incompatible with DEFER_TASKRUN; "
         "clear kUringDefaultAdditionalFlag bits when enabling SQPOLL");
@@ -140,12 +140,12 @@ Result<void> IO::Initialize() noexcept {
 
   if (const int rc = io_uring_queue_init_params(opts_.sq_entries, &ring_, &params);
       rc < 0) {
-    return Error::fail_errno(-rc, "io_uring_queue_init_params");
+    return Error::FailErrno(-rc, "io_uring_queue_init_params");
   }
 
   wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (wake_fd_ < 0) {
-    return Error::fail_errno(errno, "eventfd");
+    return Error::FailErrno(errno, "eventfd");
   }
 
   // One iovec per <= 1 GiB chunk, not per slot: the kernel's registered
@@ -164,7 +164,7 @@ Result<void> IO::Initialize() noexcept {
               ret == -ENOMEM ? "; check `ulimit -l` (RLIMIT_MEMLOCK) or LimitMEMLOCK= "
                                "in the unit file"
                              : "");
-      return Error::fail_errno(-ret, "io_uring_register_buffers");
+      return Error::FailErrno(-ret, "io_uring_register_buffers");
     }
     ELOGFMT(INFO, "registered a buffer pool of {} x {} bytes", buffer_pool_->Capacity(),
             buffer_pool_->SlotSize());
@@ -201,8 +201,8 @@ void IO::CancelAndDrain() noexcept {
       ++inflight_ops_;
       io_uring_submit(&ring_);
     } else {
-      ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", sqe.error().context(),
-              sqe.error().message());
+      ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", sqe.error().Context(),
+              sqe.error().Message());
     }
   }
 
@@ -295,13 +295,13 @@ Result<void> IO::Activate() noexcept {
           static_cast<unsigned int>(ring_.ring_fd),
           static_cast<unsigned int>(IORING_REGISTER_ENABLE_RINGS), nullptr, 0);
       ret < 0) {
-    return Error::fail_errno(-ret, "io_uring_register");
+    return Error::FailErrno(-ret, "io_uring_register");
   }
 
   // The eventfd read that lets Wake() interrupt a sleeping loop.
   if (auto res = ArmWakeRead(); !res) {
-    ELOGFMT(WARN, "failed to arm eventfd read: [{}] {}", res.error().context(),
-            res.error().message());
+    ELOGFMT(WARN, "failed to arm eventfd read: [{}] {}", res.error().Context(),
+            res.error().Message());
   }
   is_activated_ = true;
 
@@ -332,8 +332,8 @@ void IO::PinToCpu() const {
 
 void IO::Run(const std::stop_token& st) noexcept {
   if (auto res = Activate(); !res) {
-    ELOGFMT(ERROR, "failed to activate io uring: [{}] {}", res.error().context(),
-            res.error().message());
+    ELOGFMT(ERROR, "failed to activate io uring: [{}] {}", res.error().Context(),
+            res.error().Message());
     return;
   }
 
@@ -356,8 +356,8 @@ void IO::Run(const std::stop_token& st) noexcept {
 
 void IO::RunUntilDone() noexcept {
   if (auto res = Activate(); !res) {
-    ELOGFMT(ERROR, "failed to activate io worker: [{}] {}", res.error().context(),
-            res.error().message());
+    ELOGFMT(ERROR, "failed to activate io worker: [{}] {}", res.error().Context(),
+            res.error().Message());
     return;
   }
 

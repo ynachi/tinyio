@@ -15,8 +15,8 @@ bool IO::TickCounted(int& consecutive_errors, const char* who) noexcept {
     consecutive_errors = 0;
     return true;
   }
-  ELOGFMT(ERROR, "{}: tick failed: [{}] {}", who, res.error().context(),
-          res.error().message());
+  ELOGFMT(ERROR, "{}: tick failed: [{}] {}", who, res.error().Context(),
+          res.error().Message());
   return ++consecutive_errors < k_max_tick_errors;
 }
 
@@ -74,8 +74,8 @@ void IO::DrainRemote() {
 
     for (size_t i = 0; i < dequeued; ++i) {
       if (auto res = SpawnTask(std::move(fns[i])); !res) {
-        ELOGFMT(ERROR, "failed to spawn posted task: [{}] {}", res.error().context(),
-                res.error().message());
+        ELOGFMT(ERROR, "failed to spawn posted task: [{}] {}", res.error().Context(),
+                res.error().Message());
       }
     }
     total += dequeued;
@@ -106,7 +106,7 @@ Result<void> IO::SubmitOrWait() noexcept {
     const bool get_events =
         (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN) != 0;
     if (const int ret = SubmitSqes(get_events); ret < 0) {
-      return Error::fail_errno(-ret, "submit_or_wait.io_uring_submit");
+      return Error::FailErrno(-ret, "submit_or_wait.io_uring_submit");
     }
     return {};
   }
@@ -135,7 +135,7 @@ Result<void> IO::SubmitOrWait() noexcept {
     ReapOverflow();
     return {};
   }
-  return Error::fail_errno(-ret, "submit_or_wait.io_uring_submit_and_wait_timeout");
+  return Error::FailErrno(-ret, "submit_or_wait.io_uring_submit_and_wait_timeout");
 }
 
 int IO::SubmitSqes(const bool get_events) noexcept {
@@ -207,8 +207,8 @@ std::size_t IO::DrainCompletions() noexcept {
 
   if (needs_rearm) {
     if (auto res = ArmWakeRead(); !res) {
-      ELOGFMT(WARN, "failed to re-arm eventfd read: [{}] {}", res.error().context(),
-              res.error().message());
+      ELOGFMT(WARN, "failed to re-arm eventfd read: [{}] {}", res.error().Context(),
+              res.error().Message());
     }
   }
 
@@ -221,13 +221,13 @@ Result<io_uring_sqe*> IO::GetSqe() noexcept {
     // The SQ is full: submit what is queued so the kernel can consume the
     // entries. Reaping would not help here: it frees CQ space, not SQ slots.
     if (const int ret = SubmitSqes(false); ret < 0) {
-      return Error::fail_errno(-ret, "get_sqe.submit");
+      return Error::FailErrno(-ret, "get_sqe.submit");
     }
     sqe = io_uring_get_sqe(&ring_);
   }
 
   if (sqe == nullptr) {
-    return Error::fail_errno(ENOSPC, "get_sqe");
+    return Error::FailErrno(ENOSPC, "get_sqe");
   }
   return sqe;
 }
@@ -244,7 +244,7 @@ void IO::ProcessExpiredTimers() noexcept {
         if (!res) {
           // Could not cancel now: re-arm one tick out and retry.
           ELOGFMT(ERROR, "timeout cancel SQE alloc failed: [{}] {}",
-                  res.error().context(), res.error().message());
+                  res.error().Context(), res.error().Message());
           timer_wheel_.Arm(fiber,
                            detail::MonotonicNowNs() + detail::TimerWheel::k_tick_ns);
           return;

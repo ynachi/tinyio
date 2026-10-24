@@ -9,7 +9,7 @@ Result<UniqueFd> TcpListener::Bind(const SocketAddress& addr, int backlog) {
   // Create the raw socket
   const int raw_fd = ::socket(addr.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (raw_fd < 0) {
-    return Error::fail_errno(errno, "socket");
+    return Error::FailErrno(errno, "socket");
   }
 
   // Immediately wrap in your RAII Fd primitive
@@ -26,12 +26,12 @@ Result<UniqueFd> TcpListener::Bind(const SocketAddress& addr, int backlog) {
 
   // Explicit bind
   if (::bind(sock.Get(), addr.Get(), addr.addrlen) < 0) {
-    return Error::fail_errno(errno, "bind");
+    return Error::FailErrno(errno, "bind");
   }
 
   // Start listening
   if (::listen(sock.Get(), backlog) < 0) {
-    return Error::fail_errno(errno, "listen");
+    return Error::FailErrno(errno, "listen");
   }
 
   return sock;
