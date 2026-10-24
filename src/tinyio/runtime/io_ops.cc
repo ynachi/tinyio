@@ -1,7 +1,7 @@
-#include "tinyio/runtime/runtime.hpp"
-
 #include <algorithm>
 #include <cerrno>
+
+#include "tinyio/runtime/runtime.hpp"
 
 namespace tinyio {
 Result<FixedBuffer> IO::TakeFixedBuffer() noexcept {

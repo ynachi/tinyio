@@ -1,5 +1,3 @@
-#include "tinyio/runtime/runtime.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -7,6 +5,8 @@
 #include <utility>
 
 #include <ylt/easylog.hpp>
+
+#include "tinyio/runtime/runtime.hpp"
 
 namespace tinyio {
 bool IO::TickCounted(int& consecutive_errors, const char* who) noexcept {

@@ -44,13 +44,19 @@ other one leans on (`error.hpp`, `check.hpp`, `logging.hpp`). Below it:
 translation units: `runtime.cc` (construction, activation, the run loop,
 shutdown), `scheduler.cc` (fibers: spawn, resume, suspend, destroy),
 `event_loop.cc` (the tick, submit/wait, reap, timers, the eventfd wakeup)
-and `io_ops.cc` (the thin `Read`/`Write`/`Open`/… wrappers). The headers
-under `src/tinyio/detail/` sit next to their implementations.
+and `io_ops.cc` (the thin `Read`/`Write`/`Open`/… wrappers). Each folder
+holds its headers next to their implementations.
 
 Every project header is included by its rooted path, `"tinyio/error.hpp"` or
 `"tinyio/detail/fiber.hpp"`, never relative to the including file. The source
 tree under `src/` and the installed tree under `include/` have the same shape,
 so the same include line resolves in both.
+
+clang-format sorts the project's own header to the top only in the file it
+belongs to — `runtime.cc` keeps `"tinyio/runtime/runtime.hpp"` first, because
+the header matches its name. In every other file the project include sorts
+into the quoted block at the end, which is why the four runtime translation
+units begin differently.
 
 `docs/core-reading-guide.md` is the reading order, and the invariants it
 lists are the specification.
@@ -59,9 +65,11 @@ lists are the specification.
 
 `cmake --install build/<preset> --prefix <dir>` produces:
 
-- `include/tinyio/` — the public headers, in the same `runtime/` and `net/`
-  folders as in `src/`, `include/tinyio/detail/` — the ones they include, and
-  the generated `version.h`.
+- `include/tinyio/` — the public headers, in the same `runtime/`, `net/` and
+  `detail/` folders they have in `src/`, plus the generated `version.h`.
+  `tinyio.hpp` is the umbrella and the only include a consumer needs; the
+  individual headers moved when the tree was split into folders, so
+  `<tinyio/runtime.hpp>` is now `<tinyio/runtime/runtime.hpp>`.
 - `include/ylt/` — YLT's own headers, because the public headers include
   `<ylt/easylog.hpp>`. YLT's thirdparty and standalone trees (asio, frozen,
   cinatra, iguana) are not installed.

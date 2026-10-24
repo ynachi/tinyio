@@ -19,18 +19,25 @@ files, plus the headers they lean on:
 
 | File | Lines | What lives there |
 |------|-------|------------------|
-| `src/tinyio/runtime/runtime.cc` | 371 | construction, activation, the run loop, shutdown |
-| `src/tinyio/runtime/scheduler.cc` | 173 | fibers: spawn, resume, suspend, destroy, yield |
-| `src/tinyio/runtime/event_loop.cc` | 295 | the tick, submit/wait, reap, timers, the eventfd wakeup |
-| `src/tinyio/runtime/io_ops.cc` | 233 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
+| `runtime/runtime.cc` | 371 | construction, activation, the run loop, shutdown |
+| `runtime/scheduler.cc` | 173 | fibers: spawn, resume, suspend, destroy, yield |
+| `runtime/event_loop.cc` | 295 | the tick, submit/wait, reap, timers, the eventfd wakeup |
+| `runtime/io_ops.cc` | 234 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
 
 The class is still one `IO`: these are translation units, not layers, and a
 single operation crosses several of them.
+
+The four sit in `src/tinyio/runtime/`, next to `runtime.hpp` (the class
+itself), `fiber_sync.hpp` (the sync primitives) and `buffer_pool.{hpp,cc}`.
+The socket layer is in `src/tinyio/net/`; the mechanism — the context switch,
+stacks, fibers, queues, the timer wheel — is in `src/tinyio/detail/`.
 
 ## Reading order
 
 Follow one I/O call from top to bottom, one layer at a time. Check each layer
 against the invariants below before moving on.
+
+File names below are relative to `src/tinyio/`.
 
 ### 1. The context switch
 
@@ -106,7 +113,7 @@ against the invariants below before moving on.
 
 ### 8. Sync primitives
 
-`fiber_sync.hpp`: `Latch`, `Semaphore`, `Mutex`, `TaskGroup`.
+`runtime/fiber_sync.hpp`: `Latch`, `Semaphore`, `Mutex`, `TaskGroup`.
 
 - Built on two hooks only: `IO::ParkRunning()` and `IO::Unpark()`.
 - `Mutex::Unlock` and `Semaphore::Release` hand ownership straight to the

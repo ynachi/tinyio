@@ -1,11 +1,11 @@
-#include "tinyio/runtime/runtime.hpp"
-
 #include <cassert>
 #include <cerrno>
 #include <exception>
 #include <memory>
 #include <new>
 #include <utility>
+
+#include "tinyio/runtime/runtime.hpp"
 
 namespace tinyio {
 //
