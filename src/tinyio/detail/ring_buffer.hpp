@@ -81,21 +81,6 @@ class RingBuffer {
     return true;
   }
 
-  /// Removes every item equal to @p item and keeps the order of the others.
-  /// O(n): meant for rare paths only (a fiber leaving a wait queue during
-  /// teardown), never for the hot path.
-  void Erase(const T& item) noexcept {
-    std::uint64_t write = head_;
-    for (std::uint64_t read = head_; read != tail_; ++read) {
-      const T& current = slots_[read & (cap_ - 1)];
-      if (!(current == item)) {
-        slots_[write & (cap_ - 1)] = current;
-        ++write;
-      }
-    }
-    tail_ = write;
-  }
-
   /// Drops every item and keeps the storage.
   void Clear() noexcept { head_ = tail_ = 0; }
 

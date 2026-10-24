@@ -17,14 +17,9 @@ class UniqueFd {
     }
   }
 
-  static void NoopCloser(int) noexcept {}
-
  private:
   int fd_ = -1;
   Closer closer_ = DefaultCloser;
-  // A direct descriptor holds an index into the io_uring registered file
-  // table instead of a kernel descriptor: it must never be closed.
-  bool direct_ = false;
 
  public:
   UniqueFd() noexcept = default;
@@ -53,12 +48,6 @@ class UniqueFd {
   [[nodiscard]] int Get() const noexcept { return fd_; }
 
   [[nodiscard]] bool Valid() const noexcept { return fd_ >= 0; }
-
-  /// True when this holds an index into the io_uring registered file
-  /// table rather than a kernel descriptor.
-  [[nodiscard]] bool IsDirect() const noexcept { return direct_; }
-
-  void SetDirect(const bool direct = true) noexcept { direct_ = direct; }
 
   void Reset(const int fd = -1, Closer closer = DefaultCloser) noexcept {
     // Same fd: never close-and-rehold (that would store a closed fd

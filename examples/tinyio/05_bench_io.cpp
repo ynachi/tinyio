@@ -41,8 +41,7 @@ Result<void> DoWrite(IO& fio, const std::string& filename) {
 }
 
 Result<void> DoRead(IO& fio, const std::string& filename) {
-  TRY_LOG_ERR(raw_fd, fio.Open(filename, O_RDONLY), "open");
-  TRY_LOG_ERR(fd, fio.RegisterFile(std::move(raw_fd)), "register_file");
+  TRY_LOG_ERR(fd, fio.Open(filename, O_RDONLY), "open");
 
   std::vector<uint8_t> block(4096);
   constexpr std::int64_t total_size = 1024LL * 1024 * 1024;
@@ -88,12 +87,18 @@ Result<void> server_loop(IO& fio, uint16_t port) {
   TRY_LOG_ERR(server_fd, TcpListener::Bind(port, "0.0.0.0", 4096), "bind");
   ELOGFMT(INFO, "[Worker {}] Listening on http://0.0.0.0:{}", fio.Id(), port);
 
-  return fio.AcceptLoop(std::move(server_fd),
-                        [](IO& worker_fio, Result<UniqueFd> client_fd) noexcept {
-                          if (client_fd) {
-                            (void)handle_client(worker_fio, std::move(*client_fd));
-                          }
-                        });
+  // Accept until the runtime stops (Accept then fails with ECANCELED). Each
+  // client gets its own fiber.
+  while (true) {
+    auto client_fd = fio.Accept(server_fd);
+    if (!client_fd) {
+      if (fio.Stopping()) return {};
+      continue;
+    }
+    (void)fio.Spawn([fd = std::move(*client_fd)](IO& client_fio) mutable noexcept {
+      (void)handle_client(client_fio, std::move(fd));
+    });
+  }
 }
 
 int main(int argc, char* argv[]) {

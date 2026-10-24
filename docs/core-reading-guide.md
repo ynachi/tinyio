@@ -27,10 +27,10 @@ against the invariants below before moving on.
 `detail/context.hpp`, `context.cc` (~260 lines).
 
 - Draw the stack `Make()` builds, byte by byte, and check it against what
-  `tinyio_switch_context` pops (`InitialFrame`: 64 bytes on x86_64, 160 on
+  `TinyioSwitchContext` pops (`InitialFrame`: 64 bytes on x86_64, 176 on
   aarch64).
 - Step through the first switch into a new fiber in gdb with `si` and
-  `info registers`: switch → `ret` → `tinyio_context_trampoline` →
+  `info registers`: switch → `ret` → `TinyioContextTrampoline` →
   `IO::FiberEntry`. Once you have watched that, nothing in the fiber layer is
   mysterious.
 
@@ -47,7 +47,8 @@ against the invariants below before moving on.
 `runtime.cc`: `SpawnTask` → `ResumeFiber` → `FiberEntry` → `SuspendFiber` →
 `FinishCurrentFiber` → `DestroyFiber`.
 
-- Track `state`, `in_ready_queue` and `live_fibers_` through each step.
+- Track `state` and `live_fibers_` through each step. `ready` means exactly
+  "in the ready queue".
 - `DestroyFiber` keeps finished fibers (and their stacks) in `idle_fibers_`
   for reuse, up to `IoOptions::max_idle_fibers`. They stay in `all_fibers_`.
 
@@ -63,12 +64,12 @@ against the invariants below before moving on.
 
 ### 5. The event loop
 
-`IO::Tick()`, `IO::SubmitOrWait()`, `IO::SubmitOrWaitFor()`.
+`IO::Tick()`, `IO::SubmitOrWait()`, `IO::DriveToQuiescence()`.
 
-- Read both `IoOptions::LoopStyle` orderings. For each, decide exactly when
+- One ordering: resume, then submit/wait, then reap. Decide exactly when
   the loop may block in the kernel.
-- The quiesce check in the `kResumeFirst` branch is the most subtle line in
-  the file. Be able to explain it from memory (invariant 9).
+- The quiesce check in `Tick()` is the most subtle line in the file. Be able
+  to explain it from memory (invariant 9).
 
 ### 6. Cross-thread posting
 
@@ -82,7 +83,8 @@ against the invariants below before moving on.
 
 ### 7. Timeouts
 
-`IO::SyscallTimed()`, `detail/timer_wheel.hpp`, `IO::ProcessExpiredTimers()`.
+`IO::Syscall()`'s `timeout` argument, `detail/timer_wheel.hpp`,
+`IO::ProcessExpiredTimers()`.
 
 - Arming a timeout is a vector push: no SQE, no kernel timer. The kernel is
   only involved when one fires: an ASYNC_CANCEL, whose `-ECANCELED` becomes
@@ -106,15 +108,14 @@ against the invariants below before moving on.
 - `Run()` sets `stopping_`, cancels every in-flight fiber op, then drives
   `Tick()` until quiesced.
 
-Peripheral, after you own the core: `AcceptLoop` (multishot accept), direct
-file descriptors (`RegisterFile`), the fixed buffer pool.
+Peripheral, after you own the core: the fixed buffer pool.
 
 ## Invariants
 
 Each one names where it is enforced and what breaks without it.
 
 1. **A fiber has at most one operation in flight.**
-   `Syscall()`/`SyscallTimed()` assert `state == running`, and the fiber stays
+   `Syscall()` asserts `state == running`, and the fiber stays
    `waiting` until its CQE arrives. Without it, a second op would overwrite
    the embedded `Operation`, and a CQE would land in the wrong op.
 
@@ -125,29 +126,29 @@ Each one names where it is enforced and what breaks without it.
    writes into freed or recycled memory.
 
 3. **`inflight_ops_` counts submissions that still owe a terminal CQE.**
-   Incremented once per submission (`Syscall`, `SyscallTimed`, cancel SQEs in
-   `CancelAndDrain` and `ProcessExpiredTimers`, `AcceptLoopImpl`); decremented
-   once on its terminal CQE in `DrainCompletions()`. A multishot accept counts
-   once and is released by the CQE without `IORING_CQE_F_MORE`. The eventfd
-   read is deliberately not counted, since it is always armed. Without it,
+   Incremented once per submission (`Syscall`, cancel SQEs in
+   `CancelAndDrain` and `ProcessExpiredTimers`); decremented once on its CQE
+   in `DrainCompletions()`. The eventfd read is deliberately not counted,
+   since it is always armed. Without it,
    the loop quiesces with work outstanding, or never quiesces.
 
-4. **`user_data` is a tagged namespace.**
-   Low bit set: `MultishotAcceptState*`. `k_wakeup_sentinel`: eventfd read.
-   `k_fiber_cancel_sentinel`: a cancel SQE. Anything else non-zero:
-   `Operation*`. Every pointer stored there must be at least 2-byte aligned
-   (`AcceptLoopImpl` static-asserts it).
+4. **`user_data` has three meanings.**
+   `k_wakeup_sentinel`: the eventfd read. `k_fiber_cancel_sentinel`: a
+   cancel SQE. Anything else: the `Operation*` embedded in the fiber that
+   submitted it.
 
 5. **A fiber is in the ready queue at most once, and never once done.**
-   `PushReady()` checks `in_ready_queue` and refuses `done` fibers;
-   `DestroyFiber()` asserts. Without it, a fiber is resumed twice or after
+   `PushReady()` skips a fiber already `ready` (ready means queued) and
+   asserts it is not `done`; `DestroyFiber()` asserts. Without it, a fiber is resumed twice or after
    its stack is recycled.
 
 6. **Only the owner thread touches the ring, fibers and queues**, except
    `Post()` and `Wake()`.
    `IORING_SETUP_SINGLE_ISSUER`; the ring is created `R_DISABLED` and enabled
    in `Activate()` on the thread that calls `Run()`, which also resets
-   `owner_tid_`. `Syscall()` returns EPERM off-thread or outside a fiber.
+   `owner_tid_`. `Syscall()` CHECK-fails off-thread or outside a fiber
+   (`CheckCanSubmit()`): both are programming errors, so they abort rather
+   than return an error a caller could ignore.
 
 7. **A cancel is submitted before its target's `Operation` can be reused.**
    `ProcessExpiredTimers()` and `CancelAndDrain()` call `io_uring_submit()`
@@ -186,14 +187,12 @@ prediction marks the part you don't own yet. Turn each one into a test.
   shutdown?
 - Two fibers each `Read` the same socket with a 1 s timeout; data arrives at
   0.99 s. Who gets what?
-- The listening fd is closed while `AcceptLoop` is armed.
+- The listening fd is closed while a fiber is parked in `Accept()`.
 - `Post()` is called from 8 threads while the owner is blocked in
   `submit_and_wait`.
 - Remove the immediate `io_uring_submit()` from `ProcessExpiredTimers()`.
   Write the test that catches it.
 - Set `guard_size` to 0 and recurse deeply inside a fiber.
-- Call `Mutex::Lock()` from an `AcceptLoop` handler (it runs on the
-  scheduler stack, not in a fiber) in a release build.
 
 ## Habits
 
@@ -223,10 +222,6 @@ Good first changes once the reading is done; each touches a different layer.
    `-fcf-protection` marks the binary shadow-stack compatible while the
    switch breaks shadow stacks. Latent until SHSTK is enabled. Build
    `context.cc` with `-fcf-protection=branch`, or move the asm to a `.S`.
-4. **`AcceptLoop` doc** (`runtime.hpp`): it says each connection spawns a
-   fiber running the handler; the handler actually runs inline in
-   `DrainCompletions()` on the scheduler stack. I/O there returns EPERM, and
-   sync primitives dereference a null `current_fiber_` in release builds.
-5. Minor: no CFI on `tinyio_switch_context`; idle fibers keep dirty stack
+4. Minor: no CFI on `TinyioSwitchContext`; idle fibers keep dirty stack
    pages (`MADV_FREE` on caching); `TimerWheel::NsUntilNext()` scans all 512
    slots on every sleep.

@@ -77,7 +77,7 @@ void server_loop(IO& io) noexcept {
 
   while (true) {
     // Timeout in action, if no client after 30s, we just kill the server
-    auto client = io.Accept(*listener, 30s);
+    auto client = io.Accept(*listener, tinyio::k_default_accept_flags, 30s);
     if (!client) {
       ELOGFMT(ERROR, "failed to accept connexion: {}", FLAGS_port);
       ELOGFMT(ERROR, "[{}] {}", client.error().context(), client.error().message());

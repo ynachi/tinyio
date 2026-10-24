@@ -80,63 +80,6 @@ TEST(RingBufferTest, GrowWhileWrappedKeepsOrder) {
   EXPECT_EQ(Drain(ring), (std::vector{2, 3, 4, 5, 6, 7, 8, 9, 10, 11}));
 }
 
-TEST(RingBufferTest, EraseRemovesAndKeepsOrder) {
-  RingBuffer<int> ring{8};
-  for (int i = 0; i < 5; ++i) {
-    ring.Push(i);
-  }
-
-  ring.Erase(2);
-
-  EXPECT_EQ(ring.Size(), 4u);
-  EXPECT_EQ(Drain(ring), (std::vector{0, 1, 3, 4}));
-}
-
-TEST(RingBufferTest, EraseFrontAndBack) {
-  RingBuffer<int> ring{8};
-  for (int i = 0; i < 4; ++i) {
-    ring.Push(i);
-  }
-
-  ring.Erase(0);
-  ring.Erase(3);
-
-  EXPECT_EQ(Drain(ring), (std::vector{1, 2}));
-}
-
-TEST(RingBufferTest, EraseMissingIsNoOp) {
-  RingBuffer<int> ring{8};
-  ring.Push(1);
-
-  ring.Erase(42);
-
-  EXPECT_EQ(Drain(ring), (std::vector{1}));
-}
-
-TEST(RingBufferTest, EraseOnNeverUsedRingIsNoOp) {
-  RingBuffer<int> ring{8};  // no storage yet
-
-  ring.Erase(1);
-
-  EXPECT_TRUE(ring.Empty());
-}
-
-TEST(RingBufferTest, EraseWhileWrapped) {
-  RingBuffer<int> ring{4};
-  ring.Push(0);
-  ring.Push(1);
-  ring.Push(2);
-  int value = 0;
-  ASSERT_TRUE(ring.Pop(value));
-  ASSERT_TRUE(ring.Pop(value));
-  ring.Push(3);
-  ring.Push(4);  // logical [2, 3, 4] sits in slots 2, 3, 0
-
-  ring.Erase(3);
-
-  EXPECT_EQ(Drain(ring), (std::vector{2, 4}));
-}
-
 TEST(RingBufferTest, ClearEmptiesAndRingStaysUsable) {
   RingBuffer<int> ring{4};
   ring.Push(1);
@@ -157,11 +100,12 @@ TEST(RingBufferTest, WorksWithPointers) {
   ring.Push(&a);
   ring.Push(&b);
   ring.Push(&c);  // grows
-  ring.Erase(&b);
 
   int* out = nullptr;
   ASSERT_TRUE(ring.Pop(out));
   EXPECT_EQ(out, &a);
+  ASSERT_TRUE(ring.Pop(out));
+  EXPECT_EQ(out, &b);
   ASSERT_TRUE(ring.Pop(out));
   EXPECT_EQ(out, &c);
   EXPECT_FALSE(ring.Pop(out));

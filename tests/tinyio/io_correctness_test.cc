@@ -16,6 +16,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 
+#include "tinyio/detail/sanitizer_hooks.hpp"
 #include "tinyio/runtime.hpp"
 #include "tinyio/tcp_listener.hpp"
 
@@ -146,22 +147,29 @@ TEST(IOCorrectnessTest, FixedBufferRangeOutsideTheSlotIsRejected) {
 }
 
 // The destructor does not run when the constructor throws, so a failed
-// initialization has to release the ring and the eventfd itself. Run in a
-// child: lowering RLIMIT_NOFILE below the direct fd table size makes
-// io_uring_register_files fail with EMFILE after both were created.
-TEST(IOCorrectnessTest, FailedInitReleasesRingAndEventfd) {
-  const auto construct_with_too_few_fds = [] {
+// initialization has to clean up after itself and leak nothing. Run in a
+// child: pinning RLIMIT_NOFILE to the process's current fd count makes
+// io_uring_queue_init_params fail with EMFILE (the ring setup syscall
+// allocates a descriptor), and the constructor must throw without having
+// consumed any.
+TEST(IOCorrectnessTest, FailedInitThrowsAndLeaksNoFds) {
+#if TINYIO_ASAN_ENABLED
+  // ASan's runtime opens a pipe of its own while the exception is thrown;
+  // with no descriptor to spare it fails its internal CHECK and exits.
+  GTEST_SKIP() << "needs fd headroom the ASan runtime takes; covered by dev/tsan/release";
+#endif
+  const auto construct_with_no_fd_headroom = [] {
     const auto open_fds = [] {
       return std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
                            std::filesystem::directory_iterator{});
     };
-    const rlimit limit{.rlim_cur = 64, .rlim_max = 64};
+    const auto count = static_cast<rlim_t>(open_fds());
+    const rlimit limit{.rlim_cur = count, .rlim_max = count};
     if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) {
       std::_Exit(2);
     }
 
     IoOptions opts;
-    opts.direct_fd_table_size = 1024;
     const auto before = open_fds();
     bool threw = false;
     try {
@@ -172,7 +180,7 @@ TEST(IOCorrectnessTest, FailedInitReleasesRingAndEventfd) {
     std::_Exit(threw && open_fds() == before ? 0 : 1);
   };
 
-  EXPECT_EXIT(construct_with_too_few_fds(), ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(construct_with_no_fd_headroom(), ::testing::ExitedWithCode(0), "");
 }
 
 TEST(IOCorrectnessTest, TcpAcceptEcho) {
@@ -192,28 +200,27 @@ TEST(IOCorrectnessTest, TcpAcceptEcho) {
 
   std::stop_source stop_source;
 
+  // The server fiber accepts, then hands the connection to its own fiber.
   (void)io.Spawn([server_fd = std::move(server_fd)](IO& fio) mutable noexcept {
-    (void)fio.AcceptLoop(
-        std::move(server_fd),
-        [](IO& accept_fio, Result<UniqueFd> client_fd_res) noexcept {
-          if (!client_fd_res.has_value()) return;
-          (void)accept_fio.Spawn(
-              [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
-                std::array<char, 128> buf{};
-                auto read_res =
-                    client_fio.Read(client_fd, std::as_writable_bytes(std::span(buf)));
-                if (read_res.has_value() && *read_res > 0) {
-                  (void)client_fio.Write(
-                      client_fd, std::as_bytes(std::span(buf).subspan(0, *read_res)));
-                }
-                (void)client_fio.Close(std::move(client_fd));
-              });
+    auto client_fd_res = fio.Accept(server_fd);
+    ASSERT_TRUE(client_fd_res.has_value());
+    (void)fio.Spawn(
+        [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
+          std::array<char, 128> buf{};
+          auto read_res = client_fio.Read(client_fd, std::as_writable_bytes(std::span(buf)));
+          if (read_res.has_value() && *read_res > 0) {
+            (void)client_fio.Write(client_fd,
+                                   std::as_bytes(std::span(buf).subspan(0, *read_res)));
+          }
+          (void)client_fio.Close(std::move(client_fd));
         });
   });
 
   (void)io.Spawn([port, stop_source](IO& fio) mutable noexcept {
     UniqueFd client_fd(socket(AF_INET, SOCK_STREAM, 0));
-    SocketAddress addr = SocketAddress::V4(static_cast<std::uint16_t>(port), "127.0.0.1");
+    auto addr_res = SocketAddress::V4(static_cast<std::uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(addr_res.has_value());
+    SocketAddress addr = std::move(*addr_res);
     auto conn_res = fio.Connect(client_fd, addr);
     ASSERT_TRUE(conn_res.has_value());
 

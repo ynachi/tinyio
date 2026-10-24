@@ -29,8 +29,7 @@ std::atomic<uint64_t> total_success{0};
 std::atomic<uint64_t> total_errors{0};
 
 Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_id) {
-  const auto addr =
-      SocketAddress::V4(static_cast<uint16_t>(FLAGS_port), FLAGS_ip.c_str());
+  TRY(addr, SocketAddress::V4(static_cast<uint16_t>(FLAGS_port), FLAGS_ip.c_str()));
   UniqueFd sock{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
   if (!sock.Valid()) {
     return tinyio::Error::fail_errno(errno, "socket");

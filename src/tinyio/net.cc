@@ -7,13 +7,17 @@
 #include <arpa/inet.h>
 
 namespace tinyio {
-SocketAddress SocketAddress::V4(const uint16_t port, const char* ip) {
+Result<SocketAddress> SocketAddress::V4(const uint16_t port, const char* ip) {
   SocketAddress sa;
   auto* in = reinterpret_cast<sockaddr_in*>(&sa.addr);
   in->sin_family = AF_INET;
   in->sin_port = htons(port);
   if (ip && *ip) {
-    inet_pton(AF_INET, ip, &in->sin_addr);
+    // inet_pton leaves the destination zeroed on failure, and a zeroed
+    // sin_addr IS INADDR_ANY: an unchecked failure silently widens the bind.
+    if (::inet_pton(AF_INET, ip, &in->sin_addr) != 1) {
+      return Error::fail_errno(EINVAL, "inet_pton v4");
+    }
   } else {
     in->sin_addr.s_addr = INADDR_ANY;
   }
@@ -21,13 +25,16 @@ SocketAddress SocketAddress::V4(const uint16_t port, const char* ip) {
   return sa;
 }
 
-SocketAddress SocketAddress::V6(const uint16_t port, const char* ip) {
+Result<SocketAddress> SocketAddress::V6(const uint16_t port, const char* ip) {
   SocketAddress sa;
   auto* in6 = reinterpret_cast<sockaddr_in6*>(&sa.addr);
   in6->sin6_family = AF_INET6;
   in6->sin6_port = htons(port);
   if (ip && *ip) {
-    inet_pton(AF_INET6, ip, &in6->sin6_addr);
+    // Same as V4: a failed parse would zero sin6_addr == in6addr_any (::).
+    if (::inet_pton(AF_INET6, ip, &in6->sin6_addr) != 1) {
+      return Error::fail_errno(EINVAL, "inet_pton v6");
+    }
   } else {
     in6->sin6_addr = in6addr_any;
   }

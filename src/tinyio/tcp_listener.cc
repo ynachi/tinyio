@@ -39,14 +39,10 @@ Result<UniqueFd> TcpListener::Bind(const SocketAddress& addr, int backlog) {
 
 Result<UniqueFd> TcpListener::Bind(const uint16_t port, const char* ip,
                                    const int backlog) {
-  SocketAddress addr;
-
-  if (ip != nullptr && std::string_view(ip).find(':') != std::string_view::npos) {
-    addr = SocketAddress::V6(port, ip);
-  } else {
-    addr = SocketAddress::V4(port, ip);
-  }
-
+  // An IPv6 literal contains ':'; anything else is treated as IPv4.
+  const bool ipv6 =
+      ip != nullptr && std::string_view(ip).find(':') != std::string_view::npos;
+  TRY(const addr, ipv6 ? SocketAddress::V6(port, ip) : SocketAddress::V4(port, ip));
   return Bind(addr, backlog);
 }
 }  // namespace tinyio

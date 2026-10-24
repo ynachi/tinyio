@@ -13,6 +13,10 @@ tinyio_add_test(ring_buffer_tests
         ring_buffer_test.cc
 )
 
+tinyio_add_test(timer_wheel_tests
+        timer_wheel_test.cc
+)
+
 tinyio_add_test(runtime_tests
         "fiber_sync_test.cc;fiber_lifecycle_test.cc;cross_thread_post_test.cc;io_correctness_test.cc;shutdown_cancellation_test.cc"
 )

@@ -77,22 +77,25 @@ static Result<void> server_loop(IO& fio, uint16_t port) {
 
   ELOGFMT(INFO, "[Worker {}] Listening on http://0.0.0.0:{}", fio.Id(), port);
 
-  return fio.AcceptLoop(
-      std::move(server_fd), [](IO& worker_fio, Result<UniqueFd> client_fd_res) noexcept {
-        if (!client_fd_res) {
-          ELOGFMT(ERROR, "Accept failed: [{}] {}", client_fd_res.error().context(),
-                  client_fd_res.error().message());
-          return;
-        }
+  // Accept until the runtime stops (Accept then fails with ECANCELED). Each
+  // client gets its own fiber.
+  while (true) {
+    auto client_fd_res = fio.Accept(server_fd);
+    if (!client_fd_res) {
+      if (fio.Stopping()) return {};
+      ELOGFMT(ERROR, "Accept failed: [{}] {}", client_fd_res.error().context(),
+              client_fd_res.error().message());
+      continue;
+    }
 
-        (void)worker_fio.Spawn(
-            [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
-              if (auto res = handle_client(client_fio, std::move(client_fd)); !res) {
-                ELOGFMT(ERROR, "Client handler failed: [{}] {}", res.error().context(),
-                        res.error().message());
-              }
-            });
-      });
+    (void)fio.Spawn(
+        [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
+          if (auto res = handle_client(client_fio, std::move(client_fd)); !res) {
+            ELOGFMT(ERROR, "Client handler failed: [{}] {}", res.error().context(),
+                    res.error().message());
+          }
+        });
+  }
 }
 
 int main() {

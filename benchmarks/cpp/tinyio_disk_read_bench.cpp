@@ -182,8 +182,6 @@ struct Config {
   std::string file_path;
   // -1 = all scenarios; 0..4 selects one of the five (QD1/32/128, indep 32/128).
   int scenario = -1;
-  // 0 = tinyio's submit-first loop, 1 = kio's resume-first pipeline.
-  int loop_style = 0;
 };
 
 struct Worker {
@@ -209,16 +207,12 @@ struct Measurement {
 };
 
 void run_phase(const std::vector<tinyio::UniqueFd>& files, std::vector<Worker>& workers,
-               std::size_t total_ops, std::size_t blocks, unsigned flags = 0,
-               int loop_style = 0) {
+               std::size_t total_ops, std::size_t blocks, unsigned flags = 0) {
   const std::size_t depth = workers.size();
   // A tinyio::IO owns its ring and is single-use: one IO per phase.
   tinyio::IoOptions opts;
   if (flags != 0) {
     opts.additional_uring_flags = flags;
-  }
-  if (loop_style == 1) {
-    opts.loop_style = tinyio::IoOptions::LoopStyle::kResumeFirst;
   }
   tinyio::IO io(0, opts);
   (void)io.Spawn([&](tinyio::IO& fio) noexcept {
@@ -281,7 +275,7 @@ Measurement measure(const Config& config, const DataFile& data, std::size_t file
   (void)opts;
 
   // warmup
-  run_phase(files, workers, depth * 8, data.blocks(), config.flags, config.loop_style);
+  run_phase(files, workers, depth * 8, data.blocks(), config.flags);
   for (auto& worker : workers) {
     if (worker.errors || worker.short_reads || worker.corrupt) {
       throw std::runtime_error("warmup verification failed");
@@ -293,8 +287,7 @@ Measurement measure(const Config& config, const DataFile& data, std::size_t file
   struct rusage ru0{};
   getrusage(RUSAGE_SELF, &ru0);
   auto start = Clock::now();
-  run_phase(files, workers, config.operations, data.blocks(), config.flags,
-            config.loop_style);
+  run_phase(files, workers, config.operations, data.blocks(), config.flags);
   struct rusage ru1{};
   getrusage(RUSAGE_SELF, &ru1);
   std::printf("RUSAGE qd=%zu user=%.3f sys=%.3f vctx=%ld ivctx=%ld\n", depth,
@@ -393,8 +386,6 @@ int main(int argc, char** argv) {
         config.file_path = argv[index];
       } else if (option == "--scenario") {
         config.scenario = static_cast<int>(number(argv[index]));
-      } else if (option == "--loop") {
-        config.loop_style = static_cast<int>(number(argv[index]));
       } else {
         throw std::invalid_argument("unknown option");
       }

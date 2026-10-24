@@ -83,15 +83,10 @@ struct Operation {
   /// Pointer back to the fiber that initiated this operation.
   Fiber* fiber = nullptr;
 
-  /// Static context string (e.g., "read", "accept") used for debugging and errors.
-  const char* op_name = "";
-
-  /// The return value provided by the kernel upon completion (equivalent to errno/bytes
-  /// read).
+  /// The kernel's result, copied from the CQE: a negative errno on failure,
+  /// otherwise the operation's result (bytes transferred, a new fd, or 0).
+  /// IO::Syscall() turns it into a Result once the fiber resumes.
   int cqe_res = 0;
-
-  /// The completion flags provided by the kernel.
-  unsigned cqe_flags = 0;
 
   /// Absolute CLOCK_MONOTONIC deadline (ns) while this op is armed in the
   /// runtime's TimerWheel; 0 when no timeout is attached.
@@ -131,18 +126,15 @@ struct Fiber {
   /// This is enforced structurally — the fiber is suspended (state == waiting)
   /// for the entire duration of an operation, so it cannot submit a second one
   /// until the first CQE is received and the fiber is resumed. The assertion
-  /// `state == FiberState::running` in IO::syscall() makes this explicit.
+  /// `state == FiberState::running` in IO::Syscall() makes this explicit.
   Operation operation{};
 
-  /// The current lifecycle status of the fiber.
+  /// The current lifecycle status of the fiber. `ready` means exactly "in the
+  /// runtime's ready queue": PushReady() relies on it to queue a fiber once.
   FiberState state = FiberState::ready;
 
   /// Why the fiber is suspended.
   WaitKind wait_kind = WaitKind::none;
-
-  /// True while the fiber sits in the runtime's ready queue. Stops PushReady()
-  /// from queueing the same fiber twice.
-  bool in_ready_queue = false;
 
   /// True while the fiber is armed in the TimerWheel.
   bool timer_armed = false;

@@ -232,16 +232,12 @@ static bool DiedWithoutHanging(const int status) {
 
 // 7. A fiber parked on a sync primitive nobody will signal is a deadlock:
 // once the I/O fibers are cancelled the runtime quiesces and aborts. It used
-// to block forever on the eventfd under kResumeFirst.
-class AbandonedParkTest : public ::testing::TestWithParam<IoOptions::LoopStyle> {};
-
-TEST_P(AbandonedParkTest, StopAbortsInsteadOfHanging) {
+// to block forever on the eventfd.
+TEST(AbandonedParkTest, StopAbortsInsteadOfHanging) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_EXIT(
       {
-        IoOptions opts;
-        opts.loop_style = GetParam();
-        IO io(0, opts);
+        IO io(0, IoOptions{});
         Latch never(io, 1);
         (void)io.Spawn([&](IO&) noexcept { (void)never.Wait(); });
         (void)io.Spawn([](IO& rt) noexcept {
@@ -252,13 +248,11 @@ TEST_P(AbandonedParkTest, StopAbortsInsteadOfHanging) {
       DiedWithoutHanging, "");
 }
 
-TEST_P(AbandonedParkTest, RunUntilDoneAbortsInsteadOfHanging) {
+TEST(AbandonedParkTest, RunUntilDoneAbortsInsteadOfHanging) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_EXIT(
       {
-        IoOptions opts;
-        opts.loop_style = GetParam();
-        IO io(0, opts);
+        IO io(0, IoOptions{});
         Latch never(io, 1);
         (void)io.Spawn([&](IO&) noexcept { (void)never.Wait(); });
         ShutdownWatchdog watchdog;
@@ -266,10 +260,6 @@ TEST_P(AbandonedParkTest, RunUntilDoneAbortsInsteadOfHanging) {
       },
       DiedWithoutHanging, "");
 }
-
-INSTANTIATE_TEST_SUITE_P(LoopStyles, AbandonedParkTest,
-                         ::testing::Values(IoOptions::LoopStyle::kResumeFirst,
-                                           IoOptions::LoopStyle::kSubmitFirst));
 
 // 7b. The shutdown abort names the primitive the fiber is stuck on. The
 // reason lives in the fiber that is parked, so there is no counter to keep

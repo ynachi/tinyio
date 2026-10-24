@@ -102,25 +102,29 @@ struct SocketAddress {
   /// order)
   /// @param ip IPv4 address string (e.g., "127.0.0.1"). Pass nullptr for INADDR_ANY
   /// (0.0.0.0).
-  /// @return SocketAddress configured for IPv4
+  /// @return The address, or EINVAL when @p ip is not a valid IPv4 literal. A typo
+  /// must not degrade into a wildcard bind: the zeroed sockaddr a failed inet_pton
+  /// leaves behind IS 0.0.0.0.
   ///
   /// @code
-  ///   auto any = SocketAddress::v4(8080);              // Bind to all interfaces
-  ///   auto local = SocketAddress::v4(8080, "127.0.0.1"); // Localhost only
+  /// auto any = SocketAddress::V4(8080);              // Bind to all interfaces
+  /// auto local = SocketAddress::V4(8080, "127.0.0.1"); // Localhost only
   /// @endcode
-  static SocketAddress V4(std::uint16_t port, const char* ip = nullptr);
+  [[nodiscard]] static Result<SocketAddress> V4(std::uint16_t port,
+                                                const char* ip = nullptr);
 
   /// @brief Creates an IPv6 address.
   /// @param port Port number in host byte order (automatically converted to network
   /// order)
   /// @param ip IPv6 address string (e.g., "::1"). Pass nullptr for in6addr_any (::).
-  /// @return SocketAddress configured for IPv6
+  /// @return The address, or EINVAL when @p ip is not a valid IPv6 literal (which
+  /// would otherwise silently produce ::).
   ///
   /// @code
-  ///   auto any = SocketAddress::v6(8080);         // Bind to all IPv6 interfaces
-  ///   auto local = SocketAddress::v6(8080, "::1"); // IPv6 localhost only
+  /// auto any = SocketAddress::V6(8080);         // Bind to all IPv6 interfaces
+  /// auto local = SocketAddress::V6(8080, "::1"); // IPv6 localhost only
   /// @endcode
-  static SocketAddress V6(uint16_t port, const char* ip = nullptr);
+  [[nodiscard]] static Result<SocketAddress> V6(uint16_t port, const char* ip = nullptr);
 
   /// @brief Returns the raw sockaddr pointer.
   [[nodiscard]] const sockaddr* Get() const {

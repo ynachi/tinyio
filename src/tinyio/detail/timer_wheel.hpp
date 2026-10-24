@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <optional>
 #include <vector>
 
@@ -70,7 +71,7 @@ class TimerWheel {
 
   [[nodiscard]] bool HasArmed() const noexcept { return armed_ != 0; }
 
-  /// Pop every fiber whose deadline has passed and hand it to @p on_expired.
+  /// Pop every fiber whose deadline has passed and hand it to on_expired.
   /// Entries whose true deadline is still in the future (same-slot
   /// neighbours, horizon aliases) are left armed.
   template <class Fn>
@@ -139,7 +140,14 @@ class TimerWheel {
   }
 
   // Swap-and-pop: move the slot's last fiber into f's position.
+  //
+  // Precondition (the invariant every caller depends on): while
+  // f->timer_armed, slot[f->timer_index] == f, in
+  // slots_[SlotOf(f->operation.deadline_ns)]. Arm() and this function
+  // maintain it; if it ever breaks, the write below lands in the wrong
+  // vector position and silently corrupts another fiber's entry.
   static void RemoveFromSlot(Slot& slot, fiber::Fiber* f) noexcept {
+    assert(slot[f->timer_index] == f && "timer_index invariant violated");
     fiber::Fiber* last = slot.back();
     slot[f->timer_index] = last;
     last->timer_index = f->timer_index;

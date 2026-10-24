@@ -4,6 +4,7 @@
 #include <liburing.h>
 
 #include <atomic>
+#include <chrono>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "buffer_pool.hpp"
+#include "check.hpp"
 #include "detail/fiber.hpp"
 #include "detail/mpsc_queue.hpp"
 #include "detail/ring_buffer.hpp"
@@ -56,53 +58,25 @@ struct IoOptions {
   /// Guard bytes placed below each fiber stack with PROT_NONE.
   std::size_t guard_size = 4096;
 
-  /// Enables IORING_SETUP_CLAMP when available in the kernel headers.
-  bool clamp_ring_sizes = true;
-
   /// max resume per tick
   std::size_t batch_max_size = 128;
 
-  /// Event-loop ordering.
-  enum class LoopStyle {
-    /// submit/wait -> drain -> resume.
-    ///
-    /// SQEs armed by a resumed fiber are carried into the kernel by the
-    /// *next* iteration's submit.
-    kSubmitFirst,
-    /// resume -> submit/wait -> drain.
-    ///
-    /// kio's pipeline. Resuming is what arms the SQEs, so resuming first
-    /// lets the submit that follows carry them into the kernel in the same
-    /// iteration. Completions are reaped at the end of the iteration and
-    /// only mark fibers ready; the next iteration resumes them.
-    ///
-    /// This requires a quiesce check before the blocking submit: phase 1
-    /// can finish the last fiber, and blocking then would wait forever for
-    /// a completion that can never arrive.
-    kResumeFirst,
-  };
-
-  /// Selects the event-loop ordering.
-  ///
-  /// The default is kResumeFirst (kio's pipeline): it submits the SQEs that
-  /// the resumed fibers just armed in the same iteration, which measures
-  /// ~3% more HTTP throughput with a ~4x lower median p99 than kSubmitFirst
-  /// (333,441 vs 322,319 req/s; 2.50 vs 9.87 ms p99, 17 samples each).
-  /// kSubmitFirst is kept for A/B and for anyone who depends on the old
-  /// ordering.
-  LoopStyle loop_style = LoopStyle::kResumeFirst;
-
   /// Capacity for the cross-thread post queue (must be power of 2)
   std::size_t post_queue_capacity = 4096;
-
-  /// Direct FD table size (0 to disable)
-  std::uint32_t direct_fd_table_size = 1024;
 
   // Liburing auto wakeup the kernel thread so no need to manually do it
   /// IORING_SETUP_DEFER_TASKRUN is not compatible to SQ_POLL
   /// Also, when SQ_POLL is enabled, make sure to pin work threads and kernel threads
   /// and do them on different CPUs, overwhise, the bench reveals that performance
   /// drops on throughput and latency.
+  ///
+  /// @warning SQPOLL without registered files (IOSQE_FIXED_FILE) has a
+  /// descriptor-lifetime hazard: the kernel's sq thread submits SQEs after
+  /// user code has moved on, so closing an fd before its SQE is submitted
+  /// makes the kernel resolve a recycled fd number. Registered files pin
+  /// the struct file and are the sanctioned fix, but measured to bring no
+  /// gain to tinyio's workloads, so they were removed. Treat SQPOLL as
+  /// experimental until it is reintroduced together with file registration.
   std::uint32_t sq_thread_idle_ms = 2000;
   // -1 means don't pin to a specific CPU
   int sq_thread_cpu = -1;
@@ -184,7 +158,7 @@ class IO final {
     }
   }
 
-  /// Runs the cooperative scheduler until all fibers finish or stop is requested.
+  /// Runs the cooperative scheduler until stop is requested.
   ///
   /// This method is owner-thread-only. It blocks the owner thread only when no fiber is
   /// ready and the runtime is waiting for io_uring completions.
@@ -227,7 +201,7 @@ class IO final {
     return true;
   }
 
-  /// Suspend the current fiber to give bck the control to the runtime
+  /// Suspend the current fiber to give back the control to the runtime
   [[nodiscard]] Result<void> Yield() noexcept;
 
   /// Returns true when there are live fibers still owned by this runtime.
@@ -269,11 +243,16 @@ class IO final {
   /// @note Owner-thread only, inside a fiber. Aborts when the runtime has no
   ///       pool.
   [[nodiscard]] Result<FixedBuffer> AcquireFixedBuffer() noexcept;
-  ///@}
 
   // =====
   // IO Methods
   // =====
+  //
+  // Read, Write, Accept, Connect and Poll take an optional trailing timeout.
+  // With one, the call fails with ETIMEDOUT if no completion arrives in
+  // time. Timeouts are honored with up to TimerWheel::k_tick_ns (64ms) of
+  // slack. Arming one costs a vector push; the kernel is only involved (one
+  // ASYNC_CANCEL) when a timeout actually fires.
   /// Write up to @p len bytes from @p buf (a registered fixed buffer) to @p fd
   /// starting at @p offset.
   ///
@@ -333,7 +312,8 @@ class IO final {
   ///
   /// @return Number of bytes read, or an error code.
   [[nodiscard]] Result<uint32_t> Read(const UniqueFd& fd, std::span<std::byte> buf,
-                                      off_t offset = -1) noexcept;
+                                      off_t offset = -1,
+                                      std::chrono::nanoseconds timeout = {}) noexcept;
 
   /// Write up to buf.size() bytes from the caller-provided span @p buf to @p fd.
   ///
@@ -341,7 +321,8 @@ class IO final {
   ///
   /// @return Number of bytes written, or an error code.
   [[nodiscard]] Result<uint32_t> Write(const UniqueFd& fd, std::span<const std::byte> buf,
-                                       off_t offset = -1) noexcept;
+                                       off_t offset = -1,
+                                       std::chrono::nanoseconds timeout = {}) noexcept;
 
   /// Write the scatter-gather vector @p iovecs to @p fd starting at @p offset.
   ///
@@ -389,20 +370,15 @@ class IO final {
   /// @return An owned Fd on success, or an error code.
   [[nodiscard]] Result<UniqueFd> Accept(const UniqueFd& server_fd,
                                         SocketAddress& client_addr,
-                                        int flags = k_default_accept_flags) noexcept;
+                                        int flags = k_default_accept_flags,
+                                        std::chrono::nanoseconds timeout = {}) noexcept;
 
   /// Accept a new connection on @p server_fd without retrieving the client address.
   ///
   /// @return An owned Fd on success, or an error code.
   [[nodiscard]] Result<UniqueFd> Accept(const UniqueFd& server_fd,
-                                        int flags = k_default_accept_flags) noexcept;
-
-  /// Accept connections in a continuous background loop using IORING_ACCEPT_MULTISHOT.
-  /// Every accepted connection will automatically spawn a new fiber executing @p handler.
-  template <class Fn>
-    requires std::constructible_from<
-        std::move_only_function<void(IO&, Result<UniqueFd>) noexcept>, Fn>
-  [[nodiscard]] Result<void> AcceptLoop(UniqueFd server_fd, Fn&& handler) noexcept;
+                                        int flags = k_default_accept_flags,
+                                        std::chrono::nanoseconds timeout = {}) noexcept;
 
   /// Close @p fd asynchronously via io_uring.
   ///
@@ -413,15 +389,8 @@ class IO final {
   /// @brief Manually close a raw file descriptor via io_uring.
   [[nodiscard]] Result<void> Close(int fd) noexcept;
 
-  /// @brief Close an Fd via io_uring. Unregisters if it's a direct Fd.
+  /// @brief Close an Fd via io_uring.
   [[nodiscard]] Result<void> Close(UniqueFd fd) noexcept;
-
-  /// @brief Registers an Fd as a direct file descriptor to bypass kernel FD lookup
-  /// overhead. The input fd is consumed. The resulting Fd will have `is_direct()` true.
-  [[nodiscard]] Result<UniqueFd> RegisterFile(UniqueFd fd) noexcept;
-
-  /// @brief Internal: Unregister a direct FD immediately (synchronous syscall).
-  void UnregisterDirectFd(int direct_idx) noexcept;
 
   /// Remove (unlink) the file at @p path.
   [[nodiscard]] Result<void> Remove(const std::filesystem::path& path) noexcept;
@@ -434,12 +403,13 @@ class IO final {
   ///
   /// @param poll_mask Standard poll(2) mask (e.g. POLLIN, POLLOUT).
   /// @return The triggered events, or an error code.
-  [[nodiscard]] Result<uint32_t> Poll(const UniqueFd& fd, unsigned poll_mask) noexcept;
+  [[nodiscard]] Result<uint32_t> Poll(const UniqueFd& fd, unsigned poll_mask,
+                                      std::chrono::nanoseconds timeout = {}) noexcept;
 
   /// Connect @p fd to the remote address @p addr.
   /// Note: @p addr must outlive this function call.
-  [[nodiscard]] Result<void> Connect(const UniqueFd& fd,
-                                     const SocketAddress& addr) noexcept;
+  [[nodiscard]] Result<void> Connect(const UniqueFd& fd, const SocketAddress& addr,
+                                     std::chrono::nanoseconds timeout = {}) noexcept;
 
   /// Allocate or deallocate disk space for @p fd in the range [@p offset, @p offset + @p
   /// len).
@@ -463,29 +433,6 @@ class IO final {
   /// @return {} on success, or an error code.
   [[nodiscard]] Result<void> SleepForNs(std::chrono::nanoseconds duration) noexcept;
 
-  // =====
-  // Timed I/O (timer-wheel based)
-  // =====
-  // TODO create overload instead of different methods
-  // Each *_timed op behaves like its untimed counterpart but fails with
-  // ETIMEDOUT if no completion arrives within @p timeout. Timeouts are
-  // honored with up to TimerWheel::kTickNs (64ms) of slack. The hot path
-  // costs a vector push and a swap-and-pop; the kernel is only involved
-  // (one ASYNC_CANCEL) when a timeout actually fires.
-  [[nodiscard]] Result<uint32_t> Read(const UniqueFd& fd, std::span<std::byte> buf,
-                                      std::chrono::nanoseconds timeout,
-                                      off_t offset = -1) noexcept;
-  [[nodiscard]] Result<uint32_t> Write(const UniqueFd& fd, std::span<const std::byte> buf,
-                                       std::chrono::nanoseconds timeout,
-                                       off_t offset = -1) noexcept;
-  [[nodiscard]] Result<UniqueFd> Accept(const UniqueFd& server_fd,
-                                        std::chrono::nanoseconds timeout,
-                                        int flags = k_default_accept_flags) noexcept;
-  [[nodiscard]] Result<void> Connect(const UniqueFd& fd, const SocketAddress& addr,
-                                     std::chrono::nanoseconds timeout) noexcept;
-  [[nodiscard]] Result<uint32_t> Poll(const UniqueFd& fd, unsigned poll_mask,
-                                      std::chrono::nanoseconds timeout) noexcept;
-
  private:
   static constexpr uint64_t k_wakeup_sentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
   static constexpr uint64_t k_fiber_cancel_sentinel = 0xDEAD'C0DE'DEAD'C0CCULL;
@@ -499,16 +446,15 @@ class IO final {
   // IO Uring management
   //
   io_uring ring_{};
-  Result<void> SubmitOrWaitFor() noexcept;
-  /// Submits pending SQEs and, when @p runnable is false, sleeps until a
+  /// Submits pending SQEs and, when nothing is runnable, sleeps until a
   /// completion arrives.
-  Result<void> SubmitOrWait(bool runnable) noexcept;
+  Result<void> SubmitOrWait() noexcept;
   /// Submits the queued SQEs, surviving the transient failures the ring can
   /// produce. @p get_events selects the DEFER_TASKRUN-safe entry point.
   /// @return The number of SQEs submitted, or a negative errno.
   int SubmitSqes(bool get_events) noexcept;
   /// Flushes the kernel's CQ overflow and reaps it, after a submit failed
-  /// with EBUSY/EAGAIN. Scheduler only: reaping runs completion handlers.
+  /// with EBUSY/EAGAIN.
   void ReapOverflow() noexcept;
   Result<io_uring_sqe*> GetSqe() noexcept;
 
@@ -519,97 +465,57 @@ class IO final {
   Result<void> ArmWakeRead() noexcept;
   void Wake() noexcept;
 
-  struct MultishotAcceptState {
-    UniqueFd server_fd;
-    std::move_only_function<void(IO&, Result<UniqueFd>) noexcept> handler;
-  };
-
-  Result<std::size_t> DrainCompletions() noexcept;
+  /// Reaps every CQE in the ring; returns how many.
+  std::size_t DrainCompletions() noexcept;
   void DrainRemote();
   void ResumeReadyFibers();
 
-  // Internal executor for I/O operations. Factorizes the SQE acquisition,
-  // fiber suspension, and error mapping logic.
-  template <typename T = uint32_t, typename Prep>
-  TIO_NO_SANITIZE_ADDRESS Result<T> Syscall(const char* op_name, Prep&& prep) noexcept {
-    if (stopping_) {
-      return Error::fail_errno(ECANCELED, op_name);
-    }
-
-    // - Prevents multi-threaded corruption of io_uring
-    // - Prevents calling io.read() from outside a fiber
-    if (!IsOwnerThread() || current_fiber_ == nullptr) {
-      return Error::fail_errno(EPERM, op_name);
-    }
-
-    // Internal Sanity Checks
-    assert(current_fiber_->runtime == this);
-    assert(current_fiber_->state == detail::fiber::FiberState::running);
-
-    TRY_LOG_ERR(sqe, GetSqe(), "failed to get sqe: io ops [{}]", op_name);
-
-    detail::fiber::Operation& op = current_fiber_->operation;
-    op = detail::fiber::Operation{};
-    op.fiber = current_fiber_;
-    op.op_name = op_name;
-
-    std::forward<Prep>(prep)(sqe);
-    io_uring_sqe_set_data64(sqe, reinterpret_cast<__u64>(&op));
-
-    current_fiber_->state = detail::fiber::FiberState::waiting;
-    current_fiber_->wait_kind = detail::fiber::WaitKind::io;
-    ++inflight_ops_;
-
-    // suspend now
-    SuspendFiber(current_fiber_);
-
-    if (op.cqe_res < 0) {
-      return Error::fail_errno(-op.cqe_res, op_name);
-    }
-
-    if constexpr (std::is_same_v<T, void>) {
-      return {};
-    } else {
-      return static_cast<T>(op.cqe_res);
-    }
+  // Aborts unless an I/O call may submit: on the owner thread, inside a
+  // fiber. Both are programming errors, not runtime conditions, so they fail
+  // loudly instead of returning an error a caller could ignore.
+  //
+  // - Another thread would corrupt the SQ ring: io_uring_get_sqe() is plain
+  //   userspace memory, and SINGLE_ISSUER only rejects the submit, too late.
+  //   The thread is checked first, so a foreign thread never reads
+  //   current_fiber_.
+  // - Outside a fiber there is nothing to suspend.
+  void CheckCanSubmit(const char* op_name) const noexcept {
+    CHECK(IsOwnerThread()) << op_name
+                           << ": called from a thread that does not own this IO";
+    CHECK(current_fiber_ != nullptr)
+        << op_name
+        << ": called outside a fiber";
   }
 
-  /// Timed variant of syscall(): identical submission path, plus the fiber
-  /// is armed in the timer wheel. No extra SQE, no kernel timer. If the
-  /// wheel expires the op first, the resulting -ECANCELED is surfaced as
-  /// ETIMEDOUT (via Operation::timed_out).
+  // Internal executor for I/O operations: SQE acquisition, fiber suspension
+  // and error mapping. With a @p timeout, the fiber is also armed in the
+  // timer wheel: no extra SQE, no kernel timer. If the wheel expires the op
+  // first, the resulting -ECANCELED is surfaced as ETIMEDOUT.
   template <typename T = uint32_t, typename Prep>
-  TIO_NO_SANITIZE_ADDRESS Result<T> SyscallTimed(const char* op_name,
-                                                 const std::chrono::nanoseconds timeout,
-                                                 Prep&& prep) noexcept {
-    if (timeout.count() <= 0) {
-      return Syscall<T>(op_name, std::forward<Prep>(prep));
-    }
+  TIO_NO_SANITIZE_ADDRESS Result<T> Syscall(
+      const char* op_name, Prep&& prep,
+      const std::chrono::nanoseconds timeout = {}) noexcept {
+    CheckCanSubmit(op_name);
 
     if (stopping_) {
       return Error::fail_errno(ECANCELED, op_name);
     }
 
-    if (!IsOwnerThread() || current_fiber_ == nullptr) {
-      return Error::fail_errno(EPERM, op_name);
-    }
-
-    assert(current_fiber_->runtime == this);
     assert(current_fiber_->state == detail::fiber::FiberState::running);
-    assert(!current_fiber_->timer_armed && "fiber already armed in the timer wheel");
 
     TRY_LOG_ERR(sqe, GetSqe(), "failed to get sqe: io ops [{}]", op_name);
 
     detail::fiber::Operation& op = current_fiber_->operation;
     op = detail::fiber::Operation{};
     op.fiber = current_fiber_;
-    op.op_name = op_name;
 
     std::forward<Prep>(prep)(sqe);
     io_uring_sqe_set_data64(sqe, reinterpret_cast<__u64>(&op));
 
-    timer_wheel_.Arm(current_fiber_,
-                     detail::MonotonicNowNs() + static_cast<uint64_t>(timeout.count()));
+    if (timeout.count() > 0) {
+      timer_wheel_.Arm(current_fiber_,
+                       detail::MonotonicNowNs() + static_cast<uint64_t>(timeout.count()));
+    }
 
     current_fiber_->state = detail::fiber::FiberState::waiting;
     current_fiber_->wait_kind = detail::fiber::WaitKind::io;
@@ -617,13 +523,11 @@ class IO final {
 
     SuspendFiber(current_fiber_);
 
-    // On resume the fiber is always disarmed: drain_completions() disarms
-    // on normal completion; process_expired_timers() disarmed on expiry.
-    if (op.cqe_res == -ECANCELED && op.timed_out) {
-      return Error::fail_errno(ETIMEDOUT, op_name);
-    }
+    // On resume the fiber is always disarmed: DrainCompletions() disarms on
+    // completion, ProcessExpiredTimers() on expiry.
     if (op.cqe_res < 0) {
-      return Error::fail_errno(-op.cqe_res, op_name);
+      const int err = (op.cqe_res == -ECANCELED && op.timed_out) ? ETIMEDOUT : -op.cqe_res;
+      return Error::fail_errno(err, op_name);
     }
 
     if constexpr (std::is_same_v<T, void>) {
@@ -650,15 +554,10 @@ class IO final {
   uint64_t wake_value_{0};
   std::mutex wake_mutex_;
 
-  // Direct FD Table Management
-  std::vector<int> direct_fds_;
-  std::vector<uint32_t> direct_free_;  ///< LIFO free-list of available table indices
-
   //
   // Lifecycle
   //
   bool is_activated_{false};
-  bool is_running_{false};
   /// When true, a tick returns instead of sleeping once the runtime has
   /// nothing left to do. RunUntilDone() and CancelAndDrain() turn this on:
   /// those callers drive their own loop and decide when to stop, so a tick
@@ -717,12 +616,24 @@ class IO final {
   /// Initializes the io_uring instance and validates required opcodes.
   [[nodiscard]] Result<void> Initialize() noexcept;
 
-  /// True when @p buf is a slot of this runtime's (registered) pool.
-  [[nodiscard]] bool OwnsBuffer(const FixedBuffer& buf) const noexcept;
+  /// Checks that @p buf is a slot of this runtime's pool (aborts if not) and
+  /// returns the transfer length for [buffer_offset, buffer_offset + len),
+  /// clamped to the slot; EINVAL for an offset outside it or a zero length.
+  [[nodiscard]] Result<unsigned int> FixedRange(const FixedBuffer& buf, size_t len,
+                                                size_t buffer_offset,
+                                                const char* op_name) const noexcept;
 
-  /// Issue IORING_OP_ASYNC_CANCEL for every waiting fiber, submit, then drive
-  /// tick() until all in-flight ops and ready fibers are drained.
+  /// Cancels every in-flight request with one SQE, then drives the loop to
+  /// quiescence.
   void CancelAndDrain() noexcept;
+
+  /// Runs one tick, counting consecutive failures in @p consecutive_errors.
+  /// @return false once k_max_tick_errors ticks in a row have failed.
+  bool TickCounted(int& consecutive_errors, const char* who) noexcept;
+
+  /// Ticks until nothing is ready, in flight or posted. Aborts if the ticks
+  /// keep failing: returning would tear the ring down under in-flight ops.
+  void DriveToQuiescence(const char* who) noexcept;
 
   /// Aborts if a fiber is still live once the runtime has quiesced: it is
   /// parked on a sync primitive that nothing can ever signal (a deadlock).
@@ -733,18 +644,6 @@ class IO final {
       std::move_only_function<void(IO&) noexcept> task) noexcept;
 
   void PinToCpu() const;
-  Result<void> AcceptLoopImpl(
-      UniqueFd server_fd,
-      std::move_only_function<void(IO&, Result<UniqueFd>) noexcept> handler) noexcept;
 };
-
-template <class Fn>
-  requires std::constructible_from<
-      std::move_only_function<void(IO&, Result<UniqueFd>) noexcept>, Fn>
-[[nodiscard]] Result<void> IO::AcceptLoop(UniqueFd server_fd, Fn&& handler) noexcept {
-  return AcceptLoopImpl(std::move(server_fd),
-                        std::move_only_function<void(IO&, Result<UniqueFd>) noexcept>(
-                            std::forward<Fn>(handler)));
-}
 
 }  // namespace tinyio

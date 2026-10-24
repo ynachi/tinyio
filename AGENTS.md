@@ -153,8 +153,8 @@ being asked.
 Concretely, when measuring a change to tinyio:
 
 - Build two tinyio variants (baseline vs candidate) and A/B **only** those.
-- The baseline is the current tree, including the kio-style loop port
-  (`IoOptions::loop_style = LoopStyle::kResumeFirst`, the default).
+- The baseline is the current tree, including the kio-style loop
+  (resume, then submit, then reap; the only loop there is).
 - kio, coro_io and fio stay as **device/hardware controls**, not competitors:
   fio for the raw NVMe ceiling, the others only as a sanity reference if a
   number needs an outside yardstick. They are never the "other arm" of the
@@ -312,11 +312,11 @@ The reasoning behind all of this is in `docs/buffer-pool.md`.
 
 ## Known knobs
 
-- `IoOptions::loop_style`: `kResumeFirst` (default, kio's pipeline — resume,
-  then submit, then reap) or `kSubmitFirst` (the older ordering). The
-  resume-first path **requires** the quiesce check before the blocking
-  submit, and that check must cover `RunUntilDone()` *and*
-  `CancelAndDrain()` — omitting the latter hangs
+- The loop is kio's pipeline: resume, then submit, then reap. (The older
+  submit-first ordering was removed after the A/B: ~3% less throughput,
+  ~4× worse p99.) Resume-first **requires** the quiesce check before the
+  blocking submit, and that check must cover every drain
+  (`DriveToQuiescence()`) — omitting it hangs
   `ShutdownCancellationTest.StopTokenCancelsWaiting`.
 - Ring flags: tinyio's default is
   `SINGLE_ISSUER|DEFER_TASKRUN|TASKRUN_FLAG` — note it does **not** include
@@ -329,10 +329,8 @@ The reasoning behind all of this is in `docs/buffer-pool.md`.
 - **The submit path survives `EBUSY`/`EAGAIN`.** The kernel could not flush
   the completion queue; the documented recovery is to reap and submit again,
   which `SubmitSqes()` does, and the blocking wait in `SubmitOrWait()` reaps
-  and returns to the loop. Reaping only happens on the scheduler
-  (`ReapOverflow()` asserts it): `GetSqe()` runs inside a fiber's
-  `Syscall()`, and reaping there would run multishot accept handlers on that
-  fiber. From a fiber, the error goes back to the caller. A tick that failed here used to abandon a
+  and returns to the loop. Reaping only marks fibers ready, so it is safe
+  from inside a fiber's `GetSqe()` too. A tick that failed here used to abandon a
   shutdown drain with operations still in flight, and the ring was then torn
   down under them — a kernel use-after-free.
 - **A drain never gives up on a tick error.** `CancelAndDrain()` and

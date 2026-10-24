@@ -203,10 +203,10 @@ TEST(ContextTest, NewStackIsAligned) {
   EXPECT_STREQ(h.formatted, "1.250 2.500000");
 }
 
-#if defined(__x86_64__)
-// MXCSR and the x87 control word are callee-saved on x86_64: a new context
-// inherits its creator's rounding mode, and each context keeps its own
-// across switches.
+// MXCSR and the x87 control word (x86_64), FPCR (aarch64): the FP control
+// registers are callee-saved, so a new context inherits its creator's
+// rounding mode, and each context keeps its own across switches.
+#if defined(__x86_64__) || defined(__aarch64__)
 TEST(ContextTest, FloatingPointControlIsPerContext) {
   ASSERT_EQ(std::fesetround(FE_UPWARD), 0);
   Harness h([](void* arg) noexcept {
