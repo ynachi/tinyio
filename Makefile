@@ -45,10 +45,10 @@ bench: ## Build the optimized benchmark server (never benchmark a sanitizer buil
 	@echo "run: taskset -c 0-7 build/release/benchmarks/cpp/tinyio_http_bench --port=8091 --workers=4"
 
 fmt: ## Format every tracked C++ file in place
-	git ls-files '*.cc' '*.cpp' '*.h' '*.hpp' ':!src/libs' | xargs $(CLANG_FORMAT) -i
+	git ls-files '*.cc' '*.cpp' '*.h' '*.hpp' | xargs $(CLANG_FORMAT) -i
 
 fmt-check: ## Fail if any file is not formatted
-	git ls-files '*.cc' '*.cpp' '*.h' '*.hpp' ':!src/libs' | xargs $(CLANG_FORMAT) --dry-run --Werror
+	git ls-files '*.cc' '*.cpp' '*.h' '*.hpp' | xargs $(CLANG_FORMAT) --dry-run --Werror
 
 tidy: build ## Run clang-tidy over src/ using the dev compile database
 	$(CLANG_TIDY) -p build/dev -quiet 'src/.*'

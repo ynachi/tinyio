@@ -9,7 +9,7 @@
 
 #include <sys/mman.h>
 
-#include "error.hpp"
+#include "tinyio/error.hpp"
 
 #if __has_include(<valgrind/valgrind.h>)
 #  include <valgrind/valgrind.h>

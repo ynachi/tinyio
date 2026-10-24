@@ -129,7 +129,7 @@ int main() {
 }
 ```
 
-The full example is in `examples/tinyio/03_http_services.cpp`.
+The full example is in `examples/tinyio/03_http_services.cc`.
 
 ---
 

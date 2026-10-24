@@ -4,8 +4,8 @@
 #include <liburing.h>
 
 #include <atomic>
-#include <chrono>
 #include <cassert>
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -482,9 +482,7 @@ class IO final {
   void CheckCanSubmit(const char* op_name) const noexcept {
     CHECK(IsOwnerThread()) << op_name
                            << ": called from a thread that does not own this IO";
-    CHECK(current_fiber_ != nullptr)
-        << op_name
-        << ": called outside a fiber";
+    CHECK(current_fiber_ != nullptr) << op_name << ": called outside a fiber";
   }
 
   // Internal executor for I/O operations: SQE acquisition, fiber suspension
@@ -526,7 +524,8 @@ class IO final {
     // On resume the fiber is always disarmed: DrainCompletions() disarms on
     // completion, ProcessExpiredTimers() on expiry.
     if (op.cqe_res < 0) {
-      const int err = (op.cqe_res == -ECANCELED && op.timed_out) ? ETIMEDOUT : -op.cqe_res;
+      const int err =
+          (op.cqe_res == -ECANCELED && op.timed_out) ? ETIMEDOUT : -op.cqe_res;
       return Error::fail_errno(err, op_name);
     }
 

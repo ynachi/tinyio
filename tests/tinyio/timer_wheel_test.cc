@@ -187,8 +187,7 @@ TEST(TimerWheelTest, InterleavedArmDisarmExpireStress) {
   for (uint64_t round = 0; round < 32; ++round) {
     for (size_t i = 0; i < fs.fibers.size(); ++i) {
       if (!fs.At(i)->timer_armed) {
-        wheel.Arm(fs.At(i),
-                  k_base + (round + 1 + (i % 7)) * TimerWheel::k_tick_ns);
+        wheel.Arm(fs.At(i), k_base + (round + 1 + (i % 7)) * TimerWheel::k_tick_ns);
       }
       if (i % 3 == 0 && fs.At(i)->timer_armed) {
         wheel.Disarm(fs.At(i));

@@ -204,16 +204,16 @@ TEST(IOCorrectnessTest, TcpAcceptEcho) {
   (void)io.Spawn([server_fd = std::move(server_fd)](IO& fio) mutable noexcept {
     auto client_fd_res = fio.Accept(server_fd);
     ASSERT_TRUE(client_fd_res.has_value());
-    (void)fio.Spawn(
-        [client_fd = std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
-          std::array<char, 128> buf{};
-          auto read_res = client_fio.Read(client_fd, std::as_writable_bytes(std::span(buf)));
-          if (read_res.has_value() && *read_res > 0) {
-            (void)client_fio.Write(client_fd,
-                                   std::as_bytes(std::span(buf).subspan(0, *read_res)));
-          }
-          (void)client_fio.Close(std::move(client_fd));
-        });
+    (void)fio.Spawn([client_fd =
+                         std::move(*client_fd_res)](IO& client_fio) mutable noexcept {
+      std::array<char, 128> buf{};
+      auto read_res = client_fio.Read(client_fd, std::as_writable_bytes(std::span(buf)));
+      if (read_res.has_value() && *read_res > 0) {
+        (void)client_fio.Write(client_fd,
+                               std::as_bytes(std::span(buf).subspan(0, *read_res)));
+      }
+      (void)client_fio.Close(std::move(client_fd));
+    });
   });
 
   (void)io.Spawn([port, stop_source](IO& fio) mutable noexcept {

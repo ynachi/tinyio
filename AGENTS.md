@@ -19,26 +19,25 @@ command per task.
 - The library, the tests and the examples all compile with
   `-Wall -Wextra -Wconversion -Wpedantic -Wshadow -Wsign-conversion -Werror`
   (`cmake/TinyioWarnings.cmake`). New code has to satisfy that set.
-- `src/libs/` holds vendored third-party headers and is excluded from
-  formatting, the same way kio excludes its `include/libs`.
 - tinyio is Linux-only (liburing, and x86_64 / aarch64 only: the fiber
-  context switch is hand-written assembly in `src/tinyio/context.cc`); verify on srv401, not on
-  macOS.
+  context switch is hand-written assembly in `src/tinyio/detail/context.cc`);
+  verify on srv401, not on macOS.
 - Dependencies are fetched: liburing, googletest, and **YLT** (yalantinglibs)
   for logging and serialization. YLT is header-only here and only the easylog
   and struct_pack modules are reachable — `cmake/TinyioDependencies.cmake`
   turns every optional YLT backend off with the `YLT_ENABLE_*` switches.
-- **Photon is only fetched when the Photon benchmarks are switched on**
-  (`-DTINYIO_BUILD_PHOTON_BENCH=ON`). It is used by the two comparison
-  benchmarks (`net_perf_photon`, `photon_disk_bench`) and by nothing else in
-  the tree. It is tracked as `main`, and its `fs/cache/persistent_cache` does
-  not compile with clang: `va_arg(args, std::string)` is ill-formed and clang
-  reports it as an error that `-w` and `-Wno-non-pod-varargs` cannot
-  suppress. That is upstream, not tinyio: it reproduces on a pristine tree.
-  Fetching Photon unconditionally used to break `make release` under clang
-  21/22 even though the Photon benchmarks are off by default; now the
-  dependency is skipped unless something actually uses it, and building the
-  Photon benchmarks themselves still needs GCC.
+
+## Layout
+
+`src/tinyio/runtime.{hpp,cc}` is still **one class**, spread over four
+translation units: `runtime.cc` (construction, activation, the run loop,
+shutdown), `scheduler.cc` (fibers: spawn, resume, suspend, destroy),
+`event_loop.cc` (the tick, submit/wait, reap, timers, the eventfd wakeup)
+and `io_ops.cc` (the thin `Read`/`Write`/`Open`/… wrappers). The headers
+under `src/tinyio/detail/` sit next to their implementations.
+
+`docs/core-reading-guide.md` is the reading order, and the invariants it
+lists are the specification.
 
 ## Installing
 

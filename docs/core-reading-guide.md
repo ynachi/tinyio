@@ -14,8 +14,18 @@ switches back to the scheduler. The scheduler reaps completions, marks fibers
 ready and switches back into them. Everything else is bookkeeping around
 that cycle.
 
-The core is about 1,500 lines: `runtime.cc` plus `detail/context.hpp`,
-`detail/fiber.hpp`, `detail/timer_wheel.hpp` and `fiber_sync.hpp`.
+The core is about 1,100 lines of implementation, split by concern into four
+files, plus the headers they lean on:
+
+| File | Lines | What lives there |
+|------|-------|------------------|
+| `src/tinyio/runtime.cc` | 371 | construction, activation, the run loop, shutdown |
+| `src/tinyio/scheduler.cc` | 173 | fibers: spawn, resume, suspend, destroy, yield |
+| `src/tinyio/event_loop.cc` | 295 | the tick, submit/wait, reap, timers, the eventfd wakeup |
+| `src/tinyio/io_ops.cc` | 233 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
+
+The class is still one `IO`: these are translation units, not layers, and a
+single operation crosses several of them.
 
 ## Reading order
 
@@ -24,7 +34,7 @@ against the invariants below before moving on.
 
 ### 1. The context switch
 
-`detail/context.hpp`, `context.cc` (~260 lines).
+`detail/context.hpp`, `detail/context.cc` (~233 lines).
 
 - Draw the stack `Make()` builds, byte by byte, and check it against what
   `TinyioSwitchContext` pops (`InitialFrame`: 64 bytes on x86_64, 176 on
@@ -36,7 +46,7 @@ against the invariants below before moving on.
 
 ### 2. The data structures
 
-`detail/fiber.hpp`, `stack.cc`.
+`detail/fiber.hpp`, `detail/stack.cc`.
 
 - `Operation` is embedded in `Fiber`, and its address is the `user_data` the
   kernel hands back. That only works because of invariant 1.
@@ -44,7 +54,7 @@ against the invariants below before moving on.
 
 ### 3. A fiber's lifecycle
 
-`runtime.cc`: `SpawnTask` → `ResumeFiber` → `FiberEntry` → `SuspendFiber` →
+`scheduler.cc`: `SpawnTask` → `ResumeFiber` → `FiberEntry` → `SuspendFiber` →
 `FinishCurrentFiber` → `DestroyFiber`.
 
 - Track `state` and `live_fibers_` through each step. `ready` means exactly
@@ -56,7 +66,8 @@ against the invariants below before moving on.
 
 - `IO::Syscall()` (`runtime.hpp`): get an SQE, `user_data = &op`, mark the
   fiber waiting, `++inflight_ops_`, suspend.
-- `IO::DrainCompletions()`: CQE → `op->cqe_res` → `PushReady(op->fiber)`.
+- `IO::DrainCompletions()` (`event_loop.cc`): CQE → `op->cqe_res` →
+  `PushReady(op->fiber)`.
 - Back in `Syscall()` after `SuspendFiber` returns: map `cqe_res` to a
   `Result`.
 - The buffers, iovecs, paths and addresses handed to the kernel live on the
@@ -64,7 +75,8 @@ against the invariants below before moving on.
 
 ### 5. The event loop
 
-`IO::Tick()`, `IO::SubmitOrWait()`, `IO::DriveToQuiescence()`.
+`IO::Tick()`, `IO::SubmitOrWait()` (`event_loop.cc`),
+`IO::DriveToQuiescence()` (`runtime.cc`).
 
 - One ordering: resume, then submit/wait, then reap. Decide exactly when
   the loop may block in the kernel.
@@ -74,7 +86,7 @@ against the invariants below before moving on.
 ### 6. Cross-thread posting
 
 `IO::Post()`, `detail/mpsc_queue.hpp`, `IO::Wake()`, `IO::ArmWakeRead()`,
-`IO::DrainRemote()`.
+`IO::DrainRemote()` (the last three in `event_loop.cc`).
 
 - The only code another thread ever touches.
 - The eventfd read tagged `k_wakeup_sentinel` wakes a sleeping loop.
@@ -84,7 +96,7 @@ against the invariants below before moving on.
 ### 7. Timeouts
 
 `IO::Syscall()`'s `timeout` argument, `detail/timer_wheel.hpp`,
-`IO::ProcessExpiredTimers()`.
+`IO::ProcessExpiredTimers()` (`event_loop.cc`).
 
 - Arming a timeout is a vector push: no SQE, no kernel timer. The kernel is
   only involved when one fires: an ASYNC_CANCEL, whose `-ECANCELED` becomes
@@ -102,7 +114,8 @@ against the invariants below before moving on.
 
 ### 9. Shutdown
 
-`IO::Run()`, `IO::CancelAndDrain()`, `IO::~IO()`, `IO::AbortIfParkedFibers()`.
+`IO::Run()`, `IO::CancelAndDrain()`, `IO::~IO()`, `IO::AbortIfParkedFibers()`
+(all in `runtime.cc`).
 
 - Read this last: it is where every invariant is tested at once.
 - `Run()` sets `stopping_`, cancels every in-flight fiber op, then drives
@@ -221,7 +234,7 @@ Good first changes once the reading is done; each touches a different layer.
 3. **x86 shadow stack**: the switch assembly lives in a C++ file, so
    `-fcf-protection` marks the binary shadow-stack compatible while the
    switch breaks shadow stacks. Latent until SHSTK is enabled. Build
-   `context.cc` with `-fcf-protection=branch`, or move the asm to a `.S`.
+   `detail/context.cc` with `-fcf-protection=branch`, or move the asm to a `.S`.
 4. Minor: no CFI on `TinyioSwitchContext`; idle fibers keep dirty stack
    pages (`MADV_FREE` on caching); `TimerWheel::NsUntilNext()` scans all 512
    slots on every sleep.

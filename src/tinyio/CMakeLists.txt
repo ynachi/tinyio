@@ -3,10 +3,13 @@ set(TINYIO_INCLUDES "$<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/src>"
 
 set(TINYIO_SOURCES
         buffer_pool.cc
-        context.cc
+        detail/context.cc
+        detail/stack.cc
+        event_loop.cc
+        io_ops.cc
         net.cc
         runtime.cc
-        stack.cc
+        scheduler.cc
         tcp_listener.cc)
 
 # mimalloc is optional: TINYIO_USE_MIMALLOC turns it on, and the release

@@ -14,13 +14,13 @@ target_link_libraries(01_hello_echo PRIVATE Tinyio::tinyio tinyio_warnings gflag
 add_executable(02_fanout tinyio/02_fanout.cc)
 target_link_libraries(02_fanout PRIVATE Tinyio::tinyio tinyio_warnings gflags::gflags)
 
-add_executable(03_http_services tinyio/03_http_services.cpp)
+add_executable(03_http_services tinyio/03_http_services.cc)
 target_link_libraries(03_http_services PRIVATE Tinyio::tinyio tinyio_warnings)
 
 add_executable(04_echo_client tinyio/04_echo_client.cc)
 target_link_libraries(04_echo_client PRIVATE Tinyio::tinyio tinyio_warnings gflags::gflags)
 
-add_executable(05_bench_io tinyio/05_bench_io.cpp)
+add_executable(05_bench_io tinyio/05_bench_io.cc)
 target_link_libraries(05_bench_io PRIVATE Tinyio::tinyio tinyio_warnings)
 
 # Create a custom target to build all examples
