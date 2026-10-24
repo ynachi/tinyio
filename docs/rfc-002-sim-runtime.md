@@ -266,6 +266,11 @@ Internally, `advance_time` updates the virtual clock and immediately posts CQEs 
 
 ## 8. File Layout
 
+Note: this sketch predates the 2026-10-24 folder split of `src/tinyio/`, so
+the paths below are indicative rather than current. The tree is now
+`src/tinyio/{runtime,net,detail}/`, and the new files belong next to the
+module they extend.
+
 ```text
 include/tinyio/
   detail/

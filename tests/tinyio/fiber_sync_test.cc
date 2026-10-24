@@ -1,4 +1,4 @@
-#include "tinyio/fiber_sync.hpp"
+#include "tinyio/runtime/fiber_sync.hpp"
 
 #include <chrono>
 #include <vector>
@@ -13,7 +13,7 @@ using namespace tinyio;
 class FiberSyncTest : public ::testing::Test {
  protected:
   IoOptions opts_;
-  IO io_{0, opts_, {}};
+  IO io_{0, opts_};
 };
 
 // ── FiberLatch ──────────────────────────────────────────────────────────────
@@ -330,9 +330,8 @@ TEST_F(FiberSyncTest, TaskGroupResultTaskError) {
     TaskGroup<int> group(rt, 2);
 
     group.Spawn([](IO&) noexcept -> Result<int> { return 42; });
-    group.Spawn([](IO&) noexcept -> Result<int> {
-      return std::unexpected(Error{EINVAL, "test-op"});
-    });
+    group.Spawn(
+        [](IO&) noexcept -> Result<int> { return Error::FailErrno(EINVAL, "test-op"); });
 
     (void)group.Wait();
 
@@ -341,7 +340,7 @@ TEST_F(FiberSyncTest, TaskGroupResultTaskError) {
     EXPECT_EQ(r[0]->value(), 42);
 
     ASSERT_TRUE(r[1].has_value() && !r[1]->has_value());
-    EXPECT_EQ(r[1]->error().code, EINVAL);
+    EXPECT_EQ(r[1]->error().Value(), EINVAL);
   });
 
   io_.RunUntilDone();

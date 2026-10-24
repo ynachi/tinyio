@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "tinyio/runtime.hpp"
+#include "tinyio/runtime/runtime.hpp"
 
 using namespace tinyio;
 
@@ -14,7 +14,7 @@ using namespace tinyio;
 // 1. post_before_run
 TEST(CrossThreadPostTest, PostBeforeRun) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
 
   bool task_ran = false;
 
@@ -37,7 +37,7 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread) {
   IO* io_ptr = nullptr;
 
   std::thread t([&]() {
-    IO io(0, opts, {});
+    IO io(0, opts);
     io_ptr = &io;
     thread_started = true;
     // Since there are no fibers, Run() will just wait for eventfd wakeup.
@@ -70,7 +70,7 @@ TEST(CrossThreadPostTest, PostWakesSleepingThread) {
 // 3. post_concurrent_correctness
 TEST(CrossThreadPostTest, PostConcurrentCorrectness) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
 
   std::atomic counter{0};
   constexpr int num_threads = 8;
@@ -120,7 +120,7 @@ TEST(CrossThreadPostTest, PostWhileFibersActive) {
   IoOptions opts;
   // Lower batch_max_size to ensure we interleave post drains with fiber resumes
   opts.batch_max_size = 10;
-  IO io(0, opts, {});
+  IO io(0, opts);
 
   std::atomic fiber_yields{0};
   std::atomic tasks_ran{0};
@@ -172,7 +172,7 @@ TEST(CrossThreadPostTest, PostAfterStop) {
 
   {
     IoOptions opts;
-    IO io(0, opts, {});
+    IO io(0, opts);
     std::stop_source ss;
     (void)ss.request_stop();
     io.Run(ss.get_token());
@@ -202,7 +202,7 @@ TEST(CrossThreadPostTest, PostAfterStop) {
 TEST(CrossThreadPostTest, PostQueueFull) {
   IoOptions opts;
   opts.post_queue_capacity = 16;
-  IO io(0, opts, {});
+  IO io(0, opts);
 
   int success_count = 0;
   for (int i = 0; i < 100; ++i) {

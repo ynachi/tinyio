@@ -30,11 +30,25 @@ and Valgrind to catch memory errors and leaks and fix them.
 
 | Item               | Minimum           | Recommended |
 |--------------------|-------------------|-------------|
-| Linux kernel       | 5.11              | 6.1+        |
+| Linux kernel       | 6.1               | 6.6+        |
 | liburing           | 2.8               | 2.12+       |
 | Compiler (x86-64)  | Clang 20 / GCC 15 | Clang 22    |
 | Compiler (aarch64) | Clang 20 / GCC 16 | Clang 22    |
 | C++ standard       | C++23             | —           |
+
+The kernel floor is set by the io_uring features the runtime actually uses,
+not by what io_uring could do:
+
+| Feature                                    | Needs |
+|--------------------------------------------|-------|
+| `IORING_SETUP_SINGLE_ISSUER`               | 6.0   |
+| `IORING_SETUP_DEFER_TASKRUN`               | 6.1   |
+| `IORING_SETUP_TASKRUN_FLAG`                | 5.19  |
+| `IORING_ASYNC_CANCEL_ALL` / `_ANY`         | 5.19  |
+
+`DEFER_TASKRUN` is in the default ring flags, and the shutdown path cancels
+every in-flight request with a single `IORING_ASYNC_CANCEL_ALL |
+IORING_ASYNC_CANCEL_ANY`. There is no fallback for an older kernel.
 
 ---
 
@@ -47,16 +61,16 @@ and Valgrind to catch memory errors and leaks and fix them.
 using namespace tinyio;
 
 int main() {
-    IO io(0, IoOptions{}, {});
+    IO io(0, IoOptions{});
 
     io.Spawn([](IO& io) noexcept {
         auto fd = TRY(io.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644));
 
         std::string_view msg = "hello from a fiber\n";
         std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        TRY(io.Write(fd, buf));
+        TRY_VOID(io.Write(fd, buf));
 
-        TRY(io.Close(std::move(fd)));
+        TRY_VOID(io.Close(std::move(fd)));
     });
 
     io.RunUntilDone();
@@ -71,19 +85,19 @@ Each thread owns one `IO` instance. All threads bind to the same port via `SO_RE
 #include "tinyio/tinyio.hpp"
 using namespace tinyio;
 
-static Result<void> handle_client(IO& io, Fd client) noexcept {
+static Result<void> handle_client(IO& io, UniqueFd client) noexcept {
     std::byte buf[4096];
     while (true) {
         auto n = TRY(io.Read(client, std::span{buf}));
         if (n == 0) break;
         // write response ...
-        TRY(io.Write(client, response));
+        TRY_VOID(io.Write(client, response));
     }
     return {};
 }
 
 static Result<void> accept_loop(IO& io, uint16_t port, std::stop_token st) noexcept {
-    auto server = TRY(TcpListener::bind(port, "0.0.0.0"));
+    auto server = TRY(TcpListener::Bind(port, "0.0.0.0"));
 
     while (!st.stop_requested()) {
         auto client = TRY(io.Accept(server));
@@ -103,7 +117,7 @@ int main() {
         stops.emplace_back();
         auto st = stops.back().get_token();
         threads.emplace_back([i, st] {
-            IO io(i, IoOptions{}, {});
+            IO io(i, IoOptions{});
             io.Spawn([st](IO& io) noexcept {
                 (void)accept_loop(io, 8080, st);
             });
@@ -115,7 +129,7 @@ int main() {
 }
 ```
 
-The full example is in `examples/tinyio/03_http_services.cpp`.
+The full example is in `examples/tinyio/03_http_services.cc`.
 
 ---
 
@@ -125,7 +139,7 @@ The full example is in `examples/tinyio/03_http_services.cpp`.
 
 ```cpp
 // Construction — takes a worker id, options, and optional fixed buffer config.
-IO io(0, IoOptions{}, {});
+IO io(0, IoOptions{});
 
 // Spawn a fiber on the owner thread.
 Result<FiberId> io.Spawn([](IO& io) noexcept { ... });
@@ -210,14 +224,14 @@ static context string.
 // Manual check
 auto res = io.Read(fd, buf);
 if (!res) {
-    // res.error().code      — errno value
-    // res.error().error_code().message() — human-readable string
-    // res.error().op        — operation name, e.g. "read"
+    // res.error().Value()   — errno value
+    // res.error().Message() — human-readable string
+    // res.error().Context() — operation name, e.g. "read"
 }
 
-// Rust ?-style propagation (GNU statement expression, Clang/GCC only)
-auto n = TRY(io.Read(fd, buf));   // returns error to caller on failure
-TRY(io.Fsync(fd));                // Result<void>: just propagate
+// Rust ?-style propagation: bind the value, propagate the error on failure.
+auto n = TRY(io.Read(fd, buf));   // returns the error to the caller on failure
+TRY_VOID(io.Fsync(fd));           // Result<void>: just propagate
 ```
 
 ### Fixed buffer pool
@@ -225,16 +239,14 @@ TRY(io.Fsync(fd));                // Result<void>: just propagate
 Registered buffers bypass the kernel's bounce-buffer copy on every I/O call.
 
 ```cpp
-// Configure at construction time
-std::vector<BucketConfig> pool = {
-    {4096,  256},   // 256 × 4 KB buffers
-    {65536,  32},   // 32 × 64 KB buffers
-};
-IO io(0, IoOptions{}, pool);
+// One runtime, one pool: registered with the ring at construction
+IoOptions opts;
+opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 256};
+IO io(0, opts);
 
 // Inside a fiber
-auto buf = TRY(io.TakeFixedBuffer(4096));
-auto n   = TRY(io.ReadFixed(fd, buf, buf.size()));
+auto buf = TRY(io.TakeFixedBuffer());   // AcquireFixedBuffer parks the fiber instead
+auto n   = TRY(io.ReadFixed(fd, *buf, buf->Size()));
 // buf returns to pool automatically on destruction
 ```
 

@@ -37,8 +37,6 @@ if is_debian_like; then
         ninja-build \
         pkg-config \
         liburing-dev \
-        libboost-context-dev \
-        libboost-dev \
         clang \
         gcc \
         g++ \
@@ -62,7 +60,6 @@ elif is_fedora_like; then
         pkgconf \
         pkgconf-pkg-config \
         liburing-devel \
-        boost-devel \
         openssl-devel \
         git \
         libaio-devel \

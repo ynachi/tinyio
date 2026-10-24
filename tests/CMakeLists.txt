@@ -1,4 +1,3 @@
-find_package(GTest REQUIRED)
+# tinyio tests
 
 add_subdirectory(tinyio)
-add_subdirectory(fastlog)

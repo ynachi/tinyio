@@ -4,12 +4,19 @@
 include(CMakePackageConfigHelpers)
 
 function(tinyio_install_cmake_package PACKAGE_NAME EXPORT_NAME)
+    cmake_parse_arguments(PKG "" "NAMESPACE" "" ${ARGN})
+    if (NOT PKG_NAMESPACE)
+        set(PKG_NAMESPACE "${PACKAGE_NAME}::")
+    endif ()
+
     set(CONFIG_CMAKE "${PACKAGE_NAME}-config.cmake")
     set(BUILT_CONFIG_CMAKE "${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_CMAKE}")
     configure_package_config_file("${CONFIG_CMAKE}.in" "${BUILT_CONFIG_CMAKE}"
             INSTALL_DESTINATION "${TINYIO_INSTALL_CMAKEDIR}/${PACKAGE_NAME}"
     )
-    set(CONFIG_VERSION_CMAKE "${PACKAGE_NAME}config-version.cmake")
+    # The version file has to carry the same prefix as the config file, or
+    # find_package() will not find it.
+    set(CONFIG_VERSION_CMAKE "${PACKAGE_NAME}-config-version.cmake")
     set(BUILT_CONFIG_VERSION_CMAKE "${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_VERSION_CMAKE}")
     write_basic_package_version_file("${BUILT_CONFIG_VERSION_CMAKE}"
             COMPATIBILITY SameMajorVersion)
@@ -18,7 +25,7 @@ function(tinyio_install_cmake_package PACKAGE_NAME EXPORT_NAME)
     set(TARGETS_CMAKE "${PACKAGE_NAME}-targets.cmake")
     install(EXPORT ${EXPORT_NAME}
             DESTINATION "${TINYIO_INSTALL_CMAKEDIR}/${PACKAGE_NAME}"
-            NAMESPACE "${PACKAGE_NAME}::"
+            NAMESPACE "${PKG_NAMESPACE}"
             FILE "${TARGETS_CMAKE}")
 endfunction()
 
@@ -130,16 +137,17 @@ function(add_tinyio_lib LIB_NAME)
                 "$<INSTALL_INTERFACE:${ARG_SHARED_INSTALL_INTERFACE_LIBS}>"
                 PRIVATE ${ARG_SHARED_PRIVATE_LINK_LIBS})
 
-        target_link_libraries(${LIB_NAME}_shared
-                PUBLIC "$<BUILD_INTERFACE:tinyio_sanitizer_flags>")
-
         string(TOUPPER ${LIB_NAME} VISIBILITY_NAME)
         target_compile_definitions(${LIB_NAME}_shared PRIVATE ${VISIBILITY_NAME}_EXPORTING)
-        set_target_properties(${LIB_NAME}_shared
-                PROPERTIES C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET
-                hidden
-                VISIBILITY_INLINES_HIDDEN 1)
-        target_compile_features(options INTERFACE cxx_std_23)
+        # No hidden visibility here: tinyio has no export macros on its public
+        # API yet, so hiding every symbol leaves the shared library with
+        # nothing a consumer can link against. TINYIO_EXPORTING is kept as the
+        # hook for those macros.
+        #
+        # The target is ${LIB_NAME}_shared: "options" was a typo that only
+        # fired when the shared library was built, which the default build
+        # does not do.
+        target_compile_features(${LIB_NAME}_shared INTERFACE cxx_std_23)
 
         if(MSVC_TOOLCHAIN)
             target_compile_options(${LIB_NAME}_shared PRIVATE /bigobj)
@@ -200,9 +208,6 @@ function(add_tinyio_lib LIB_NAME)
                     PUBLIC "$<BUILD_INTERFACE:${ARG_STATIC_LINK_LIBS}>")
         endif()
 
-        target_link_libraries(${LIB_NAME}_static
-                PUBLIC "$<BUILD_INTERFACE:tinyio_sanitizer_flags>")
-
         if(WIN32)
             string(TOUPPER ${LIB_NAME} VISIBILITY_NAME)
             target_compile_definitions(${LIB_NAME}_static PUBLIC ${VISIBILITY_NAME}_STATIC)
@@ -231,7 +236,7 @@ endfunction()
 
 function(tinyio_install_all_headers PATH)
     set(options)
-    set(one_value_args)
+    set(one_value_args SOURCE_DIR)
     set(multi_value_args PATTERN)
     cmake_parse_arguments(ARG
             "${options}"
@@ -241,7 +246,16 @@ function(tinyio_install_all_headers PATH)
     if(NOT ARG_PATTERN)
         set(ARG_PATTERN "*.h" "*.hpp")
     endif()
-    file(GLOB CURRENT_DIRECTORY_HEADERS ${ARG_PATTERN})
+    if(NOT ARG_SOURCE_DIR)
+        set(ARG_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    # The glob patterns are relative to the source directory the headers come
+    # from, which is not always the directory this function is called from.
+    set(GLOB_PATTERNS)
+    foreach(PATTERN ${ARG_PATTERN})
+        list(APPEND GLOB_PATTERNS "${ARG_SOURCE_DIR}/${PATTERN}")
+    endforeach()
+    file(GLOB CURRENT_DIRECTORY_HEADERS ${GLOB_PATTERNS} LIST_DIRECTORIES false)
 
     set(PUBLIC_HEADERS)
     foreach(HEADER ${CURRENT_DIRECTORY_HEADERS})

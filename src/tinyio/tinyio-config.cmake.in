@@ -1,0 +1,25 @@
+@PACKAGE_INIT@
+
+# tinyio's public headers include <ylt/easylog.hpp> and <liburing.h>.
+# YLT installs its own headers into the same include directory as tinyio's,
+# so liburing is what a consumer still has to provide.
+include(CMakeFindDependencyMacro)
+
+find_dependency(Threads)
+find_dependency(OpenSSL)
+find_dependency(PkgConfig)
+pkg_check_modules(LibUring REQUIRED IMPORTED_TARGET liburing>=2.9)
+
+include("${CMAKE_CURRENT_LIST_DIR}/tinyio-targets.cmake")
+
+# In-tree the alias is Tinyio::tinyio and points at whichever flavour was
+# built. CMake cannot export an alias, so recreate it here.
+if (NOT TARGET Tinyio::tinyio)
+    if (TARGET Tinyio::tinyio_shared)
+        add_library(Tinyio::tinyio ALIAS Tinyio::tinyio_shared)
+    elseif (TARGET Tinyio::tinyio_static)
+        add_library(Tinyio::tinyio ALIAS Tinyio::tinyio_static)
+    endif ()
+endif ()
+
+check_required_components(tinyio)
