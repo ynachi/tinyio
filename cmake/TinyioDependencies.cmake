@@ -105,6 +105,13 @@ function(tinyio_configure_dependencies)
     # actually turns dladdr on is not one of YLT's switches.
     set(YLT_ENABLE_DL ON)
 
+    # YLT installs its own headers (include/ylt/...) because tinyio's public
+    # headers include <ylt/easylog.hpp>. Its thirdparty and standalone trees
+    # (asio, frozen, cinatra, iguana) are not reachable from easylog and are
+    # several hundred files, so they stay out of the install.
+    set(INSTALL_THIRDPARTY OFF)
+    set(INSTALL_STANDALONE OFF)
+
     # Pinned to the 0.6.1 release tag, not the v0.6.1 branch: the branch moves,
     # the tag does not. 0.6.1 is the first release with the easylog fix for a
     # lost wakeup in appender::stop(): it set the stop flag while holding the
@@ -120,14 +127,6 @@ function(tinyio_configure_dependencies)
     FetchContent_MakeAvailable(yalantinglibs)
 
     add_library(tinyio::ylt ALIAS yalantinglibs)
-
-    #
-    # BOOST
-    #
-    # tinyio's fibers are stackful: boost::context provides the fiber stacks
-    # and the jump_fcontext trampoline.
-    include(TinyioBoost)
-    tinyio_find_boost(REQUIRED COMPONENTS context)
 
     #
     # BENCHMARK

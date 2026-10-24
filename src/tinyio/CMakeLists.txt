@@ -3,6 +3,7 @@ set(TINYIO_INCLUDES "$<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/src>"
 
 set(TINYIO_SOURCES
         buffer_pool.cc
+        context.cc
         net.cc
         runtime.cc
         stack.cc
@@ -21,7 +22,6 @@ endif ()
 
 set(TINYIO_STATIC_BUILD_INTERFACE_LIBS
         tinyio::liburing
-        Boost::context
         ${TINYIO_MIMALLOC_LIBS}
         OpenSSL::SSL
         OpenSSL::Crypto
@@ -29,14 +29,26 @@ set(TINYIO_STATIC_BUILD_INTERFACE_LIBS
         yalantinglibs)
 set(TINYIO_SHARED_BUILD_INTERFACE_LIBS
         tinyio::liburing
-        Boost::context
         ${TINYIO_MIMALLOC_SHARED_LIBS}
         OpenSSL::SSL
         OpenSSL::Crypto
         Threads::Threads
         yalantinglibs)
-set(TINYIO_STATIC_INSTALL_INTERFACE_LIBS)
-set(TINYIO_SHARED_INSTALL_INTERFACE_LIBS)
+# What an installed consumer has to link. The build interface above uses the
+# pinned liburing built in the tree; an installed package asks for a system
+# liburing instead, because the fetched one lives in the build tree and cannot
+# be relocated. The rest are found with find_dependency() in
+# tinyio-config.cmake.in.
+set(TINYIO_STATIC_INSTALL_INTERFACE_LIBS
+        PkgConfig::LibUring
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads)
+set(TINYIO_SHARED_INSTALL_INTERFACE_LIBS
+        PkgConfig::LibUring
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads)
 
 
 add_tinyio_lib(tinyio
@@ -52,12 +64,14 @@ add_tinyio_lib(tinyio
 )
 
 # The strict warning set applies to tinyio's own sources, not to the fetched
-# dependencies.
+# dependencies. It is scoped to the build tree: a static library records its
+# private dependencies in the link interface, and exporting the warning flags
+# would impose them on consumers of the installed package.
 if (TINYIO_BUILD_SHARED)
-    target_link_libraries(tinyio_shared PRIVATE tinyio_warnings)
+    target_link_libraries(tinyio_shared PRIVATE "$<BUILD_INTERFACE:tinyio_warnings>")
 endif ()
 if (TINYIO_BUILD_STATIC)
-    target_link_libraries(tinyio_static PRIVATE tinyio_warnings)
+    target_link_libraries(tinyio_static PRIVATE "$<BUILD_INTERFACE:tinyio_warnings>")
 endif ()
 
 # easylog prints a stack trace on a fatal record, and it reaches for
@@ -95,3 +109,23 @@ if (TINYIO_BUILD_SHARED)
 elseif (TINYIO_BUILD_STATIC)
     add_library(Tinyio::tinyio ALIAS tinyio_static)
 endif ()
+
+# The installed package is consumed as <prefix>/include/tinyio/tinyio.hpp, so
+# the include directory of the prefix has to be on the consumer's path.
+foreach (tinyio_target IN ITEMS tinyio_static tinyio_shared)
+    if (TARGET ${tinyio_target})
+        target_include_directories(${tinyio_target} INTERFACE
+                "$<INSTALL_INTERFACE:${TINYIO_INSTALL_INCLUDEDIR}>")
+    endif ()
+endforeach ()
+
+# Public headers. The detail/ headers are not API, but the public ones include
+# them, so they have to travel with them. version.h is generated into the
+# build tree and comes from there.
+tinyio_install_all_headers(tinyio)
+tinyio_install_all_headers(tinyio/detail SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/detail")
+install(FILES "${PROJECT_BINARY_DIR}/src/tinyio/version.h"
+        DESTINATION "${TINYIO_INSTALL_INCLUDEDIR}/tinyio")
+
+# The CMake package: find_package(tinyio) hands out Tinyio::tinyio.
+tinyio_install_cmake_package(tinyio tinyio_targets NAMESPACE "Tinyio::")

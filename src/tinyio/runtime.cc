@@ -269,27 +269,31 @@ void IO::PushReady(detail::fiber::Fiber* fiber) noexcept {
     return;
   }
 
-  // Ask the specific hook if it is already in a list
-  if (const auto* hook = static_cast<IntrusiveHook<ReadyQueueTag>*>(fiber);
-      hook->IsLinked()) {
+  // Already queued: it will run once, however many wakeups it got.
+  if (fiber->in_ready_queue) {
     return;
   }
 
   fiber->state = detail::fiber::FiberState::ready;
-  ready_queue_.PushBack(fiber);
-}
-
-void IO::RemoveReady(detail::fiber::Fiber* fiber) noexcept {
-  if (fiber != nullptr) {
-    // We don't even need to check if it's in the queue here!
-    // IntrusiveList::remove() already safely checks `is_linked()` internally
-    // and does nothing if the fiber isn't in the list.
-    ready_queue_.Remove(fiber);
-  }
+  fiber->in_ready_queue = true;
+  ready_queue_.Push(fiber);
 }
 
 [[nodiscard]] detail::fiber::Fiber* IO::PopReady() noexcept {
-  return ready_queue_.PopFront();
+  detail::fiber::Fiber* fiber = nullptr;
+  if (!ready_queue_.Pop(fiber)) {
+    return nullptr;
+  }
+  fiber->in_ready_queue = false;
+  return fiber;
+}
+
+void IO::RemoveFromAllFibers(detail::fiber::Fiber* fiber) noexcept {
+  // Swap-and-pop: move the last fiber into the hole.
+  detail::fiber::Fiber* last = all_fibers_.back();
+  all_fibers_[fiber->all_fibers_index] = last;
+  last->all_fibers_index = fiber->all_fibers_index;
+  all_fibers_.pop_back();
 }
 
 void IO::DestroyFiber(detail::fiber::Fiber* fiber) noexcept {
@@ -297,38 +301,42 @@ void IO::DestroyFiber(detail::fiber::Fiber* fiber) noexcept {
     return;
   }
 
-  ready_queue_.Remove(fiber);
+  // The ready queue cannot remove from the middle, so it must not hold a
+  // finished fiber. It cannot: a fiber finishes while it runs, after
+  // PopReady() took it out, and PushReady() refuses a done fiber.
+  assert(!fiber->in_ready_queue && "finished fiber still in the ready queue");
   timer_wheel_.Disarm(fiber);
   fiber->task = nullptr;
 
   detail::ToolsDestroyFiber(fiber->tools);
 
   // Enforce the High-Water Mark!
-  if (idle_fibers_.Size() >= opts_.max_idle_fibers) {
+  if (idle_fibers_.size() >= opts_.max_idle_fibers) {
     // only remove from all_fibers_ when we are returning memory to the OS!
-    all_fibers_.Remove(fiber);
+    RemoveFromAllFibers(fiber);
 
     //  unmap the stack memory to prevent leaks
     detail::stack::ReleaseStack(fiber->stack);
     delete fiber;
   } else {
     // Cache it for later. It remains in all_fibers_!
-    idle_fibers_.PushBack(fiber);
+    idle_fibers_.push_back(fiber);
   }
 
   --live_fibers_;
 }
 
 void IO::DestroyAllFibers() noexcept {
-  // Iterate the master list. We are guaranteed to catch every reused/idle fiber.
-  while (detail::fiber::Fiber* fiber = all_fibers_.PopFront()) {
-    ready_queue_.Remove(fiber);
-    idle_fibers_.Remove(fiber);
-
+  // all_fibers_ owns every fiber, idle ones included, so the other
+  // containers only need to forget their pointers.
+  for (detail::fiber::Fiber* fiber : all_fibers_) {
     detail::ToolsDestroyFiber(fiber->tools);
     detail::stack::ReleaseStack(fiber->stack);
     delete fiber;
   }
+  all_fibers_.clear();
+  idle_fibers_.clear();
+  ready_queue_.Clear();
 }
 
 Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) noexcept {
@@ -336,9 +344,11 @@ Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) 
     return Error::fail_errno(EPERM, "spawn");
   }
 
-  auto* fiber = idle_fibers_.PopFront();
-
-  if (fiber == nullptr) {
+  detail::fiber::Fiber* fiber = nullptr;
+  if (!idle_fibers_.empty()) {
+    fiber = idle_fibers_.back();
+    idle_fibers_.pop_back();
+  } else {
     // Use unique_ptr so the Fiber is freed if allocate_stack fails below.
     // We do NOT add to all_fibers_ until the stack is successfully allocated.
     std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow)
@@ -352,7 +362,8 @@ Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) 
     owned->stack = stack;
 
     // Only push to all_fibers_ once all allocations have succeeded.
-    all_fibers_.PushFront(owned.get());
+    owned->all_fibers_index = all_fibers_.size();
+    all_fibers_.push_back(owned.get());
     fiber = owned.release();
   }
 
@@ -367,8 +378,7 @@ Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) 
   fiber->state = detail::fiber::FiberState::ready;
   detail::ToolsCreateFiber(fiber->tools);
 
-  fiber->context.fctx = boost::context::detail::make_fcontext(
-      fiber->stack.high, fiber->stack.usable_size, &TinyioFiberEntry);
+  detail::context::Make(fiber->context, fiber->stack.high, &IO::FiberEntry, fiber);
 
   // push to active list
   PushReady(fiber);
@@ -383,9 +393,7 @@ TIO_NO_SANITIZE_ADDRESS void IO::ResumeFiber(detail::fiber::Fiber* fiber) noexce
   fiber->state = detail::fiber::FiberState::running;
 
   detail::ToolsBeforeSwitch(scheduler_tools_, &fiber->tools, &fiber->stack);
-  boost::context::detail::transfer_t t =
-      boost::context::detail::jump_fcontext(fiber->context.fctx, fiber);
-  fiber->context.fctx = t.fctx;
+  detail::context::Switch(scheduler_context_, fiber->context);
   detail::ToolsAfterSwitch(scheduler_tools_);
 
   // Clear it when we jump back to the scheduler
@@ -394,11 +402,7 @@ TIO_NO_SANITIZE_ADDRESS void IO::ResumeFiber(detail::fiber::Fiber* fiber) noexce
 
 TIO_NO_SANITIZE_ADDRESS void IO::SuspendFiber(detail::fiber::Fiber* fiber) noexcept {
   detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr);
-
-  boost::context::detail::transfer_t t =
-      boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
-  scheduler_context_.fctx = t.fctx;
-
+  detail::context::Switch(fiber->context, scheduler_context_);
   detail::ToolsAfterSwitch(fiber->tools);
 }
 
@@ -429,7 +433,9 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
   fiber->state = detail::fiber::FiberState::done;
 
   detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr);
-  boost::context::detail::jump_fcontext(scheduler_context_.fctx, nullptr);
+  // Last switch out. The stack pointer saved into fiber->context is never
+  // resumed: a recycled fiber gets a fresh frame from context::Make().
+  detail::context::Switch(fiber->context, scheduler_context_);
 
   std::terminate();
 }
@@ -446,24 +452,23 @@ void IO::CancelAndDrain() noexcept {
   // the IO fibers to finish (e.g., TaskGroup::Wait, Latch::Wait).
   // Waking them up prematurely would cause them to destroy synchronization
   // primitives while the IO fibers are still unwinding, causing Use-After-Free.
-  all_fibers_.ForEach([&](detail::fiber::Fiber& fiber) noexcept {
-    if (fiber.state != detail::fiber::FiberState::waiting) {
-      return;
+  for (detail::fiber::Fiber* fiber : all_fibers_) {
+    if (fiber->state != detail::fiber::FiberState::waiting ||
+        fiber->wait_kind != detail::fiber::WaitKind::io) {
+      continue;
     }
 
-    if (fiber.wait_kind == detail::fiber::WaitKind::io) {
-      auto res = GetSqe();
-      if (!res) {
-        ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", res.error().context(),
-                res.error().message());
-        return;
-      }
-      io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber.operation), 0);
-      io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
-      ++inflight_ops_;
-      issued_cancels = true;
+    auto res = GetSqe();
+    if (!res) {
+      ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", res.error().context(),
+              res.error().message());
+      continue;
     }
-  });
+    io_uring_prep_cancel64(res.value(), reinterpret_cast<__u64>(&fiber->operation), 0);
+    io_uring_sqe_set_data64(res.value(), k_fiber_cancel_sentinel);
+    ++inflight_ops_;
+    issued_cancels = true;
+  }
 
   for (uint64_t tagged_ptr : active_multishots_) {
     auto res = GetSqe();
@@ -505,15 +510,21 @@ void IO::CancelAndDrain() noexcept {
   // waiting is permanently deadlocked (e.g., waiting on a Latch that no
   // one will count down because the counting fiber propagated an ECANCELED).
   // We MUST wake them up so their stacks unwind and RAII destructors run.
+  //
+  // Each one is still in its primitive's wait queue. It removes itself when
+  // it wakes up and sees Stopping() (see ParkOn() in fiber_sync.hpp), so
+  // the primitive's destructor finds an empty queue.
+  //
+  // Iterating all_fibers_ while waking fibers is safe: PushReady() only
+  // touches the ready queue, and the fibers run later, in Tick().
   bool abandoned_sync_fibers = false;
-  all_fibers_.ForEach([&](detail::fiber::Fiber& fiber) noexcept {
-    if (fiber.state == detail::fiber::FiberState::waiting &&
-        fiber.wait_kind == detail::fiber::WaitKind::sync) {
-      static_cast<IntrusiveHook<WaitQueueTag>*>(&fiber)->UnlinkSelf();
-      PushReady(&fiber);
+  for (detail::fiber::Fiber* fiber : all_fibers_) {
+    if (fiber->state == detail::fiber::FiberState::waiting &&
+        fiber->wait_kind == detail::fiber::WaitKind::sync) {
+      PushReady(fiber);
       abandoned_sync_fibers = true;
     }
-  });
+  }
 
   if (abandoned_sync_fibers) {
     ELOGFMT(WARN, "IO #{} teardown: forcefully waking up abandoned sync-parked fibers",
@@ -528,32 +539,26 @@ void IO::CancelAndDrain() noexcept {
   }
 }
 
-}  // namespace tinyio
-
-// Note: extern "C" with a C++ parameter type (transfer_t) is technically
-// non-conforming but required by Boost.Context's API. transfer_t is trivial,
-// so this works correctly on all targeted compilers (GCC/Clang).
-extern "C" [[noreturn]] void TinyioFiberEntry(
-    boost::context::detail::transfer_t t) noexcept {
-  auto* fiber = static_cast<tinyio::detail::fiber::Fiber*>(t.data);
+// First code a new fiber runs, on its own stack, reached through the
+// trampoline in context.cc. ResumeFiber() saved the scheduler's context in
+// the switch that got us here, so there is nothing to record.
+[[noreturn]] void IO::FiberEntry(void* arg) noexcept {
+  auto* fiber = static_cast<detail::fiber::Fiber*>(arg);
   if (fiber == nullptr || fiber->runtime == nullptr) {
     std::terminate();
   }
 
   auto& rt = *fiber->runtime;
-  rt.scheduler_context_.fctx = t.fctx;
 
-  // Complete the ASAN fiber switch.  We pass scheduler_tools_ (not
-  // fiber->tools) because resume_fiber() stored the fake-stack handle
-  // into scheduler_tools_.asan_fake_stack via tools_before_switch(), and
-  // __sanitizer_finish_switch_fiber() needs that same handle to finalise
-  // the transition from the scheduler's stack to ours.
-  tinyio::detail::ToolsAfterSwitch(fiber->tools);
+  // Complete the ASAN fiber switch ResumeFiber() started. A brand-new fiber
+  // has no fake stack to restore: fiber->tools.asan_fake_stack is still the
+  // nullptr ToolsCreateFiber() set.
+  detail::ToolsAfterSwitch(fiber->tools);
   fiber->task(rt);
   rt.FinishCurrentFiber(fiber);
-
-  std::terminate();
 }
+
+}  // namespace tinyio
 
 namespace tinyio {
 Result<void> IO::SubmitOrWaitFor() noexcept {

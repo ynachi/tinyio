@@ -5,8 +5,12 @@ tinyio_add_test(buffer_pool_tests
         buffer_pool_test.cc
 )
 
-tinyio_add_test(intrusive_list_tests
-        intrusive_list_test.cc
+tinyio_add_test(context_tests
+        context_test.cc
+)
+
+tinyio_add_test(ring_buffer_tests
+        ring_buffer_test.cc
 )
 
 tinyio_add_test(runtime_tests

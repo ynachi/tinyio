@@ -21,12 +21,39 @@ command per task.
   (`cmake/TinyioWarnings.cmake`). New code has to satisfy that set.
 - `src/libs/` holds vendored third-party headers and is excluded from
   formatting, the same way kio excludes its `include/libs`.
-- tinyio is Linux-only (liburing + boost::context); verify on srv401, not on
+- tinyio is Linux-only (liburing, and x86_64 / aarch64 only: the fiber
+  context switch is hand-written assembly in `src/tinyio/context.cc`); verify on srv401, not on
   macOS.
 - Dependencies are fetched: liburing, googletest, and **YLT** (yalantinglibs)
   for logging and serialization. YLT is header-only here and only the easylog
   and struct_pack modules are reachable — `cmake/TinyioDependencies.cmake`
   turns every optional YLT backend off with the `YLT_ENABLE_*` switches.
+
+## Installing
+
+`cmake --install build/<preset> --prefix <dir>` produces:
+
+- `include/tinyio/` — the public headers, `include/tinyio/detail/` — the ones
+  they include, and the generated `version.h`.
+- `include/ylt/` — YLT's own headers, because the public headers include
+  `<ylt/easylog.hpp>`. YLT's thirdparty and standalone trees (asio, frozen,
+  cinatra, iguana) are not installed.
+- `lib/libtinyio.{a,so}` and `lib/cmake/tinyio/` — the library and its CMake
+  package.
+
+A consumer needs nothing but the prefix:
+
+```cmake
+find_package(tinyio REQUIRED)
+target_link_libraries(app PRIVATE Tinyio::tinyio)
+```
+
+The package pulls liburing (>= 2.9, from the system), and
+OpenSSL in with `find_dependency()`. Note that it asks for a **system**
+liburing, not the pinned 2.9 the build tree compiles against: the pinned one
+lives in the build tree and cannot be relocated. The shared flavour exports
+every symbol — tinyio has no export macros on its public API yet, so hidden
+visibility would leave the `.so` with nothing to link against.
 
 ## Errors and logging
 

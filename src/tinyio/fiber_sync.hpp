@@ -9,8 +9,45 @@
 
 namespace tinyio {
 
-// A wait list is just an intrusive list of fibers waiting on a condition
-using FiberWaitQueue = IntrusiveList<detail::fiber::Fiber, WaitQueueTag, false>;
+// A wait list is a FIFO of the fibers waiting on a condition. Small initial
+// capacity, allocated on the first wait: most primitives never see one.
+class FiberWaitQueue {
+ public:
+  [[nodiscard]] bool Empty() const noexcept { return fibers_.Empty(); }
+
+  void PushBack(detail::fiber::Fiber* fiber) noexcept { fibers_.Push(fiber); }
+
+  /// The oldest waiter, or nullptr when there is none.
+  [[nodiscard]] detail::fiber::Fiber* PopFront() noexcept {
+    detail::fiber::Fiber* fiber = nullptr;
+    return fibers_.Pop(fiber) ? fiber : nullptr;
+  }
+
+  /// O(n). Only for a fiber that leaves before being popped (teardown).
+  void Remove(detail::fiber::Fiber* fiber) noexcept { fibers_.Erase(fiber); }
+
+ private:
+  detail::RingBuffer<detail::fiber::Fiber*> fibers_{8};
+};
+
+/// Parks the running fiber on @p waiters until someone pops and unparks it.
+///
+/// During teardown the runtime may instead wake a parked fiber directly
+/// (IO::CancelAndDrain, pass 2) while it is still in @p waiters. The fiber
+/// then sees Stopping() and removes itself, so the primitive is not left
+/// holding a pointer to a fiber that is gone. A fiber that was popped
+/// normally is no longer in the queue, and Remove() does nothing.
+[[nodiscard]] inline Result<void> ParkOn(IO& io, FiberWaitQueue& waiters,
+                                         const char* op_name) noexcept {
+  auto* self = io.RunningFiber();
+  waiters.PushBack(self);
+  io.ParkRunning();
+  if (io.Stopping()) {
+    waiters.Remove(self);
+    return Error::fail_errno(ECANCELED, op_name);
+  }
+  return {};
+}
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds
 /// when all are done.
@@ -44,14 +81,9 @@ struct Latch {
   }
 
   [[nodiscard]] Result<void> Wait() noexcept {
-    auto* self = io_.RunningFiber();
-    assert(self != nullptr && "wait() called outside a fiber");
+    assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
     if (count_ > 0) {
-      waiters_.PushBack(self);
-      io_.ParkRunning();
-      if (io_.Stopping()) {
-        return Error::fail_errno(ECANCELED, "latch.wait");
-      }
+      return ParkOn(io_, waiters_, "latch.wait");
     }
     return {};
   }
@@ -95,18 +127,12 @@ struct Semaphore {
 
   // Decrements count. Suspends if count == 0.
   [[nodiscard]] Result<void> Acquire() noexcept {
-    auto* self = io_.RunningFiber();
-    assert(self != nullptr && "acquire() called outside a fiber");
+    assert(io_.RunningFiber() != nullptr && "acquire() called outside a fiber");
     if (count_ > 0) {
       --count_;
-    } else {
-      waiters_.PushBack(self);
-      io_.ParkRunning();
-      if (io_.Stopping()) {
-        return Error::fail_errno(ECANCELED, "semaphore.acquire");
-      }
+      return {};
     }
-    return {};
+    return ParkOn(io_, waiters_, "semaphore.acquire");
   }
 
   // Increments count. Wakes one waiter if any.
@@ -159,18 +185,12 @@ struct Mutex {
   explicit Mutex(IO& io) : io_(io) {}
 
   [[nodiscard]] Result<void> Lock() noexcept {
-    auto* self = io_.RunningFiber();
-    assert(self != nullptr && "lock() called outside a fiber");
+    assert(io_.RunningFiber() != nullptr && "lock() called outside a fiber");
     if (!held_) {
       held_ = true;
       return {};
     }
-    waiters_.PushBack(self);
-    io_.ParkRunning();
-    if (io_.Stopping()) {
-      return Error::fail_errno(ECANCELED, "mutex.lock");
-    }
-    return {};
+    return ParkOn(io_, waiters_, "mutex.lock");
   }
 
   void Unlock() noexcept {
@@ -277,14 +297,9 @@ struct TaskGroup<void> {
 
   // Suspends calling fiber until all spawned children have finished.
   [[nodiscard]] Result<void> Wait() noexcept {
-    auto* self = io_.RunningFiber();
-    assert(self != nullptr && "wait() called outside a fiber");
+    assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
     if (active_tasks_ > 0) {
-      waiters_.PushBack(self);
-      io_.ParkRunning();
-      if (io_.Stopping()) {
-        return Error::fail_errno(ECANCELED, "taskgroup.wait");
-      }
+      return ParkOn(io_, waiters_, "taskgroup.wait");
     }
     return {};
   }

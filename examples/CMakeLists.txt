@@ -33,4 +33,12 @@ add_custom_target(examples
         05_bench_io
 )
 
+install(TARGETS
+        01_hello_echo
+        02_fanout
+        03_http_services
+        04_echo_client
+        05_bench_io
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}/examples")
+
 message(STATUS "  Examples will be installed to: ${CMAKE_INSTALL_PREFIX}/bin/examples")

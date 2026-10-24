@@ -22,6 +22,14 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/tinyio/version.h.in"
 # Cmake find modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
+# Installation layout. GNUInstallDirs supplies the usual CMAKE_INSTALL_*
+# values; the TINYIO_* names below are what the install helpers in
+# cmake/TinyioBuildUtils.cmake use.
+include(GNUInstallDirs)
+set(TINYIO_INSTALL_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+set(TINYIO_INSTALL_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+set(TINYIO_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake")
+
 # -----------------------------------------
 # Optional Components
 #------------------------------------------

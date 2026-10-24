@@ -1,9 +1,10 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 
 #include "context.hpp"
 #include "sanitizer_hooks.hpp"
-#include "tinyio/intrusive_list.hpp"
 
 namespace tinyio {
 class IO;
@@ -62,14 +63,7 @@ struct Operation {
 };
 
 /// \brief Represents a single cooperative thread of execution (coroutine).
-/// Intrusive doubly-linked list
-struct Fiber  // NOLINT on multiple inheritance of non pure virtual classes. This as not
-              // classes per say
-    : IntrusiveHook<AllFibersTag>,
-      IntrusiveHook<ReadyQueueTag>,
-      IntrusiveHook<WaitQueueTag>,
-      IntrusiveHook<IdleQueueTag>,
-      IntrusiveHook<TimerTag> {
+struct Fiber {
   /// Pointer to the main event loop / scheduler that owns this fiber.
   IO* runtime = nullptr;
 
@@ -104,5 +98,18 @@ struct Fiber  // NOLINT on multiple inheritance of non pure virtual classes. Thi
 
   /// Why the fiber is suspended.
   WaitKind wait_kind = WaitKind::none;
+
+  /// True while the fiber sits in the runtime's ready queue. Stops PushReady()
+  /// from queueing the same fiber twice.
+  bool in_ready_queue = false;
+
+  /// True while the fiber is armed in the TimerWheel.
+  bool timer_armed = false;
+
+  /// Position in its TimerWheel slot while timer_armed (O(1) disarm).
+  std::size_t timer_index = 0;
+
+  /// Position in the runtime's all_fibers_ vector (O(1) removal).
+  std::size_t all_fibers_index = 0;
 };
 }  // namespace tinyio::detail::fiber

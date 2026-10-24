@@ -16,6 +16,7 @@
 #include "buffer_pool.hpp"
 #include "detail/fiber.hpp"
 #include "detail/mpsc_queue.hpp"
+#include "detail/ring_buffer.hpp"
 #include "detail/timer_wheel.hpp"
 #include "error.hpp"
 #include "fd.hpp"
@@ -419,7 +420,7 @@ class IO final {
   // Each *_timed op behaves like its untimed counterpart but fails with
   // ETIMEDOUT if no completion arrives within @p timeout. Timeouts are
   // honored with up to TimerWheel::kTickNs (64ms) of slack. The hot path
-  // costs two intrusive-list operations; the kernel is only involved
+  // costs a vector push and a swap-and-pop; the kernel is only involved
   // (one ASYNC_CANCEL) when a timeout actually fires.
   [[nodiscard]] Result<uint32_t> Read(const UniqueFd& fd, std::span<std::byte> buf,
                                       std::chrono::nanoseconds timeout,
@@ -533,8 +534,7 @@ class IO final {
 
     assert(current_fiber_->runtime == this);
     assert(current_fiber_->state == detail::fiber::FiberState::running);
-    assert(!static_cast<IntrusiveHook<TimerTag>*>(current_fiber_)->IsLinked() &&
-           "fiber already armed in the timer wheel");
+    assert(!current_fiber_->timer_armed && "fiber already armed in the timer wheel");
 
     TRY_LOG_ERR(sqe, GetSqe(), "failed to get sqe: io ops [{}]", op_name);
 
@@ -618,9 +618,13 @@ class IO final {
   //
   detail::context::Context scheduler_context_{};
   detail::ToolFiberState scheduler_tools_{};
-  IntrusiveList<detail::fiber::Fiber, AllFibersTag, false> all_fibers_;
-  IntrusiveList<detail::fiber::Fiber, ReadyQueueTag, false> ready_queue_;
-  IntrusiveList<detail::fiber::Fiber, IdleQueueTag, true> idle_fibers_;  ///< For recycle
+  /// Every fiber this runtime owns, running, waiting or idle. Unordered:
+  /// removal swaps the last fiber into the hole (Fiber::all_fibers_index).
+  std::vector<detail::fiber::Fiber*> all_fibers_;
+  /// Fibers waiting for CPU time, oldest first.
+  detail::RingBuffer<detail::fiber::Fiber*> ready_queue_{1024};
+  /// Finished fibers kept with their stack for reuse (LIFO).
+  std::vector<detail::fiber::Fiber*> idle_fibers_;
   detail::fiber::Fiber* current_fiber_ = nullptr;
   FiberId next_fiber_id_ = 1;
   std::size_t live_fibers_ = 0;
@@ -632,11 +636,12 @@ class IO final {
 
   [[noreturn]] TIO_NO_SANITIZE_ADDRESS void FinishCurrentFiber(
       detail::fiber::Fiber* fiber) noexcept;
-  friend void ::TinyioFiberEntry(boost::context::detail::transfer_t) noexcept;
+  /// Entry point of every fiber (a context::EntryFn); @p arg is the Fiber.
+  [[noreturn]] static void FiberEntry(void* arg) noexcept;
 
   void PushReady(detail::fiber::Fiber* fiber) noexcept;
-  void RemoveReady(detail::fiber::Fiber* fiber) noexcept;
   [[nodiscard]] detail::fiber::Fiber* PopReady() noexcept;
+  void RemoveFromAllFibers(detail::fiber::Fiber* fiber) noexcept;
   void DestroyFiber(detail::fiber::Fiber* fiber) noexcept;
   void DestroyAllFibers() noexcept;
   TIO_NO_SANITIZE_ADDRESS void SuspendFiber(detail::fiber::Fiber* fiber) noexcept;

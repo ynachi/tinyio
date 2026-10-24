@@ -11,8 +11,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libssl-dev is required: cmake/TinyioDependencies.cmake does
 # find_package(OpenSSL 3 REQUIRED). Without the -dev package CMake reports a
 # missing OPENSSL_CRYPTO_LIBRARY and configure fails before any build starts.
-# libboost-context-dev is required: tinyio's fibers are stackful and use
-# boost::context for the stacks and the jump_fcontext trampoline.
 # libgflags-dev is required: the gflags network benchmark links gflags::gflags.
 
 RUN apt-get update \
@@ -27,7 +25,6 @@ RUN apt-get update \
         ccache mold \
         gdb wrk \
         libssl-dev \
-        libboost-context-dev \
         libgflags-dev \
  && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
 
