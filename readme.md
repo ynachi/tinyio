@@ -47,7 +47,7 @@ and Valgrind to catch memory errors and leaks and fix them.
 using namespace tinyio;
 
 int main() {
-    IO io(0, IoOptions{}, {});
+    IO io(0, IoOptions{});
 
     io.Spawn([](IO& io) noexcept {
         auto fd = TRY(io.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644));
@@ -103,7 +103,7 @@ int main() {
         stops.emplace_back();
         auto st = stops.back().get_token();
         threads.emplace_back([i, st] {
-            IO io(i, IoOptions{}, {});
+            IO io(i, IoOptions{});
             io.Spawn([st](IO& io) noexcept {
                 (void)accept_loop(io, 8080, st);
             });
@@ -125,7 +125,7 @@ The full example is in `examples/tinyio/03_http_services.cpp`.
 
 ```cpp
 // Construction — takes a worker id, options, and optional fixed buffer config.
-IO io(0, IoOptions{}, {});
+IO io(0, IoOptions{});
 
 // Spawn a fiber on the owner thread.
 Result<FiberId> io.Spawn([](IO& io) noexcept { ... });
@@ -225,16 +225,14 @@ TRY(io.Fsync(fd));                // Result<void>: just propagate
 Registered buffers bypass the kernel's bounce-buffer copy on every I/O call.
 
 ```cpp
-// Configure at construction time
-std::vector<BucketConfig> pool = {
-    {4096,  256},   // 256 × 4 KB buffers
-    {65536,  32},   // 32 × 64 KB buffers
-};
-IO io(0, IoOptions{}, pool);
+// One runtime, one pool: registered with the ring at construction
+IoOptions opts;
+opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 256};
+IO io(0, opts);
 
 // Inside a fiber
-auto buf = TRY(io.TakeFixedBuffer(4096));
-auto n   = TRY(io.ReadFixed(fd, buf, buf.size()));
+auto buf = TRY(io.TakeFixedBuffer());   // AcquireFixedBuffer parks the fiber instead
+auto n   = TRY(io.ReadFixed(fd, *buf, buf->Size()));
 // buf returns to pool automatically on destruction
 ```
 

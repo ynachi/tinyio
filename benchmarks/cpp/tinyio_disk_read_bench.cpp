@@ -220,7 +220,7 @@ void run_phase(const std::vector<tinyio::UniqueFd>& files, std::vector<Worker>& 
   if (loop_style == 1) {
     opts.loop_style = tinyio::IoOptions::LoopStyle::kResumeFirst;
   }
-  tinyio::IO io(0, opts, {});
+  tinyio::IO io(0, opts);
   (void)io.Spawn([&](tinyio::IO& fio) noexcept {
     tinyio::TaskGroup<void> group(fio);
     for (std::size_t index = 0; index < depth; ++index) {

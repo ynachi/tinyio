@@ -73,7 +73,7 @@ Result<void> run_client(IO& io, const uint64_t thread_id, const uint64_t client_
 }
 
 void thread_worker(uint64_t thread_id) {
-  IO io{static_cast<uint16_t>(thread_id), tinyio::IoOptions{}, {}};
+  IO io{static_cast<uint16_t>(thread_id), tinyio::IoOptions{}};
 
   for (uint64_t c = 0; c < FLAGS_clients_per_thread; ++c) {
     std::move_only_function<void(IO&) noexcept> task =

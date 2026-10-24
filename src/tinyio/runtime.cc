@@ -2,6 +2,7 @@
 
 #include <sched.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -12,13 +13,27 @@
 #include <sys/eventfd.h>
 #include <ylt/easylog.hpp>
 
+#include "check.hpp"
+
 namespace tinyio {
-IO::IO(const size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs)
-    : id_(id),
-      opts_(opts),
-      buffer_pool_(std::move(pool_configs)),
-      post_queue_(opts.post_queue_capacity) {
+IO::IO(const size_t id, const IoOptions& opts)
+    : id_(id), opts_(opts), post_queue_(opts.post_queue_capacity) {
+  if (opts.buffer_pool) {
+    buffer_pool_.emplace(opts.buffer_pool->slot_size, opts.buffer_pool->slots);
+    buffer_pool_->SetOwner(this);
+  }
+
   if (auto res = Initialize(); !res) {
+    // The destructor does not run when a constructor throws: release what
+    // Initialize() created before it failed.
+    if (wake_fd_ >= 0) {
+      ::close(wake_fd_);
+      wake_fd_ = -1;
+    }
+    if (ring_.ring_fd > 0) {
+      io_uring_queue_exit(&ring_);
+      ring_.ring_fd = -1;
+    }
     const auto err = res.error();
     throw std::system_error(err.code,
                             std::format("tinyio::IO init failed in {}", err.context()));
@@ -69,15 +84,6 @@ IO::~IO() noexcept {
             live_fibers_);
   }
 
-  if (ring_.ring_fd > 0 && buffer_pool_.IsRegistered()) {
-    if (auto res = UnregisterBuffers(); !res.has_value()) {
-      auto err = res.error();
-      ELOGFMT(ERROR, "Failed to unregister buffers: [{}] {}", err.context(),
-              err.message());
-    }
-    ELOGFMT(INFO, "unregistered buffers, worker: {}", id_);
-  }
-
   if (ring_.ring_fd > 0 && !direct_fds_.empty()) {
     if (const int ret = io_uring_unregister_files(&ring_); ret < 0) {
       ELOGFMT(ERROR, "Failed to unregister files: {}", std::strerror(-ret));
@@ -98,6 +104,13 @@ IO::~IO() noexcept {
       ::close(wake_fd_);
       wake_fd_ = -1;
     }
+  }
+
+  // Detach the pool before the fibers go away: a fiber parked on a slot
+  // points at memory that is about to be freed, so the pool must not try to
+  // unpark it afterwards.
+  if (buffer_pool_) {
+    buffer_pool_->Detach();
   }
 
   // Release all fiber stacks and Fiber objects (both live and idle).
@@ -138,14 +151,28 @@ Result<void> IO::Initialize() noexcept {
 
   wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (wake_fd_ < 0) {
-    io_uring_queue_exit(&ring_);
     return Error::fail_errno(errno, "eventfd");
   }
 
-  // register pool if not empty
-  if (buffer_pool_.BucketCount() != 0) {
-    TRY_VOID(RegisterBuffers(buffer_pool_));
-    ELOGFMT(INFO, "the buffer pool have been registered to io_uring");
+  // One iovec per <= 1 GiB chunk, not per slot: the kernel's registered
+  // buffer table is far smaller than the number of slots a pool holds. The
+  // kernel pins the pages, which counts against RLIMIT_MEMLOCK unless the
+  // process has CAP_IPC_LOCK.
+  if (buffer_pool_) {
+    std::vector<iovec> table;
+    buffer_pool_->AppendRegions(table);
+    if (const int ret = io_uring_register_buffers(
+            &ring_, table.data(), static_cast<unsigned int>(table.size()));
+        ret < 0) {
+      ELOGFMT(ERROR, "io_uring_register_buffers failed: {} ({} regions, {} bytes pinned){}",
+              std::strerror(-ret), table.size(), buffer_pool_->AllocatedBytes(),
+              ret == -ENOMEM ? "; check `ulimit -l` (RLIMIT_MEMLOCK) or LimitMEMLOCK= "
+                               "in the unit file"
+                             : "");
+      return Error::fail_errno(-ret, "io_uring_register_buffers");
+    }
+    ELOGFMT(INFO, "registered a buffer pool of {} x {} bytes", buffer_pool_->Capacity(),
+            buffer_pool_->SlotSize());
   }
 
   if (opts_.direct_fd_table_size > 0) {
@@ -170,28 +197,20 @@ Result<void> IO::Initialize() noexcept {
   return {};
 }
 
-Result<void> IO::RegisterBuffers(FixedBufferPool& pool) noexcept {
-  if (pool.IsRegistered()) {
-    return Error::fail_errno(EALREADY, "register_buffers: pool already registered");
-  }
-
-  if (const int ret = io_uring_register_buffers(
-          &ring_, pool.IovecsPtr(), static_cast<unsigned int>(pool.TotalCapacity()));
-      ret < 0) {
-    return Error::fail_errno(-ret, "io_uring_register_buffers");
-  }
-
-  pool.SetRegistered();
-
-  return {};
+Result<FixedBuffer> IO::TakeFixedBuffer() noexcept {
+  CHECK(buffer_pool_.has_value())
+      << "take_fixed_buffer: no buffer pool configured (IoOptions::buffer_pool)";
+  return buffer_pool_->Take();
 }
 
-Result<void> IO::UnregisterBuffers() noexcept {
-  if (const int ret = io_uring_unregister_buffers(&ring_); ret < 0) {
-    return Error::fail_errno(-ret, "io_uring_unregister_buffers");
-  }
-  buffer_pool_.SetUnregistered();
-  return {};
+Result<FixedBuffer> IO::AcquireFixedBuffer() noexcept {
+  CHECK(buffer_pool_.has_value())
+      << "acquire_fixed_buffer: no buffer pool configured (IoOptions::buffer_pool)";
+  return buffer_pool_->Acquire(*this);
+}
+
+bool IO::OwnsBuffer(const FixedBuffer& buf) const noexcept {
+  return buffer_pool_.has_value() && buf.Pool() == &*buffer_pool_;
 }
 
 Result<UniqueFd> IO::RegisterFile(UniqueFd fd) noexcept {
@@ -511,11 +530,13 @@ void IO::CancelAndDrain() noexcept {
 
 void IO::AbortIfParkedFibers() const noexcept {
   // Called once quiesced: nothing ready, nothing in flight. A fiber still
-  // live is parked on a sync primitive and nothing can ever wake it.
+  // live is parked on a sync primitive or on the buffer pool, and nothing
+  // can ever wake it.
   if (live_fibers_ > 0) {
     ELOGFMT(FATAL,
             "IO #{} quiesced with {} parked fiber(s) and no one left to wake them "
-            "(latch never counted down? mutex never unlocked?)",
+            "(latch never counted down? mutex never unlocked? fixed buffer never "
+            "released?)",
             id_, live_fibers_);
     std::abort();
   }
@@ -961,11 +982,26 @@ Result<uint32_t> IO::Read(const UniqueFd& fd, const std::span<std::byte> buf,
 Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf, const size_t len,
                                const off_t file_offset,
                                const size_t buffer_offset) noexcept {
+  // The slot has to come from this runtime's pool: the kernel resolves the
+  // buf_index against the table registered with this ring, and a foreign
+  // index would name the wrong buffer.
+  CHECK(OwnsBuffer(buf)) << "read_fixed: the buffer is not registered with this runtime";
+  // The buffer offset has to land inside the slot, and the length must not
+  // be zero: either is an EINVAL. A length that runs past the slot is
+  // clamped to what is left of it, so the kernel never reads into the next
+  // slot.
+  const bool bad_range = !(buffer_offset < buf.Size() && len > 0);
+  if (bad_range) {
+    return Error::fail_errno(EINVAL, "read_fixed: range outside the buffer");
+  }
+  const size_t safe_len =
+      std::min({len, buf.Size() - buffer_offset, static_cast<size_t>(kMaxRwLen)});
+  auto* start_addr = buf.Ptr() + buffer_offset;
+
   return Syscall("read_fixed", [&](io_uring_sqe* sqe) {
-    void* start_addr = static_cast<std::byte*>(buf.Ptr()) + buffer_offset;
-    io_uring_prep_read_fixed(sqe, fd.Get(), start_addr, static_cast<unsigned int>(len),
-                             static_cast<std::uint64_t>(file_offset),
-                             static_cast<int>(buf.Index()));
+    io_uring_prep_read_fixed(
+        sqe, fd.Get(), start_addr, static_cast<unsigned int>(safe_len),
+        static_cast<std::uint64_t>(file_offset), static_cast<int>(buf.Index()));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }
@@ -1044,11 +1080,21 @@ Result<uint32_t> IO::Write(const UniqueFd& fd, std::span<const std::byte> buf,
 Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                 const size_t len, const off_t file_offset,
                                 const size_t buffer_offset) noexcept {
+  // Same contract as ReadFixed: a bad offset or an empty write is an EINVAL,
+  // a length past the slot is clamped.
+  CHECK(OwnsBuffer(buf)) << "write_fixed: the buffer is not registered with this runtime";
+  const bool bad_range = !(buffer_offset < buf.Size() && len > 0);
+  if (bad_range) {
+    return Error::fail_errno(EINVAL, "write_fixed: range outside the buffer");
+  }
+  const size_t safe_len =
+      std::min({len, buf.Size() - buffer_offset, static_cast<size_t>(kMaxRwLen)});
+  const auto* start_addr = buf.Ptr() + buffer_offset;
+
   return Syscall("write_fixed", [&](io_uring_sqe* sqe) {
-    const void* start_addr = buf.Ptr() + buffer_offset;
-    io_uring_prep_write_fixed(sqe, fd.Get(), start_addr, static_cast<unsigned int>(len),
-                              static_cast<std::uint64_t>(file_offset),
-                              static_cast<int>(buf.Index()));
+    io_uring_prep_write_fixed(
+        sqe, fd.Get(), start_addr, static_cast<unsigned int>(safe_len),
+        static_cast<std::uint64_t>(file_offset), static_cast<int>(buf.Index()));
     if (fd.IsDirect()) sqe->flags |= IOSQE_FIXED_FILE;
   });
 }

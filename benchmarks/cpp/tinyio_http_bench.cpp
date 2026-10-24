@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
       threads.emplace_back([i, opts, st] {
         tinyio::IoOptions io_opts;
         io_opts.stack_size = opts.stack_size;
-        tinyio::IO worker(i, io_opts, {});
+        tinyio::IO worker(i, io_opts);
 
         (void)worker.Spawn([opts](tinyio::IO& io) noexcept {
           accept_loop(io, opts.port, opts.stack_size);

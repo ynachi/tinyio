@@ -143,24 +143,34 @@ function(tinyio_configure_dependencies)
                 GIT_SHALLOW TRUE)
         FetchContent_MakeAvailable(benchmark)
 
-        FetchContent_Declare(
-                photon
-                SYSTEM
-                GIT_REPOSITORY https://github.com/ynachi/PhotonLibOS.git
-                GIT_TAG main
-        )
-        FetchContent_MakeAvailable(photon)
+        # Photon is fetched ONLY when the Photon benchmarks are switched on.
+        # It is a heavy dependency (a full clone plus a long compile) that
+        # nothing else in the tree links against, and it does not compile with
+        # clang: fs/cache/persistent_cache uses va_arg(args, std::string),
+        # which is ill-formed and reported as an error that -w and
+        # -Wno-non-pod-varargs cannot suppress. Fetching it unconditionally
+        # broke the release build under clang 21/22 even though the Photon
+        # benchmarks themselves are off by default.
+        if (TINYIO_BUILD_PHOTON_BENCH)
+            FetchContent_Declare(
+                    photon
+                    SYSTEM
+                    GIT_REPOSITORY https://github.com/ynachi/PhotonLibOS.git
+                    GIT_TAG main
+            )
+            FetchContent_MakeAvailable(photon)
 
-        # Photon does not build clean on GCC 15: it needs cstdint force-included
-        # and its warnings silenced. Only the photon targets get this; applying
-        # it globally would mask warnings in tinyio's own sources.
-        # photon_obj is the object library that actually compiles the sources;
-        # photon_static / photon_shared only collect its objects.
-        foreach (photon_target photon_obj photon_static photon_shared)
-            if (TARGET ${photon_target})
-                target_compile_options(${photon_target} PRIVATE
-                        -w -include cstdint)
-            endif ()
-        endforeach ()
+            # Photon does not build clean on GCC 15: it needs cstdint force-included
+            # and its warnings silenced. Only the photon targets get this; applying
+            # it globally would mask warnings in tinyio's own sources.
+            # photon_obj is the object library that actually compiles the sources;
+            # photon_static / photon_shared only collect its objects.
+            foreach (photon_target photon_obj photon_static photon_shared)
+                if (TARGET ${photon_target})
+                    target_compile_options(${photon_target} PRIVATE
+                            -w -include cstdint)
+                endif ()
+            endforeach ()
+        endif ()
     endif ()
 endfunction()

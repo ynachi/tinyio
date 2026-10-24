@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
                             st = stop_sources[i].get_token()] mutable noexcept {
         tinyio::IoOptions io_opts;
         io_opts.stack_size = opts.stack_size;
-        tinyio::IO worker(i, io_opts, {});
+        tinyio::IO worker(i, io_opts);
 
         // Signal the IO pointer before entering run() so that the
         // main thread can Post() the accept fiber into the queue.

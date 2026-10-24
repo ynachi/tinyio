@@ -128,7 +128,7 @@ BenchResult bench_tinyio_fiber(const Options& opts, std::span<const std::byte> b
 
   tinyio::UniqueFd fd{raw_fd};
   tinyio::IoOptions io_opts;
-  tinyio::IO io(0, io_opts, {});
+  tinyio::IO io(0, io_opts);
 
   std::optional<tinyio::Result<void>> result;
 
@@ -175,7 +175,7 @@ BenchResult bench_tinyio_concurrent(const Options& opts, std::span<const std::by
 
   tinyio::UniqueFd fd{raw_fd};
   tinyio::IoOptions io_opts;
-  tinyio::IO io(0, io_opts, {});
+  tinyio::IO io(0, io_opts);
 
   const auto start = Clock::now();
 

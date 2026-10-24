@@ -1,4 +1,3 @@
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -7,6 +6,7 @@
 #include <thread>
 
 #include <gtest/gtest.h>
+#include <sys/wait.h>
 
 #include "tinyio/fiber_sync.hpp"
 #include "tinyio/runtime.hpp"
@@ -24,7 +24,7 @@ struct Accessor {
 // 1. stop_token_cancels_waiting
 TEST(ShutdownCancellationTest, StopTokenCancelsWaiting) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
   std::stop_source ss;
 
   bool fiber_ran = false;
@@ -60,7 +60,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsWaiting) {
 // 2. stop_token_cancels_ready
 TEST(ShutdownCancellationTest, StopTokenCancelsReady) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
   std::stop_source ss;
 
   bool fiber_started = false;
@@ -97,7 +97,7 @@ TEST(ShutdownCancellationTest, StopTokenCancelsReady) {
 TEST(ShutdownCancellationTest, DestructorCancelsLiveWork) {
   IoOptions opts;
   {
-    IO io(0, opts, {});
+    IO io(0, opts);
     auto res = io.Spawn([](IO& rt) noexcept {
       (void)rt.SleepForNs(std::chrono::nanoseconds(10'000'000'000ULL));  // 10s
     });
@@ -117,7 +117,7 @@ TEST(ShutdownCancellationTest, DestructorAbortsWrongThread) {
   IoOptions opts;
   EXPECT_DEATH(
       {
-        auto io = std::make_unique<IO>(0, opts, std::vector<tinyio::BucketConfig>{});
+        auto io = std::make_unique<IO>(0, opts);
 
         auto activate_ptr = get(ActivateTag{});
         (void)(io.get()->*activate_ptr)();
@@ -135,7 +135,7 @@ TEST(ShutdownCancellationTest, DestructorAbortsWrongThread) {
 // 5. syscall_returns_ecanceled
 TEST(ShutdownCancellationTest, SyscallReturnsEcanceled) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
   std::stop_source ss;
 
   bool fiber_finished = false;
@@ -173,7 +173,7 @@ TEST(ShutdownCancellationTest, SyscallReturnsEcanceled) {
 // 6. double_run
 TEST(ShutdownCancellationTest, DoubleRun) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
 
   bool pass1 = false;
   (void)io.Spawn([&](IO&) noexcept { pass1 = true; });
@@ -241,7 +241,7 @@ TEST_P(AbandonedParkTest, StopAbortsInsteadOfHanging) {
       {
         IoOptions opts;
         opts.loop_style = GetParam();
-        IO io(0, opts, {});
+        IO io(0, opts);
         Latch never(io, 1);
         (void)io.Spawn([&](IO&) noexcept { (void)never.Wait(); });
         (void)io.Spawn([](IO& rt) noexcept {
@@ -258,7 +258,7 @@ TEST_P(AbandonedParkTest, RunUntilDoneAbortsInsteadOfHanging) {
       {
         IoOptions opts;
         opts.loop_style = GetParam();
-        IO io(0, opts, {});
+        IO io(0, opts);
         Latch never(io, 1);
         (void)io.Spawn([&](IO&) noexcept { (void)never.Wait(); });
         ShutdownWatchdog watchdog;
@@ -275,7 +275,7 @@ INSTANTIATE_TEST_SUITE_P(LoopStyles, AbandonedParkTest,
 // succeeds, so the waiter unlocks and the mutex ends up free.
 TEST(ShutdownCancellationTest, MutexHandoffDuringShutdownSucceeds) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
   Mutex mu(io);
   bool waiter_locked = false;
 
@@ -302,7 +302,7 @@ TEST(ShutdownCancellationTest, MutexHandoffDuringShutdownSucceeds) {
 // by the runtime, and leaves its scope with the group empty.
 TEST(ShutdownCancellationTest, TaskGroupParentWokenByCancelledChildren) {
   IoOptions opts;
-  IO io(0, opts, {});
+  IO io(0, opts);
   int cancelled_children = 0;
   bool parent_done = false;
 

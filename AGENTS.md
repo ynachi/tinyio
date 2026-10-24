@@ -28,6 +28,17 @@ command per task.
   for logging and serialization. YLT is header-only here and only the easylog
   and struct_pack modules are reachable — `cmake/TinyioDependencies.cmake`
   turns every optional YLT backend off with the `YLT_ENABLE_*` switches.
+- **Photon is only fetched when the Photon benchmarks are switched on**
+  (`-DTINYIO_BUILD_PHOTON_BENCH=ON`). It is used by the two comparison
+  benchmarks (`net_perf_photon`, `photon_disk_bench`) and by nothing else in
+  the tree. It is tracked as `main`, and its `fs/cache/persistent_cache` does
+  not compile with clang: `va_arg(args, std::string)` is ill-formed and clang
+  reports it as an error that `-w` and `-Wno-non-pod-varargs` cannot
+  suppress. That is upstream, not tinyio: it reproduces on a pristine tree.
+  Fetching Photon unconditionally used to break `make release` under clang
+  21/22 even though the Photon benchmarks are off by default; now the
+  dependency is skipped unless something actually uses it, and building the
+  Photon benchmarks themselves still needs GCC.
 
 ## Installing
 
@@ -178,6 +189,14 @@ interleaved samples, **fast-tier median** (the link is tri-modal, see below):
 - Code lives under `/tmp/bench/` on the remote: `tinyio` (working clone),
   `tinyio_port` (clean clone of this tree used to build the benchmarks),
   `kio_v2`, `ylt`.
+- **After an `rsync` to a remote build tree, touch the sources.** `rsync -a`
+  preserves mtimes, so an object compiled before a header edit can look newer
+  than that header and ninja will not rebuild it. The tree then mixes objects
+  compiled against two different layouts of `IO`, and the fiber machinery
+  crashes on a garbage `current_fiber_` — a build bookkeeping bug that looks
+  exactly like a memory corruption in the hand-written context switch.
+  `find <tree>/src <tree>/tests -name '*.cc' -o -name '*.hpp' | xargs touch`
+  before rebuilding a tree that was synced.
 
 ### The disk box has two modes — always control for it
 
@@ -225,6 +244,63 @@ landed on opposite sides of the gap and produced an apparent −2.5 % that was
 pure mix. Bucket the samples by tier first (the largest gap in the sorted p99
 values splits them cleanly: ~3.3 ms → ~7.8 ms), then compare the arms inside
 each tier. Per tier the arms agree to well under 1 %.
+
+## Fixed buffers
+
+tinyio's fixed buffer facility is kio's, ported over: a pool of fixed-size
+slots carved out of one huge-page backed mapping and registered with the ring,
+so a read or a write can name the slot instead of an address and the kernel
+does not have to copy through a bounce buffer.
+
+One runtime, one pool, as in kio. The pool is an option: when
+`IoOptions::buffer_pool` is set, the runtime maps the pool and registers it
+with the ring at construction. There is no public registration API.
+
+```cpp
+IoOptions opts;
+opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 256};
+IO io(0, opts);
+
+// Inside a fiber
+auto buf = TRY(io.TakeFixedBuffer());       // non-blocking, EAGAIN when empty
+auto wait = io.AcquireFixedBuffer();        // parks the fiber when empty
+auto n    = TRY(io.ReadFixed(fd, *buf, buf->Size()));
+// the slot goes back to its pool when the lease is destroyed
+```
+
+Invariants worth knowing before touching this code:
+
+- **Slot size is a power of two >= 4096 that divides 1 GiB.** io_uring caps a
+  registered iovec at 1 GiB, so the mapping is registered as consecutive 1 GiB
+  chunks and 1 GiB has to be an exact multiple of the slot size -- otherwise a
+  slot would straddle two registered entries and no single `buf_index` would
+  cover it.
+- **One iovec per chunk, not per slot.** The `buf_index` is computed from the
+  pointer (`first_index_ + ((ptr - base_) >> 30)`), so the kernel's registered
+  buffer table holds a handful of entries instead of one per slot. That table
+  is much smaller than the number of slots a pool has.
+- **The mapping is 2 MiB-aligned and `MADV_HUGEPAGE`d**, base *and* length:
+  fewer TLB misses during DMA.
+- **Registered pages are pinned.** Without `CAP_IPC_LOCK` they count against
+  `RLIMIT_MEMLOCK` (`ulimit -l`); past it the constructor throws ENOMEM and
+  logs the hint.
+- **A released slot is handed to the oldest waiter**, not put back on the free
+  list, so a new arrival cannot steal the slot a woken fiber is about to
+  receive. Waiters are served strictly FIFO. A slot handed over is the
+  waiter's even if the pool closes before the waiter runs.
+- **The runtime never closes its pool on shutdown** (kio's model). A fiber
+  parked in `AcquireFixedBuffer()` is a sync park like any other: once the
+  runtime has quiesced nothing can release a slot to it, so
+  `AbortIfParkedFibers()` aborts. A leaked lease is a bug, not a shutdown
+  path.
+- **`ReadFixed`/`WriteFixed` only take this runtime's slots.** The kernel
+  resolves `buf_index` against this ring's table, so a slot from any other
+  pool is a CHECK failure. A buffer offset outside the slot or a zero length
+  is EINVAL; a length past the slot is clamped.
+- **The pool is detached before the fibers are destroyed.** `Detach()` drops
+  the waiters and the owner link, so the pool's destructor wakes nobody.
+- **Leases must not outlive the runtime.** The runtime owns the pool; a
+  lease destroyed after it returns its slot to freed memory.
 
 ## Known knobs
 

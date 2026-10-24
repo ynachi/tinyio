@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -31,6 +33,9 @@ inline constexpr unsigned k_uring_default_additional_flag =
 /// These are mandatory base flags
 inline constexpr unsigned k_uring_base_flags =
     IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_R_DISABLED;
+
+/// The largest length io_uring accepts for a single read or write.
+inline constexpr size_t kMaxRwLen = 0x7ffff000;
 
 /// Default io accept flags
 inline constexpr int k_default_accept_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -104,6 +109,14 @@ struct IoOptions {
 
   /// Total number of fibers which can be recycle
   std::size_t max_idle_fibers = 1024;
+
+  /// The runtime's fixed buffer pool: one runtime, one pool. When set, the
+  /// runtime maps the pool and registers it with the ring at construction;
+  /// unset, the fixed-buffer API is unavailable.
+  ///
+  /// Registered pages are pinned: without CAP_IPC_LOCK they count against
+  /// RLIMIT_MEMLOCK (`ulimit -l`), and construction throws ENOMEM past it.
+  std::optional<BufferPoolConfig> buffer_pool{};
 };
 
 class IO final {
@@ -130,7 +143,7 @@ class IO final {
   ///@}
 
   /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
-  explicit IO(size_t id, const IoOptions& opts, std::vector<BucketConfig> pool_configs);
+  explicit IO(size_t id, const IoOptions& opts);
 
   /// Destroys the runtime and releases ring resources and all fiber stacks.
   ///
@@ -219,13 +232,35 @@ class IO final {
   /// Returns true if the runtime is currently stopping
   [[nodiscard]] bool Stopping() const noexcept { return stopping_; }
 
-  /// Register a fixed buffer pool
-  Result<void> RegisterBuffers(FixedBufferPool& pool) noexcept;
-  Result<void> UnregisterBuffers() noexcept;
-  [[nodiscard]] FixedBufferPool& GetBufferPool() noexcept { return buffer_pool_; }
-  [[nodiscard]] Result<FixedBuffer> TakeFixedBuffer(const size_t size) noexcept {
-    return buffer_pool_.Take(size);
+  /// @name Fixed buffers
+  ///
+  /// A fixed buffer is a slot of the runtime's pool (IoOptions::buffer_pool).
+  /// The pool is registered with the ring at construction, so a read or a
+  /// write can name the slot instead of an address and the kernel does not
+  /// have to copy through a bounce buffer.
+  ///@{
+
+  /// The runtime's pool, or nullptr when IoOptions::buffer_pool is unset.
+  [[nodiscard]] const FixedBufferPool* BufferPool() const noexcept {
+    return buffer_pool_ ? &*buffer_pool_ : nullptr;
   }
+
+  /// Take a slot without blocking.
+  ///
+  /// @return The slot, or EAGAIN when the pool is exhausted.
+  /// @note Aborts when the runtime has no pool.
+  [[nodiscard]] Result<FixedBuffer> TakeFixedBuffer() noexcept;
+
+  /// Take a slot, parking the running fiber while the pool is empty.
+  ///
+  /// The fiber wakes when a released slot is handed to it. Like any sync
+  /// park, shutdown does not cancel it: a fiber still parked here once the
+  /// runtime has quiesced waits for a lease nobody will release, and the
+  /// runtime aborts (see AbortIfParkedFibers()).
+  /// @note Owner-thread only, inside a fiber. Aborts when the runtime has no
+  ///       pool.
+  [[nodiscard]] Result<FixedBuffer> AcquireFixedBuffer() noexcept;
+  ///@}
 
   // =====
   // IO Methods
@@ -237,12 +272,16 @@ class IO final {
   /// a pinned buffer because @p buf is already registered with the ring.
   /// Pass @p offset = -1 to use the file's current position.
   ///
+  /// The transfer covers [buffer_offset, buffer_offset + len) of the slot.
+  /// A @p buffer_offset outside the slot or a zero @p len is an EINVAL; a
+  /// @p len past the end of the slot is clamped to what is left of it.
+  ///
   /// @return Number of bytes written, or an error code.
   ///
   /// @code
-  /// TRY(buf, fio.take_fixed_buffer(4096));
-  /// std::memcpy(buf.ptr(), data.data(), data.size());
-  /// TRY(n, fio.write_fixed(fd, buf, data.size(), file_offset));
+  /// auto buf = TRY(fio.TakeFixedBuffer());
+  /// std::memcpy(buf.Ptr(), data.data(), data.size());
+  /// auto n = TRY(fio.WriteFixed(fd, buf, data.size(), file_offset));
   /// @endcode
   [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                             size_t len, off_t file_offset = -1,
@@ -258,12 +297,14 @@ class IO final {
   /// Uses io_uring's READ_FIXED operation.
   /// Pass @p file_offset = -1 to use the file's current position.
   ///
+  /// Same range contract as WriteFixed().
+  ///
   /// @return Number of bytes read, or an error code.
   ///
   /// @code
-  /// TRY(buf, fio.take_fixed_buffer(4096));
-  /// TRY(n, fio.read_fixed(fd, buf, 4096, 0));
-  /// std::string_view content{reinterpret_cast<const char*>(buf.ptr()),
+  /// auto buf = TRY(fio.TakeFixedBuffer());
+  /// auto n = TRY(fio.ReadFixed(fd, buf, buf.Size(), 0));
+  /// std::string_view content{reinterpret_cast<const char*>(buf.Ptr()),
   ///                          static_cast<size_t>(n)};
   /// @endcode
   [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf,
@@ -611,7 +652,8 @@ class IO final {
   std::size_t id_;  ///  Id of the worker in a multi-threaded context
   IoOptions opts_;
 
-  FixedBufferPool buffer_pool_;
+  /// The fixed buffer pool, registered with the ring (IoOptions::buffer_pool).
+  std::optional<FixedBufferPool> buffer_pool_;
 
   //
   // Fiber management
@@ -653,6 +695,9 @@ class IO final {
 
   /// Initializes the io_uring instance and validates required opcodes.
   [[nodiscard]] Result<void> Initialize() noexcept;
+
+  /// True when @p buf is a slot of this runtime's (registered) pool.
+  [[nodiscard]] bool OwnsBuffer(const FixedBuffer& buf) const noexcept;
 
   /// Issue IORING_OP_ASYNC_CANCEL for every waiting fiber, submit, then drive
   /// tick() until all in-flight ops and ready fibers are drained.

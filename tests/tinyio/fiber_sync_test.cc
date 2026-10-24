@@ -13,7 +13,7 @@ using namespace tinyio;
 class FiberSyncTest : public ::testing::Test {
  protected:
   IoOptions opts_;
-  IO io_{0, opts_, {}};
+  IO io_{0, opts_};
 };
 
 // ── FiberLatch ──────────────────────────────────────────────────────────────

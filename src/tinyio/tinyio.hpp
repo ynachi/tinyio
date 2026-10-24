@@ -3,7 +3,7 @@
 ///
 /// \code
 ///   auto listener = TcpListener::Bind(8080).value();
-///   IO io{0, IoOptions{}, {}};
+///   IO io{0, IoOptions{}};
 ///   io.spawn([&listener](tinyio::IO& io) noexcept {
 ///       while (true) {
 ///           TRY(client, io.Accept(listener));

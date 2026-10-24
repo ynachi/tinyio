@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
 
   ELOGFMT(INFO, "listening on {}:{}", FLAGS_ip, FLAGS_port);
 
-  IO io{0, tinyio::IoOptions{}, {}};
+  IO io{0, tinyio::IoOptions{}};
 
   if (auto res = io.Spawn(server_loop); !res.has_value()) {
     ELOGFMT(ERROR, "failed to spawn server: [{}] {}", res.error().context(),

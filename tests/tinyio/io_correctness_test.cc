@@ -1,14 +1,19 @@
 #include <fcntl.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <stop_token>
+#include <system_error>
 #include <thread>
 
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 
 #include "tinyio/runtime.hpp"
@@ -19,7 +24,7 @@ using namespace std::chrono_literals;
 
 TEST(IOCorrectnessTest, FileWriteReadRoundtrip) {
   IoOptions opts;
-  IO io{0, opts, {}};
+  IO io{0, opts};
   (void)io.Spawn([](IO& fio) noexcept {
     auto file_path = std::filesystem::temp_directory_path() / "tinyio_test_file.txt";
 
@@ -49,7 +54,7 @@ TEST(IOCorrectnessTest, FileWriteReadRoundtrip) {
 
 TEST(IOCorrectnessTest, SleepForAccuracy) {
   IoOptions opts;
-  IO io{0, opts, {}};
+  IO io{0, opts};
   (void)io.Spawn([](IO& fio) noexcept {
     auto start = std::chrono::steady_clock::now();
     auto res = fio.SleepForNs(50ms);
@@ -64,17 +69,16 @@ TEST(IOCorrectnessTest, SleepForAccuracy) {
 
 TEST(IOCorrectnessTest, FixedBufferWriteRead) {
   IoOptions opts;
-  IO io{0, opts, {}};
-  FixedBufferPool pool{std::vector<BucketConfig>{{4096, 1}}};
-  ASSERT_TRUE(io.RegisterBuffers(pool).has_value());
+  opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 1};
+  IO io{0, opts};
 
-  (void)io.Spawn([&pool](IO& fio) noexcept {
+  (void)io.Spawn([](IO& fio) noexcept {
     auto file_path = std::filesystem::temp_directory_path() / "tinyio_test_fixed.txt";
     auto fd_res = fio.Open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
     ASSERT_TRUE(fd_res.has_value());
     UniqueFd fd = std::move(*fd_res);
 
-    auto buf_res = pool.Take(4096);
+    auto buf_res = fio.TakeFixedBuffer();
     ASSERT_TRUE(buf_res.has_value());
     auto& fixed_buf = *buf_res;
 
@@ -99,9 +103,81 @@ TEST(IOCorrectnessTest, FixedBufferWriteRead) {
   io.RunUntilDone();
 }
 
+// A range outside the slot is an EINVAL, not a wild pointer into the next
+// slot: the kernel resolves the buf_index against the registered table and
+// would happily write past the end of the buffer it was given.
+TEST(IOCorrectnessTest, FixedBufferRangeOutsideTheSlotIsRejected) {
+  IoOptions opts;
+  opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 1};
+  IO io{0, opts};
+
+  (void)io.Spawn([](IO& fio) noexcept {
+    auto file_path =
+        std::filesystem::temp_directory_path() / "tinyio_test_fixed_range.txt";
+    auto fd_res = fio.Open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ASSERT_TRUE(fd_res.has_value());
+    UniqueFd fd = std::move(*fd_res);
+
+    auto buf_res = fio.TakeFixedBuffer();
+    ASSERT_TRUE(buf_res.has_value());
+    auto& fixed_buf = *buf_res;
+
+    // The buffer offset is past the end of the slot:
+    // ReadFixed(fd, buf, len, file_offset, buffer_offset).
+    auto read_res = fio.ReadFixed(fd, fixed_buf, 16, 0, 4096);
+    ASSERT_FALSE(read_res.has_value());
+    EXPECT_EQ(read_res.error().value(), EINVAL);
+
+    // The length is zero.
+    auto write_res = fio.WriteFixed(fd, fixed_buf, 0, 0);
+    ASSERT_FALSE(write_res.has_value());
+    EXPECT_EQ(write_res.error().value(), EINVAL);
+
+    // A length that runs past the end of the slot is clamped to what is
+    // left of it, so the transfer stays inside the registered buffer.
+    auto clamped = fio.WriteFixed(fd, fixed_buf, 8192, 0, 4090);
+    ASSERT_TRUE(clamped.has_value());
+    EXPECT_EQ(*clamped, 6u);
+
+    (void)fio.Close(std::move(fd));
+    (void)fio.Remove(file_path);
+  });
+  io.RunUntilDone();
+}
+
+// The destructor does not run when the constructor throws, so a failed
+// initialization has to release the ring and the eventfd itself. Run in a
+// child: lowering RLIMIT_NOFILE below the direct fd table size makes
+// io_uring_register_files fail with EMFILE after both were created.
+TEST(IOCorrectnessTest, FailedInitReleasesRingAndEventfd) {
+  const auto construct_with_too_few_fds = [] {
+    const auto open_fds = [] {
+      return std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                           std::filesystem::directory_iterator{});
+    };
+    const rlimit limit{.rlim_cur = 64, .rlim_max = 64};
+    if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+      std::_Exit(2);
+    }
+
+    IoOptions opts;
+    opts.direct_fd_table_size = 1024;
+    const auto before = open_fds();
+    bool threw = false;
+    try {
+      IO io{0, opts};
+    } catch (const std::system_error&) {
+      threw = true;
+    }
+    std::_Exit(threw && open_fds() == before ? 0 : 1);
+  };
+
+  EXPECT_EXIT(construct_with_too_few_fds(), ::testing::ExitedWithCode(0), "");
+}
+
 TEST(IOCorrectnessTest, TcpAcceptEcho) {
   IoOptions opts;
-  IO io{0, opts, {}};
+  IO io{0, opts};
 
   auto server_fd_res = TcpListener::Bind(0, "127.0.0.1");
   ASSERT_TRUE(server_fd_res.has_value());

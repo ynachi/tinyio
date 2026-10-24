@@ -5,7 +5,7 @@
 
 int main() {
   tinyio::IoOptions opts;
-  tinyio::IO io(0, opts, {});
+  tinyio::IO io(0, opts);
 
   constexpr size_t iterations = 10000000;
 

@@ -1,122 +1,181 @@
 #include "buffer_pool.hpp"
 
-#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <system_error>
 #include <utility>
 
-#include <ylt/easylog.hpp>
+#include <sys/mman.h>
+
+#include "runtime.hpp"
 
 namespace tinyio {
-FixedBuffer::FixedBuffer(FixedBuffer&& other) noexcept
-    : index_(std::exchange(other.index_, k_invalid_buf_index)),
-      bucket_id_(other.bucket_id_),
-      view_(other.view_),
-      pool_(std::exchange(other.pool_, nullptr)) {}
-
-FixedBuffer& FixedBuffer::operator=(FixedBuffer&& other) noexcept {
-  if (this != &other) [[likely]] {
-    Release();
-    index_ = std::exchange(other.index_, k_invalid_buf_index);
-    bucket_id_ = other.bucket_id_;
-    view_ = other.view_;
-    pool_ = std::exchange(other.pool_, nullptr);
-  }
-  return *this;
-}
 
 void FixedBuffer::Release() noexcept {
-  if (pool_ && index_ != k_invalid_buf_index) {
-    pool_->Release(index_, bucket_id_);
-    index_ = k_invalid_buf_index;
-    pool_ = nullptr;
+  if (pool_ != nullptr) {
+    auto* pool = std::exchange(pool_, nullptr);
+    data_ = nullptr;
+    size_ = 0;
+    pool->Release(ordinal_);
   }
 }
 
-FixedBufferPool::Bucket::Bucket(const size_t size, const size_t count,
-                                const uint32_t start)
-    : slot_size(size), start_index(start), slab(nullptr, std::free) {
-  // Allocate page-aligned slab (required for io_uring fixed buffers + O_DIRECT)
-  void* ptr = nullptr;
-  const size_t total = size * count;
+uint16_t FixedBuffer::Index() const noexcept {
+  CHECK(pool_ != nullptr) << "FixedBuffer::index on an empty lease";
+  return pool_->RegistrationIndex(data_);
+}
 
-  if (posix_memalign(&ptr, k_buffer_alignment, total) != 0) {
-    throw std::bad_alloc();
+FixedBufferPool::FixedBufferPool(const size_t slot_size, const uint32_t slots)
+    : slot_size_(slot_size), slots_(slots) {
+  // Invariant 2: slot_size must be a power of two >= 4096 dividing 1 GiB.
+  if (slot_size < kPageSize || (slot_size & (slot_size - 1)) != 0 ||
+      (kOneGiB % slot_size) != 0) {
+    throw std::invalid_argument(
+        "slot_size must be a power of two >= 4096 that evenly divides 1 GiB");
   }
-  slab.reset(static_cast<std::byte*>(ptr));
 
-  free_stack.reserve(count);
-  for (uint32_t i = 0; i < count; ++i) {
-    free_stack.push_back(start + static_cast<uint32_t>(count - 1 - i));
+  if (slots == 0) {
+    throw std::invalid_argument("slots must be > 0");
+  }
+
+  // No overflow check: slot_size is validated <= 1 GiB above and slots fits
+  // uint32_t, so the product is bounded below 2^62.
+  total_bytes_ = slot_size_ * static_cast<size_t>(slots_);
+
+  // Invariant 1: align BOTH length and base to 2 MiB for THP. Map one extra
+  // 2 MiB, carve an aligned base out of the mapping, and return the head and
+  // tail slivers so the final mapping is exactly [base_, base_ +
+  // allocated_bytes_) on a 2 MiB boundary.
+  allocated_bytes_ = (total_bytes_ + kHugePageSize - 1) & ~(kHugePageSize - 1);
+
+  // Pre-reserve the free list so Release() stays noexcept in steady state.
+  free_slots_.reserve(slots_);
+  for (uint32_t i = slots_; i != 0; --i) {
+    free_slots_.push_back(i - 1);
+  }
+
+  const size_t map_bytes = allocated_bytes_ + kHugePageSize;
+  void* mapping = ::mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    throw std::system_error(errno, std::system_category(), "mmap buffer pool failed");
+  }
+
+  const auto raw = reinterpret_cast<uintptr_t>(mapping);
+  const auto aligned = (raw + kHugePageSize - 1) & ~(kHugePageSize - 1);
+  base_ = reinterpret_cast<std::byte*>(aligned);
+  (void)::munmap(mapping, aligned - raw);
+  (void)::munmap(base_ + allocated_bytes_,
+                 (raw + map_bytes) - (aligned + allocated_bytes_));
+
+  (void)::madvise(base_, allocated_bytes_, MADV_HUGEPAGE);
+}
+
+FixedBufferPool::~FixedBufferPool() noexcept {
+  Close();
+
+  if (base_ != nullptr) {
+    (void)::munmap(base_, allocated_bytes_);
+    base_ = nullptr;
   }
 }
 
-[[nodiscard]] Result<uint32_t> FixedBufferPool::Bucket::Pop() noexcept {
-  if (free_stack.empty()) [[unlikely]] {
-    // resize is not allowed
-    return Error::fail_errno(EAGAIN, "fixed_buffer_pool.pop");
+Result<FixedBuffer> FixedBufferPool::Take() noexcept {
+  if (closed_) {
+    return Error::fail_errc(std::errc::operation_canceled, "pool closed");
   }
-  const uint32_t idx = free_stack.back();
-  free_stack.pop_back();
-  return idx;
+  if (free_slots_.empty()) {
+    return Error::fail_errno(EAGAIN, "fixed_buffer_pool.take");
+  }
+
+  // LIFO pop: the most recently used slot is the hot one in cache.
+  const uint32_t ordinal = free_slots_.back();
+  free_slots_.pop_back();
+  return MakeLease(ordinal);
 }
 
-FixedBufferPool::FixedBufferPool(std::vector<BucketConfig> configs) {
-  if (configs.size() == 0) {
+Result<FixedBuffer> FixedBufferPool::Acquire(IO& io) noexcept {
+  CHECK(io.IsOwnerThread()) << "FixedBufferPool::acquire called from a foreign thread";
+
+  if (owner_ == nullptr) {
+    owner_ = &io;
+  }
+  CHECK(owner_ == &io) << "FixedBufferPool::acquire called with a foreign runtime";
+
+  if (auto buffer = Take(); buffer.has_value()) {
+    return buffer;
+  }
+  if (closed_) {
+    return Error::fail_errc(std::errc::operation_canceled, "pool closed");
+  }
+
+  auto* fiber = io.RunningFiber();
+  CHECK(fiber != nullptr) << "FixedBufferPool::acquire called outside a fiber";
+
+  // Park until a slot is handed to us, or the pool is closed.
+  waiters_.Push(fiber);
+  io.ParkRunning();
+
+  // Resumed. A slot handed over is ours even if the pool closed before we
+  // ran: checking closed_ first would strand it in handed_ for good.
+  uint32_t ordinal = 0;
+  if (handed_.Pop(ordinal)) {
+    return MakeLease(ordinal);
+  }
+  // Woken without a slot: only Close() does that.
+  return Error::fail_errc(std::errc::operation_canceled, "pool closed");
+}
+
+void FixedBufferPool::Close() noexcept {
+  if (closed_) {
+    return;
+  }
+  closed_ = true;
+
+  // Wake every parked fiber: each one resumes with operation_canceled.
+  while (!waiters_.Empty()) {
+    detail::fiber::Fiber* fiber = nullptr;
+    if (!waiters_.Pop(fiber)) {
+      break;
+    }
+    if (owner_ != nullptr) {
+      owner_->Unpark(fiber);
+    }
+  }
+}
+
+uint16_t FixedBufferPool::AppendRegions(std::vector<iovec>& table) {
+  first_index_ = static_cast<uint16_t>(table.size());
+
+  // io_uring caps a registered iovec at 1 GiB, so the mapping is registered
+  // as consecutive 1 GiB chunks (the last one shorter).
+  for (size_t offset = 0; offset < total_bytes_; offset += kOneGiB) {
+    const size_t length = std::min(kOneGiB, total_bytes_ - offset);
+    CHECK(table.size() < 65535) << "registered buffer index space exhausted";
+    table.push_back(iovec{.iov_base = base_ + offset, .iov_len = length});
+  }
+  return first_index_;
+}
+
+void FixedBufferPool::Release(const uint32_t ordinal) noexcept {
+  if (closed_) {
+    // Nobody can be waiting for a slot anymore; the pool is going away.
+    free_slots_.push_back(ordinal);
     return;
   }
 
-  // Sort by slot_size ascending for efficient binary search in take()
-  std::ranges::sort(configs,
-                    [](const auto& a, const auto& b) { return a.size < b.size; });
-
-  // Validate: all sizes must be page-aligned for io_uring + O_DIRECT compatibility
-  for (const auto& cfg : configs) {
-    if (cfg.size % 4096 != 0) {
-      throw std::invalid_argument(
-          "slot_size must be page-aligned (multiple of 4096) for io_uring fixed buffers");
+  // Direct handoff (Invariant 4): the slot goes to the oldest waiter instead
+  // of back on the free list, so a new arrival cannot steal it.
+  detail::fiber::Fiber* fiber = nullptr;
+  if (!waiters_.Empty() && waiters_.Pop(fiber)) {
+    handed_.Push(ordinal);
+    if (owner_ != nullptr) {
+      owner_->Unpark(fiber);
     }
+    return;
   }
 
-  // Build buckets + global iovec array
-  uint32_t current_global_index = 0;
-  buckets_.reserve(configs.size());
-  for (const auto& config : configs) {
-    buckets_.emplace_back(config.size, config.count, current_global_index);
-
-    // Register each slot in the flattened iovec array
-    for (uint32_t i = 0; i < config.count; ++i) {
-      global_iovecs_.push_back(
-          {.iov_base = &buckets_.back().slab[i * config.size], .iov_len = config.size});
-    }
-    current_global_index += static_cast<uint32_t>(config.count);
-  }
-
-  ELOGFMT(INFO, "MultiSizeFixedBufferPool: {} buckets, {} total slots, {} MB allocated",
-          buckets_.size(), global_iovecs_.size(),
-          std::ranges::fold_left(configs, 0ull, [](size_t acc, const auto& c) {
-            return acc + c.size * c.count;
-          }) / (1024 * 1024));
+  free_slots_.push_back(ordinal);
 }
 
-[[nodiscard]] Result<FixedBuffer> FixedBufferPool::Take(const size_t size) noexcept {
-  // Binary search for first bucket with slot_size >= requested size
-  const auto it = std::ranges::lower_bound(buckets_, size, {}, &Bucket::slot_size);
-
-  if (it == buckets_.end()) [[unlikely]] {
-    return Error::fail_errno(ENOMEM, "fixed_buffer_pool.take");
-  }
-
-  Result<uint32_t> idx_res = it->Pop();
-  if (!idx_res.has_value()) [[unlikely]] {
-    return std::unexpected(idx_res.error());
-  }
-
-  const uint32_t bucket_id = static_cast<uint32_t>(it - buckets_.begin());
-  const uint32_t global_idx = *idx_res;
-
-  // Compute local offset within bucket's slab
-  const uint32_t local_idx = global_idx - it->start_index;
-  std::span view(&it->slab[local_idx * it->slot_size], it->slot_size);
-
-  return FixedBuffer(global_idx, bucket_id, view, this);
-}
 }  // namespace tinyio

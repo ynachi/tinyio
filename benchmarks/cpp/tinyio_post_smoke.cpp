@@ -32,7 +32,7 @@ static constexpr int kTotal = kProducers * kTasksPerProducer;
 static bool test_post_before_run() {
   std::atomic<int> counter{0};
   tinyio::IoOptions opts;
-  tinyio::IO io(0, opts, {});
+  tinyio::IO io(0, opts);
 
   {
     std::vector<std::jthread> producers;
@@ -77,7 +77,7 @@ static bool test_post_while_running() {
   // Construct and run IO on the runner thread so owner_tid_ == runner.
   std::jthread runner([&](std::stop_token st) {
     tinyio::IoOptions opts;
-    tinyio::IO io(0, opts, {});
+    tinyio::IO io(0, opts);
     io_ptr.store(&io, std::memory_order_release);
     io.Run(st);
     io_ptr.store(nullptr, std::memory_order_release);

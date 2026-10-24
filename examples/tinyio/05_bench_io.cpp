@@ -109,7 +109,7 @@ int main(int argc, char* argv[]) {
   IoOptions opts{.sq_entries = 4096};
 
   if (mode == "write" || mode == "read") {
-    IO worker(0, opts, {});
+    IO worker(0, opts);
     (void)worker.Spawn([&](IO& fio) noexcept {
       if (mode == "write")
         (void)DoWrite(fio, filename);
@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
       stop_sources.emplace_back();
       auto st = stop_sources.back().get_token();
       threads.emplace_back([i, st, opts] {
-        IO worker(i, opts, {});
+        IO worker(i, opts);
         // port is constexpr, so the inner lambda does not have to capture it.
         (void)worker.Spawn([](IO& fio) noexcept { (void)server_loop(fio, port); });
         worker.Run(st);

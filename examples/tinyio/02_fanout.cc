@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
 
   ELOGFMT(INFO, "probing {} target(s) on port {}", targets.size(), FLAGS_port);
 
-  IO io{0, tinyio::IoOptions{}, {}};
+  IO io{0, tinyio::IoOptions{}};
 
   if (auto res = io.Spawn(run_probes); !res.has_value()) {
     ELOGFMT(ERROR, "failed to spawn: [{}] {}", res.error().context(),

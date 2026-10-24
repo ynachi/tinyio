@@ -121,7 +121,7 @@ int main() {
     // Launch a new OS thread for each worker
     threads.emplace_back([i, st] {
       IoOptions opts{.sq_entries = 4096};
-      IO worker(i, opts, {});
+      IO worker(i, opts);
 
       // Spawn the initial accept loop fiber onto this worker
       (void)worker.Spawn([st](IO& fio) noexcept {

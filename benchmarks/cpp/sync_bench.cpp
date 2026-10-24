@@ -80,7 +80,7 @@ void bench_mutex_contended(tinyio::IO& io, size_t iterations) {
 
 int main() {
   tinyio::IoOptions opts;
-  tinyio::IO io(0, opts, {});
+  tinyio::IO io(0, opts);
 
   constexpr size_t iterations = 10000000;  // 10 million
   std::stop_source st;
