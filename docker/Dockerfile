@@ -8,10 +8,7 @@ FROM ubuntu:24.04
 ARG LLVM=20
 ENV DEBIAN_FRONTEND=noninteractive
 
-# libssl-dev is required: cmake/TinyioDependencies.cmake does
-# find_package(OpenSSL 3 REQUIRED). Without the -dev package CMake reports a
-# missing OPENSSL_CRYPTO_LIBRARY and configure fails before any build starts.
-# libgflags-dev is required: the gflags network benchmark links gflags::gflags.
+# libgflags-dev is required: the examples link gflags::gflags.
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -24,7 +21,6 @@ RUN apt-get update \
         cmake ninja-build make git pkg-config \
         ccache mold \
         gdb wrk \
-        libssl-dev \
         libgflags-dev \
  && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
 

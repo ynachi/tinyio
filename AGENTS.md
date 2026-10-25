@@ -22,10 +22,17 @@ command per task.
 - tinyio is Linux-only (liburing, and x86_64 / aarch64 only: the fiber
   context switch is hand-written assembly in `src/tinyio/detail/context.cc`);
   verify on srv401, not on macOS.
-- Dependencies are fetched: liburing, googletest, and **YLT** (yalantinglibs)
-  for logging and serialization. YLT is header-only here and only the easylog
-  and struct_pack modules are reachable — `cmake/TinyioDependencies.cmake`
-  turns every optional YLT backend off with the `YLT_ENABLE_*` switches.
+- Every dependency is declared in `cmake/TinyioDependencies.cmake` and
+  nowhere else. Fetched: liburing, **YLT** (yalantinglibs) for logging and
+  serialization, google/crc32c for the WAL checksums, googletest, and mimalloc
+  when enabled. From the system: gflags, for the examples only. YLT is
+  header-only here and only the easylog and struct_pack modules are reachable;
+  every optional YLT backend is off through the `YLT_ENABLE_*` switches.
+- The pinned liburing is downloaded and configured during CMake configure, so
+  `<liburing.h>` resolves for an IDE before the first build.
+- One library target, `tinyio::tinyio`: static by default, shared with
+  `TINYIO_BUILD_SHARED=ON`. Its headers are a `FILE_SET HEADERS` in
+  `src/tinyio/CMakeLists.txt`, so a new header goes on that list.
 
 ## Layout
 
@@ -75,16 +82,18 @@ lists are the specification.
   cinatra, iguana) are not installed.
 - `lib/libtinyio.{a,so}` and `lib/cmake/tinyio/` — the library and its CMake
   package.
+- `include/crc32c/`, `lib/libcrc32c.a` and `lib/cmake/Crc32c/` — google/crc32c,
+  which a static `libtinyio.a` still needs at link time.
 
 A consumer needs nothing but the prefix:
 
 ```cmake
 find_package(tinyio REQUIRED)
-target_link_libraries(app PRIVATE Tinyio::tinyio)
+target_link_libraries(app PRIVATE tinyio::tinyio)
 ```
 
-The package pulls liburing (>= 2.9, from the system), and
-OpenSSL in with `find_dependency()`. Note that it asks for a **system**
+The package pulls Threads, Crc32c and liburing (>= 2.9, from the system,
+through pkg-config) in with `find_dependency()`. Note that it asks for a **system**
 liburing, not the pinned 2.9 the build tree compiles against: the pinned one
 lives in the build tree and cannot be relocated. The shared flavour exports
 every symbol — tinyio has no export macros on its public API yet, so hidden
@@ -135,12 +144,13 @@ Three things are worth knowing before touching a log call:
   `easylog::init_log()` in `main`, which replaces them. Without an
   `init_log()` call easylog silently drops every record: its default logger
   never starts the writer thread.
-- **The format backend is pinned to `std::format`.**
-  `cmake/TinyioFmtShim/fmt/format.h` shadows the system fmt so easylog always
-  takes the `std::format` path. Otherwise the backend would depend on whether
-  the host happens to have fmt installed, and the fmt that ships with Ubuntu
-  25.04 (10.1.1) does not compile with clang 21 in the header-only mode
-  easylog forces. `TINYIO_USE_SYSTEM_FMT=ON` opts out.
+- **The format backend is pinned to `std::format`.** easylog would use the
+  host's fmt whenever `<fmt/format.h>` is installed, and the fmt that ships
+  with Ubuntu 25.04 (10.1.1) does not compile with clang 21 in the
+  header-only mode easylog forces. `src/tinyio/logging.hpp` keeps fmt out of
+  the include and points `ELOGFMT` at `std::format`, so **always include
+  `tinyio/logging.hpp`, never `<ylt/easylog.hpp>` directly**: a direct include
+  that comes first brings the host's fmt back.
 - **YLT is pinned to the `0.6.1` release tag**, not to a branch. 0.6.1 has the
   easylog fix for a lost wakeup in `appender::stop()`: the old code set the
   stop flag while holding the file mutex instead of the queue mutex the writer
@@ -153,7 +163,7 @@ Three things are worth knowing before touching a log call:
 
 easylog prints a stack trace on a fatal record, from `std::stacktrace` when
 the standard library can link it and from YLT's own backtrace helper
-otherwise. `cmake/TinyioStacktrace.cmake` probes which one works at configure
+otherwise. `cmake/TinyioToolchain.cmake` probes which one works at configure
 time: some toolchains ship the `<stacktrace>` header without the matching
 runtime support (GCC 15 headers on a GCC 16 runtime), and then every
 translation unit that reaches easylog's fatal path fails to link.

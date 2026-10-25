@@ -33,7 +33,7 @@
 // runtime. Fail the build instead.
 #if defined(__aarch64__) && \
     (defined(__ARM_FEATURE_PAC_DEFAULT) || defined(__ARM_FEATURE_BTI_DEFAULT))
-#  error "tinyio's context switch requires -mbranch-protection=none"
+#    error "tinyio's context switch requires -mbranch-protection=none"
 #endif
 
 #if defined(__x86_64__)
@@ -154,7 +154,7 @@ TinyioContextTrampoline:
 )");
 
 #else
-#  error "tinyio: context switching is implemented for x86_64 and aarch64 only"
+#    error "tinyio: context switching is implemented for x86_64 and aarch64 only"
 #endif
 
 extern "C" void TinyioContextTrampoline() noexcept;
@@ -167,28 +167,28 @@ namespace {
 // addresses = the order TinyioSwitchContext pops them in.
 #if defined(__x86_64__)
 struct InitialFrame {
-  std::uint32_t mxcsr;
-  std::uint16_t x87_cw;
-  std::uint16_t padding;
-  std::uintptr_t r15;
-  std::uintptr_t r14;
-  std::uintptr_t r13;  // entry function
-  std::uintptr_t r12;  // its argument
-  std::uintptr_t rbx;
-  std::uintptr_t rbp;             // 0: ends frame-pointer backtraces
-  std::uintptr_t return_address;  // TinyioContextTrampoline
+    std::uint32_t mxcsr;
+    std::uint16_t x87_cw;
+    std::uint16_t padding;
+    std::uintptr_t r15;
+    std::uintptr_t r14;
+    std::uintptr_t r13;  // entry function
+    std::uintptr_t r12;  // its argument
+    std::uintptr_t rbx;
+    std::uintptr_t rbp;             // 0: ends frame-pointer backtraces
+    std::uintptr_t return_address;  // TinyioContextTrampoline
 };
 static_assert(sizeof(InitialFrame) == 64);
 #elif defined(__aarch64__)
 struct InitialFrame {
-  std::uintptr_t x19;  // the entry function's argument
-  std::uintptr_t x20;  // entry function
-  std::uintptr_t x21_x28[8];
-  std::uintptr_t x29;  // 0: ends frame-pointer backtraces
-  std::uintptr_t x30;  // return address: TinyioContextTrampoline
-  double d8_d15[8];
-  std::uintptr_t fpcr;     // FP control state restored on first entry
-  std::uintptr_t padding;  // keeps the frame 16-byte aligned (176 total)
+    std::uintptr_t x19;  // the entry function's argument
+    std::uintptr_t x20;  // entry function
+    std::uintptr_t x21_x28[8];
+    std::uintptr_t x29;  // 0: ends frame-pointer backtraces
+    std::uintptr_t x30;  // return address: TinyioContextTrampoline
+    double d8_d15[8];
+    std::uintptr_t fpcr;     // FP control state restored on first entry
+    std::uintptr_t padding;  // keeps the frame 16-byte aligned (176 total)
 };
 static_assert(sizeof(InitialFrame) == 176);
 #endif
@@ -196,38 +196,38 @@ static_assert(sizeof(InitialFrame) == 176);
 }  // namespace
 
 void Make(Context& ctx, void* stack_top, const EntryFn fn, void* arg) noexcept {
-  // The frame sits at the very top of the stack, 16-byte aligned. When the
-  // switch has popped it, sp == top: aligned, as the ABI requires at the
-  // trampoline's call into fn.
-  auto top = reinterpret_cast<std::uintptr_t>(stack_top) & ~std::uintptr_t{15};
-  auto* frame = reinterpret_cast<InitialFrame*>(top) - 1;
-  *frame = InitialFrame{};
+    // The frame sits at the very top of the stack, 16-byte aligned. When the
+    // switch has popped it, sp == top: aligned, as the ABI requires at the
+    // trampoline's call into fn.
+    auto top = reinterpret_cast<std::uintptr_t>(stack_top) & ~std::uintptr_t{15};
+    auto* frame = reinterpret_cast<InitialFrame*>(top) - 1;
+    *frame = InitialFrame{};
 
-  const auto entry = reinterpret_cast<std::uintptr_t>(fn);
-  const auto trampoline = reinterpret_cast<std::uintptr_t>(&TinyioContextTrampoline);
-  const auto argument = reinterpret_cast<std::uintptr_t>(arg);
+    const auto entry = reinterpret_cast<std::uintptr_t>(fn);
+    const auto trampoline = reinterpret_cast<std::uintptr_t>(&TinyioContextTrampoline);
+    const auto argument = reinterpret_cast<std::uintptr_t>(arg);
 
 #if defined(__x86_64__)
-  // Inherit the creating thread's floating-point control state, as a new
-  // thread would.
-  std::uint16_t x87_cw = 0;
-  asm volatile("fnstcw %0" : "=m"(x87_cw));
-  frame->mxcsr = __builtin_ia32_stmxcsr();
-  frame->x87_cw = x87_cw;
-  frame->r13 = entry;
-  frame->r12 = argument;
-  frame->return_address = trampoline;
+    // Inherit the creating thread's floating-point control state, as a new
+    // thread would.
+    std::uint16_t x87_cw = 0;
+    asm volatile("fnstcw %0" : "=m"(x87_cw));
+    frame->mxcsr = __builtin_ia32_stmxcsr();
+    frame->x87_cw = x87_cw;
+    frame->r13 = entry;
+    frame->r12 = argument;
+    frame->return_address = trampoline;
 #elif defined(__aarch64__)
-  // Inherit the creating thread's FP control state, as a new thread would.
-  std::uint64_t fpcr = 0;
-  asm volatile("mrs %0, fpcr" : "=r"(fpcr));
-  frame->fpcr = fpcr;
-  frame->x19 = argument;
-  frame->x20 = entry;
-  frame->x30 = trampoline;
+    // Inherit the creating thread's FP control state, as a new thread would.
+    std::uint64_t fpcr = 0;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    frame->fpcr = fpcr;
+    frame->x19 = argument;
+    frame->x20 = entry;
+    frame->x30 = trampoline;
 #endif
 
-  ctx.sp = frame;
+    ctx.sp = frame;
 }
 
 }  // namespace tinyio::detail::context

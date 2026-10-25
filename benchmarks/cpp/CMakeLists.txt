@@ -2,28 +2,28 @@
 # dependency beyond tinyio itself, so the release preset can build it without
 # fetching anything.
 add_executable(tinyio_http_bench tinyio_http_bench.cpp)
-target_link_libraries(tinyio_http_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(tinyio_http_bench PRIVATE tinyio::tinyio)
 
 add_executable(tinyio_disk_bench tinyio_disk_bench.cpp)
-target_link_libraries(tinyio_disk_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(tinyio_disk_bench PRIVATE tinyio::tinyio)
 
 add_executable(tinyio_disk_read_bench tinyio_disk_read_bench.cpp)
-target_link_libraries(tinyio_disk_read_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(tinyio_disk_read_bench PRIVATE tinyio::tinyio)
 
 add_executable(tinyio_post_smoke tinyio_post_smoke.cpp)
-target_link_libraries(tinyio_post_smoke PRIVATE Tinyio::tinyio)
+target_link_libraries(tinyio_post_smoke PRIVATE tinyio::tinyio)
 
 add_executable(tinyio_dispatch_bench tinyio_dispatch_bench.cpp)
-target_link_libraries(tinyio_dispatch_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(tinyio_dispatch_bench PRIVATE tinyio::tinyio)
 
 add_executable(context_switch_bench context_switch_bench.cpp)
-target_link_libraries(context_switch_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(context_switch_bench PRIVATE tinyio::tinyio)
 
 add_executable(sync_bench sync_bench.cpp)
-target_link_libraries(sync_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(sync_bench PRIVATE tinyio::tinyio)
 
 add_executable(try_macro_bench try_macro_bench.cpp)
-target_link_libraries(try_macro_bench PRIVATE Tinyio::tinyio)
+target_link_libraries(try_macro_bench PRIVATE tinyio::tinyio)
 
 # Only tinyio's own benchmarks live here. The comparison benchmarks against
 # other libraries (kio, asio, helio, photon, coro_io) were removed: AGENTS.md

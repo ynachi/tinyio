@@ -1,13 +1,13 @@
 function(tinyio_configure_sanitizers)
-    add_library(tinyio-sanitizers INTERFACE)
-    add_library(tinyio::sanitizers ALIAS tinyio-sanitizers)
-
     if (TINYIO_USE_MIMALLOC AND NOT TINYIO_SANITIZER STREQUAL "none")
         message(FATAL_ERROR "mimalloc replaces the allocator the sanitizers need; use one or the other")
     endif ()
 
     # Sanitizers apply to every target, fetched dependencies included, so one
-    # build tree is instrumented consistently. mimalloc must stay off with them.
+    # build tree is instrumented consistently. That only holds because this
+    # runs before tinyio_configure_dependencies(): add_compile_options() does
+    # not reach targets that already exist. liburing is built by its own
+    # Makefile and stays uninstrumented. mimalloc must stay off with them.
     # ---------------------------------------------------------------------------
     if (TINYIO_SANITIZER STREQUAL "address")
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined)

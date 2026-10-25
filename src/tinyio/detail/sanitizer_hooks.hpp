@@ -5,36 +5,36 @@
 #include "tinyio/detail/stack.hpp"
 
 #if defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-#    define TINYIO_ASAN_ENABLED 1
-#  endif
-#  if __has_feature(thread_sanitizer)
-#    define TINYIO_TSAN_ENABLED 1
-#  endif
+#    if __has_feature(address_sanitizer)
+#        define TINYIO_ASAN_ENABLED 1
+#    endif
+#    if __has_feature(thread_sanitizer)
+#        define TINYIO_TSAN_ENABLED 1
+#    endif
 #endif
 
 #if defined(__SANITIZE_ADDRESS__)
-#  define TINYIO_ASAN_ENABLED 1
+#    define TINYIO_ASAN_ENABLED 1
 #endif
 
 #if defined(__SANITIZE_THREAD__)
-#  define TINYIO_TSAN_ENABLED 1
+#    define TINYIO_TSAN_ENABLED 1
 #endif
 
 #ifndef TINYIO_ASAN_ENABLED
-#  define TINYIO_ASAN_ENABLED 0
+#    define TINYIO_ASAN_ENABLED 0
 #endif
 #ifndef TINYIO_TSAN_ENABLED
-#  define TINYIO_TSAN_ENABLED 0
+#    define TINYIO_TSAN_ENABLED 0
 #endif
 
 // Prevents ASAN from creating fake-stack frames for a function.
 // Required on every function that calls TinyioSwitchContext, because
 // ASAN's fake-stack mechanism conflicts with hand-rolled stack switches.
 #if defined(__clang__) || defined(__GNUC__)
-#  define TIO_NO_SANITIZE_ADDRESS __attribute__((no_sanitize("address")))
+#    define TIO_NO_SANITIZE_ADDRESS __attribute__((no_sanitize("address")))
 #else
-#  define TIO_NO_SANITIZE_ADDRESS
+#    define TIO_NO_SANITIZE_ADDRESS
 #endif
 
 #if TINYIO_ASAN_ENABLED
@@ -42,20 +42,17 @@
 // libasan and Clang's compiler-rt export these two symbols; declaring them
 // weak keeps the link working on runtimes that do not implement them, in
 // which case the fiber switch simply stays uninstrumented.
-#  if defined(__clang__) || defined(__GNUC__)
+#    if defined(__clang__) || defined(__GNUC__)
 extern "C" void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom,
                                                std::size_t size) __attribute__((weak));
-extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save,
-                                                const void** bottom_old,
-                                                std::size_t* size_old)
-    __attribute__((weak));
-#  else
+extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_old,
+                                                std::size_t* size_old) __attribute__((weak));
+#    else
 extern "C" void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom,
                                                std::size_t size);
-extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save,
-                                                const void** bottom_old,
+extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_old,
                                                 std::size_t* size_old);
-#  endif
+#    endif
 #endif
 
 #if TINYIO_TSAN_ENABLED
@@ -68,73 +65,73 @@ extern "C" void __tsan_switch_to_fiber(void* fiber, unsigned flags);
 namespace tinyio::detail {
 
 struct ToolFiberState {
-  void* asan_fake_stack = nullptr;
-  void* tsan_fiber = nullptr;
-  bool owns_tsan_fiber = false;
+    void* asan_fake_stack = nullptr;
+    void* tsan_fiber = nullptr;
+    bool owns_tsan_fiber = false;
 };
 
 inline void ToolsCaptureCurrentThread(ToolFiberState& state) noexcept {
 #if TINYIO_TSAN_ENABLED
-  state.tsan_fiber = __tsan_get_current_fiber();
-  state.owns_tsan_fiber = false;
+    state.tsan_fiber = __tsan_get_current_fiber();
+    state.owns_tsan_fiber = false;
 #else
-  (void)state;
+    (void)state;
 #endif
 }
 
 inline void ToolsCreateFiber(ToolFiberState& state) noexcept {
 #if TINYIO_ASAN_ENABLED
-  state.asan_fake_stack = nullptr;
+    state.asan_fake_stack = nullptr;
 #endif
 #if TINYIO_TSAN_ENABLED
-  state.tsan_fiber = __tsan_create_fiber(0);
-  state.owns_tsan_fiber = true;
+    state.tsan_fiber = __tsan_create_fiber(0);
+    state.owns_tsan_fiber = true;
 #else
-  (void)state;
+    (void)state;
 #endif
 }
 
 inline void ToolsDestroyFiber(ToolFiberState& state) noexcept {
 #if TINYIO_TSAN_ENABLED
-  if (state.tsan_fiber != nullptr && state.owns_tsan_fiber) {
-    __tsan_destroy_fiber(state.tsan_fiber);
-  }
-  state.tsan_fiber = nullptr;
-  state.owns_tsan_fiber = false;
+    if (state.tsan_fiber != nullptr && state.owns_tsan_fiber) {
+        __tsan_destroy_fiber(state.tsan_fiber);
+    }
+    state.tsan_fiber = nullptr;
+    state.owns_tsan_fiber = false;
 #else
-  (void)state;
+    (void)state;
 #endif
 }
 
 inline void ToolsBeforeSwitch(ToolFiberState& from, ToolFiberState* to_tools,
                               const stack::Stack* to_stack) noexcept {
 #if TINYIO_ASAN_ENABLED
-  const void* bottom = to_stack == nullptr ? nullptr : to_stack->low;
-  const std::size_t size = to_stack == nullptr ? 0U : to_stack->usable_size;
-  if (__sanitizer_start_switch_fiber != nullptr) {
-    __sanitizer_start_switch_fiber(&from.asan_fake_stack, bottom, size);
-  }
+    const void* bottom = to_stack == nullptr ? nullptr : to_stack->low;
+    const std::size_t size = to_stack == nullptr ? 0U : to_stack->usable_size;
+    if (__sanitizer_start_switch_fiber != nullptr) {
+        __sanitizer_start_switch_fiber(&from.asan_fake_stack, bottom, size);
+    }
 #else
-  (void)from;
-  (void)to_stack;
+    (void)from;
+    (void)to_stack;
 #endif
 
 #if TINYIO_TSAN_ENABLED
-  if (to_tools != nullptr && to_tools->tsan_fiber != nullptr) {
-    __tsan_switch_to_fiber(to_tools->tsan_fiber, 0);
-  }
+    if (to_tools != nullptr && to_tools->tsan_fiber != nullptr) {
+        __tsan_switch_to_fiber(to_tools->tsan_fiber, 0);
+    }
 #else
-  (void)to_tools;
+    (void)to_tools;
 #endif
 }
 
 inline void ToolsAfterSwitch(const ToolFiberState& current) noexcept {
 #if TINYIO_ASAN_ENABLED
-  if (__sanitizer_finish_switch_fiber != nullptr) {
-    __sanitizer_finish_switch_fiber(current.asan_fake_stack, nullptr, nullptr);
-  }
+    if (__sanitizer_finish_switch_fiber != nullptr) {
+        __sanitizer_finish_switch_fiber(current.asan_fake_stack, nullptr, nullptr);
+    }
 #else
-  (void)current;
+    (void)current;
 #endif
 }
 

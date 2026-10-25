@@ -12,19 +12,19 @@ namespace tinyio {
 // A wait list is a FIFO of the fibers waiting on a condition. Small initial
 // capacity, allocated on the first wait: most primitives never see one.
 class FiberWaitQueue {
- public:
-  [[nodiscard]] bool Empty() const noexcept { return fibers_.Empty(); }
+public:
+    [[nodiscard]] bool Empty() const noexcept { return fibers_.Empty(); }
 
-  void PushBack(detail::fiber::Fiber* fiber) noexcept { fibers_.Push(fiber); }
+    void PushBack(detail::fiber::Fiber* fiber) noexcept { fibers_.Push(fiber); }
 
-  /// The oldest waiter, or nullptr when there is none.
-  [[nodiscard]] detail::fiber::Fiber* PopFront() noexcept {
-    detail::fiber::Fiber* fiber = nullptr;
-    return fibers_.Pop(fiber) ? fiber : nullptr;
-  }
+    /// The oldest waiter, or nullptr when there is none.
+    [[nodiscard]] detail::fiber::Fiber* PopFront() noexcept {
+        detail::fiber::Fiber* fiber = nullptr;
+        return fibers_.Pop(fiber) ? fiber : nullptr;
+    }
 
- private:
-  detail::RingBuffer<detail::fiber::Fiber*> fibers_{8};
+private:
+    detail::RingBuffer<detail::fiber::Fiber*> fibers_{8};
 };
 
 /// Parks the running fiber on @p waiters until someone pops and unparks it.
@@ -35,10 +35,9 @@ class FiberWaitQueue {
 ///
 /// @p reason names the primitive the fiber is parked on, so a runtime that
 /// aborts can say WHICH primitive is stuck instead of printing a count.
-inline void ParkOn(IO& io, FiberWaitQueue& waiters,
-                   const detail::fiber::WaitKind reason) noexcept {
-  waiters.PushBack(io.RunningFiber());
-  io.ParkRunning(reason);
+inline void ParkOn(IO& io, FiberWaitQueue& waiters, const detail::fiber::WaitKind reason) noexcept {
+    waiters.PushBack(io.RunningFiber());
+    io.ParkRunning(reason);
 }
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds
@@ -62,41 +61,41 @@ inline void ParkOn(IO& io, FiberWaitQueue& waiters,
 /// latch.wait(); // suspends until both fibers call count_down
 /// @endcode
 struct Latch {
-  explicit Latch(IO& io, const std::ptrdiff_t count) : io_(io), count_(count) {}
+    explicit Latch(IO& io, const std::ptrdiff_t count) : io_(io), count_(count) {}
 
-  /// Called by worker fibers. When count reaches 0, all waiters are pushed ready.
-  void CountDown(const std::ptrdiff_t n = 1) noexcept {
-    count_ -= n;
-    if (count_ <= 0) {
-      DrainWaiters();
+    /// Called by worker fibers. When count reaches 0, all waiters are pushed ready.
+    void CountDown(const std::ptrdiff_t n = 1) noexcept {
+        count_ -= n;
+        if (count_ <= 0) {
+            DrainWaiters();
+        }
     }
-  }
 
-  [[nodiscard]] Result<void> Wait() noexcept {
-    assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
-    if (count_ > 0) {
-      ParkOn(io_, waiters_, detail::fiber::WaitKind::latch);
+    [[nodiscard]] Result<void> Wait() noexcept {
+        assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
+        if (count_ > 0) {
+            ParkOn(io_, waiters_, detail::fiber::WaitKind::latch);
+        }
+        return {};
     }
-    return {};
-  }
 
-  ~Latch() {
-    if (!waiters_.Empty()) {
-      ELOGFMT(FATAL, "Latch destroyed with fibers waiting");
-      std::abort();
+    ~Latch() {
+        if (!waiters_.Empty()) {
+            ELOGFMT(FATAL, "Latch destroyed with fibers waiting");
+            std::abort();
+        }
     }
-  }
 
- private:
-  void DrainWaiters() noexcept {
-    while (!waiters_.Empty()) {
-      io_.Unpark(waiters_.PopFront());
+private:
+    void DrainWaiters() noexcept {
+        while (!waiters_.Empty()) {
+            io_.Unpark(waiters_.PopFront());
+        }
     }
-  }
 
-  IO& io_;
-  std::ptrdiff_t count_;
-  FiberWaitQueue waiters_;
+    IO& io_;
+    std::ptrdiff_t count_;
+    FiberWaitQueue waiters_;
 };
 
 /// @brief A counting gate. Limits how many fibers may be in a critical section
@@ -115,48 +114,48 @@ struct Latch {
 /// });
 /// @endcode
 struct Semaphore {
-  explicit Semaphore(IO& io, const std::ptrdiff_t initial) : io_(io), count_(initial) {}
+    explicit Semaphore(IO& io, const std::ptrdiff_t initial) : io_(io), count_(initial) {}
 
-  // Decrements count. Suspends if count == 0.
-  [[nodiscard]] Result<void> Acquire() noexcept {
-    assert(io_.RunningFiber() != nullptr && "acquire() called outside a fiber");
-    if (count_ > 0) {
-      --count_;
-      return {};
+    // Decrements count. Suspends if count == 0.
+    [[nodiscard]] Result<void> Acquire() noexcept {
+        assert(io_.RunningFiber() != nullptr && "acquire() called outside a fiber");
+        if (count_ > 0) {
+            --count_;
+            return {};
+        }
+        ParkOn(io_, waiters_, detail::fiber::WaitKind::semaphore);
+        return {};
     }
-    ParkOn(io_, waiters_, detail::fiber::WaitKind::semaphore);
-    return {};
-  }
 
-  // Increments count. Wakes one waiter if any.
-  void Release() noexcept {
-    if (!waiters_.Empty()) {
-      io_.Unpark(waiters_.PopFront());
-    } else {
-      ++count_;
+    // Increments count. Wakes one waiter if any.
+    void Release() noexcept {
+        if (!waiters_.Empty()) {
+            io_.Unpark(waiters_.PopFront());
+        } else {
+            ++count_;
+        }
     }
-  }
 
-  // Non-blocking attempt. Returns false instead of suspending.
-  [[nodiscard]] bool TryAcquire() noexcept {
-    if (count_ > 0) {
-      --count_;
-      return true;
+    // Non-blocking attempt. Returns false instead of suspending.
+    [[nodiscard]] bool TryAcquire() noexcept {
+        if (count_ > 0) {
+            --count_;
+            return true;
+        }
+        return false;
     }
-    return false;
-  }
 
-  ~Semaphore() {
-    if (!waiters_.Empty()) {
-      ELOGFMT(FATAL, "Semaphore destroyed with fibers waiting");
-      std::abort();
+    ~Semaphore() {
+        if (!waiters_.Empty()) {
+            ELOGFMT(FATAL, "Semaphore destroyed with fibers waiting");
+            std::abort();
+        }
     }
-  }
 
- private:
-  IO& io_;
-  std::ptrdiff_t count_;
-  FiberWaitQueue waiters_;
+private:
+    IO& io_;
+    std::ptrdiff_t count_;
+    FiberWaitQueue waiters_;
 };
 
 /// @brief Mutual exclusion for shared state across fibers
@@ -175,76 +174,80 @@ struct Semaphore {
 /// });
 /// @endcode
 struct Mutex {
-  explicit Mutex(IO& io) : io_(io) {}
+    explicit Mutex(IO& io) : io_(io) {}
 
-  [[nodiscard]] Result<void> Lock() noexcept {
-    assert(io_.RunningFiber() != nullptr && "lock() called outside a fiber");
-    if (!held_) {
-      held_ = true;
-      return {};
-    }
-    ParkOn(io_, waiters_, detail::fiber::WaitKind::mutex);
-    return {};
-  }
-
-  void Unlock() noexcept {
-    if (!waiters_.Empty()) {
-      // Ownership transfers directly to the woken fiber, so held_
-      // intentionally stays true.
-      io_.Unpark(waiters_.PopFront());
-    } else {
-      held_ = false;
-    }
-  }
-
-  [[nodiscard]] bool TryLock() noexcept {
-    if (!held_) {
-      held_ = true;
-      return true;
-    }
-    return false;
-  }
-
-  // RAII guard
-  struct Guard {
-    explicit Guard(Mutex* m) : m_(m) {}
-    ~Guard() {
-      if (m_) m_->Unlock();
-    }
-    Guard(const Guard&) = delete;
-    Guard& operator=(const Guard&) = delete;
-    Guard(Guard&& other) noexcept : m_(other.m_) { other.m_ = nullptr; }
-    Guard& operator=(Guard&& other) noexcept {
-      if (this != &other) {
-        if (m_) m_->Unlock();
-        m_ = other.m_;
-        other.m_ = nullptr;
-      }
-      return *this;
+    [[nodiscard]] Result<void> Lock() noexcept {
+        assert(io_.RunningFiber() != nullptr && "lock() called outside a fiber");
+        if (!held_) {
+            held_ = true;
+            return {};
+        }
+        ParkOn(io_, waiters_, detail::fiber::WaitKind::mutex);
+        return {};
     }
 
-   private:
-    Mutex* m_;
-  };
-
-  [[nodiscard]] Result<Guard> ScopedLock() noexcept {
-    if (auto res = Lock(); !res) {
-      return std::unexpected(res.error());
+    void Unlock() noexcept {
+        if (!waiters_.Empty()) {
+            // Ownership transfers directly to the woken fiber, so held_
+            // intentionally stays true.
+            io_.Unpark(waiters_.PopFront());
+        } else {
+            held_ = false;
+        }
     }
-    return Guard{this};
-  }
 
-  ~Mutex() {
-    if (!waiters_.Empty()) {
-      ELOGFMT(FATAL, "Mutex destroyed with fibers waiting");
-      std::abort();
+    [[nodiscard]] bool TryLock() noexcept {
+        if (!held_) {
+            held_ = true;
+            return true;
+        }
+        return false;
     }
-  }
 
- private:
-  IO& io_;
-  bool held_{false};
-  FiberWaitQueue waiters_;
+    // RAII guard
+    struct Guard {
+        explicit Guard(Mutex* m) : m_(m) {}
+        ~Guard() {
+            if (m_) {
+                m_->Unlock();
+            }
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+        Guard(Guard&& other) noexcept : m_(other.m_) { other.m_ = nullptr; }
+        Guard& operator=(Guard&& other) noexcept {
+            if (this != &other) {
+                if (m_) {
+                    m_->Unlock();
+                }
+                m_ = other.m_;
+                other.m_ = nullptr;
+            }
+            return *this;
+        }
+
+    private:
+        Mutex* m_;
+    };
+
+    [[nodiscard]] Result<Guard> ScopedLock() noexcept {
+        if (auto res = Lock(); !res) {
+            return std::unexpected(res.error());
+        }
+        return Guard{this};
+    }
+
+    ~Mutex() {
+        if (!waiters_.Empty()) {
+            ELOGFMT(FATAL, "Mutex destroyed with fibers waiting");
+            std::abort();
+        }
+    }
+
+private:
+    IO& io_;
+    bool held_{false};
+    FiberWaitQueue waiters_;
 };
 
 /// @brief Ties fiber lifetime to a lexical scope. Ensures that spawned child fibers
@@ -272,56 +275,56 @@ struct TaskGroup;
 /// @endcode
 template <>
 struct TaskGroup<void> {
-  explicit TaskGroup(IO& io) : io_(io) {}
+    explicit TaskGroup(IO& io) : io_(io) {}
 
-  // Spawns a child fiber tracked by this group.
-  template <class Fn>
-    requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
-  [[nodiscard]] Result<void> Spawn(Fn&& task) noexcept {
-    auto res = io_.Spawn([this, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
-      t(io);
-      this->OnTaskDone();
-    });
-    if (res.has_value()) {
-      ++active_tasks_;
-      return {};
+    // Spawns a child fiber tracked by this group.
+    template <class Fn>
+        requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
+    [[nodiscard]] Result<void> Spawn(Fn&& task) noexcept {
+        auto res = io_.Spawn([this, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
+            t(io);
+            this->OnTaskDone();
+        });
+        if (res.has_value()) {
+            ++active_tasks_;
+            return {};
+        }
+        return std::unexpected(res.error());
     }
-    return std::unexpected(res.error());
-  }
 
-  // Suspends calling fiber until all spawned children have finished.
-  [[nodiscard]] Result<void> Wait() noexcept {
-    assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
-    if (active_tasks_ > 0) {
-      ParkOn(io_, waiters_, detail::fiber::WaitKind::task_group);
+    // Suspends calling fiber until all spawned children have finished.
+    [[nodiscard]] Result<void> Wait() noexcept {
+        assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
+        if (active_tasks_ > 0) {
+            ParkOn(io_, waiters_, detail::fiber::WaitKind::task_group);
+        }
+        return {};
     }
-    return {};
-  }
 
-  ~TaskGroup() {
-    // Hard check, a live task would
-    // later invoke on_task_done() through a dangling `this` — a UAF inside
-    // a fiber callback is strictly worse than aborting here.
-    if (active_tasks_ != 0) {
-      ELOGFMT(FATAL, "TaskGroup destroyed with {} live task(s); call wait() first",
-              active_tasks_);
-      std::abort();
+    ~TaskGroup() {
+        // Hard check, a live task would
+        // later invoke on_task_done() through a dangling `this` — a UAF inside
+        // a fiber callback is strictly worse than aborting here.
+        if (active_tasks_ != 0) {
+            ELOGFMT(FATAL, "TaskGroup destroyed with {} live task(s); call wait() first",
+                    active_tasks_);
+            std::abort();
+        }
     }
-  }
 
- private:
-  void OnTaskDone() noexcept {
-    --active_tasks_;
-    if (active_tasks_ == 0) {
-      while (!waiters_.Empty()) {
-        io_.Unpark(waiters_.PopFront());
-      }
+private:
+    void OnTaskDone() noexcept {
+        --active_tasks_;
+        if (active_tasks_ == 0) {
+            while (!waiters_.Empty()) {
+                io_.Unpark(waiters_.PopFront());
+            }
+        }
     }
-  }
 
-  IO& io_;
-  std::ptrdiff_t active_tasks_ = 0;
-  FiberWaitQueue waiters_;
+    IO& io_;
+    std::ptrdiff_t active_tasks_ = 0;
+    FiberWaitQueue waiters_;
 };
 
 // Deduction guide for TaskGroup (deduces to TaskGroup<void>)
@@ -354,41 +357,40 @@ TaskGroup(IO&) -> TaskGroup<void>;
 /// @endcode
 template <typename T>
 struct TaskGroup {
-  static_assert(std::is_nothrow_move_constructible_v<T>,
-                "TaskGroup<T>: T must be nothrow-move-constructible");
+    static_assert(std::is_nothrow_move_constructible_v<T>,
+                  "TaskGroup<T>: T must be nothrow-move-constructible");
 
-  explicit TaskGroup(IO& io, std::size_t capacity) : tg_(io), results_(capacity) {}
+    explicit TaskGroup(IO& io, std::size_t capacity) : tg_(io), results_(capacity) {}
 
-  // Spawns the next child fiber; its result lands in the next available slot.
-  // If the runtime cannot allocate a fiber, the slot is pre-populated with the
-  // error and the error is also returned (for early-abort if desired).
-  template <class Fn>
-    requires std::constructible_from<std::move_only_function<Result<T>(IO&) noexcept>, Fn>
-  Result<void> Spawn(Fn&& task) noexcept {
-    assert(next_ < results_.size() && "TaskGroup: more spawns than capacity");
-    std::size_t index = next_++;
-    auto res = tg_.Spawn([this, index, t = std::forward<Fn>(task)](
-                             IO& io) mutable noexcept { results_[index] = t(io); });
-    if (!res) {
-      results_[index] = std::unexpected(res.error());
+    // Spawns the next child fiber; its result lands in the next available slot.
+    // If the runtime cannot allocate a fiber, the slot is pre-populated with the
+    // error and the error is also returned (for early-abort if desired).
+    template <class Fn>
+        requires std::constructible_from<std::move_only_function<Result<T>(IO&) noexcept>, Fn>
+    Result<void> Spawn(Fn&& task) noexcept {
+        assert(next_ < results_.size() && "TaskGroup: more spawns than capacity");
+        std::size_t index = next_++;
+        auto res = tg_.Spawn([this, index, t = std::forward<Fn>(task)](IO& io) mutable noexcept {
+            results_[index] = t(io);
+        });
+        if (!res) {
+            results_[index] = std::unexpected(res.error());
+        }
+        return res;
     }
-    return res;
-  }
 
-  // Suspends the calling fiber until all spawned children have finished.
-  [[nodiscard]] Result<void> Wait() noexcept { return tg_.Wait(); }
+    // Suspends the calling fiber until all spawned children have finished.
+    [[nodiscard]] Result<void> Wait() noexcept { return tg_.Wait(); }
 
-  // Returns all result slots. Check each entry: nullopt = never spawned,
-  // has_value() = task succeeded, !has_value() = task returned an error.
-  std::vector<std::optional<Result<T>>>& Results() noexcept { return results_; }
-  const std::vector<std::optional<Result<T>>>& Results() const noexcept {
-    return results_;
-  }
+    // Returns all result slots. Check each entry: nullopt = never spawned,
+    // has_value() = task succeeded, !has_value() = task returned an error.
+    std::vector<std::optional<Result<T>>>& Results() noexcept { return results_; }
+    const std::vector<std::optional<Result<T>>>& Results() const noexcept { return results_; }
 
- private:
-  TaskGroup<> tg_;
-  std::vector<std::optional<Result<T>>> results_;
-  std::size_t next_ = 0;
+private:
+    TaskGroup<> tg_;
+    std::vector<std::optional<Result<T>>> results_;
+    std::size_t next_ = 0;
 };
 
 }  // namespace tinyio
