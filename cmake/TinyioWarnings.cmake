@@ -25,14 +25,6 @@ function(tinyio_configure_warnings)
         list(APPEND TINYIO_WARNING_OPTIONS -Wno-c2y-extensions)
     endif ()
 
-    # Probe each page of a large stack frame on allocation so a frame larger
-    # than the 4 KiB fiber guard page cannot jump past it into the neighbouring
-    # mapping.
-    check_cxx_compiler_flag("-fstack-clash-protection" TINYIO_HAVE_STACK_CLASH_PROTECTION)
-    if (TINYIO_HAVE_STACK_CLASH_PROTECTION)
-        list(APPEND TINYIO_WARNING_OPTIONS -fstack-clash-protection)
-    endif ()
-
     target_compile_options(
             tinyio_warnings
             INTERFACE

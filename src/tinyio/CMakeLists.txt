@@ -14,6 +14,7 @@ add_library(tinyio::tinyio ALIAS tinyio)
 target_sources(tinyio
         PRIVATE
         detail/context.cc
+        detail/mpsc_queue.hpp
         detail/stack.cc
         net/net.cc
         net/tcp_listener.cc
@@ -40,7 +41,6 @@ target_sources(tinyio
         "${PROJECT_BINARY_DIR}/src/tinyio/version.h"
         detail/context.hpp
         detail/fiber.hpp
-        detail/mpsc_queue.hpp
         detail/ring_buffer.hpp
         detail/sanitizer_hooks.hpp
         detail/stack.hpp

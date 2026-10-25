@@ -1,7 +1,6 @@
 #pragma once
 
-#include <fcntl.h>
-
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -11,15 +10,17 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <liburing.h>
 
 #include "tinyio/check.hpp"
 #include "tinyio/detail/fiber.hpp"
-#include "tinyio/detail/mpsc_queue.hpp"
 #include "tinyio/detail/ring_buffer.hpp"
 #include "tinyio/detail/timer_wheel.hpp"
 #include "tinyio/error.hpp"
@@ -28,6 +29,16 @@
 #include "tinyio/runtime/buffer_pool.hpp"
 
 namespace tinyio {
+
+namespace detail {
+template <typename T>
+class MpscQueue;
+}  // namespace detail
+
+template <class Fn>
+concept FiberTask =
+    std::move_constructible<std::decay_t<Fn>> && std::constructible_from<std::decay_t<Fn>, Fn> &&
+    std::is_nothrow_invocable_v<std::decay_t<Fn>&, IO&>;
 
 /// Default io uring flag
 inline constexpr unsigned k_uring_default_additional_flag =
@@ -142,19 +153,41 @@ public:
 
     /// Spawns one stackful fiber owned by this runtime.
     ///
-    /// The callable is invoked as fn(IO&). The fiber never migrates to another Runtime.
+    /// The callable is constructed directly at the top of the fiber's stack
+    /// (zero extra heap allocations even for large captures) and invoked as
+    /// fn(IO&). The fiber never migrates to another Runtime.
     /// This method is owner-thread-only. It catches construction/allocation failures and
     /// returns Result.
-    template <class Fn>
-        requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
+    template <FiberTask Fn>
     [[nodiscard]] Result<FiberId> Spawn(Fn&& fn) noexcept {
+        using Task = std::decay_t<Fn>;
+        TRY(fiber, AllocateFiber());
+
+        constexpr std::size_t k_align = std::max<std::size_t>(alignof(Task), 16U);
+        const auto high = reinterpret_cast<std::uintptr_t>(fiber->stack.high);
+        const auto low = reinterpret_cast<std::uintptr_t>(fiber->stack.low);
+        if (sizeof(Task) > (high - low) / 2U) {
+            RecycleUnstartedFiber(fiber);
+            return Error::FailErrno(ENOMEM, "spawn");
+        }
+
+        const std::uintptr_t task_addr = (high - sizeof(Task)) & ~(k_align - 1U);
+        auto* task_mem = reinterpret_cast<void*>(task_addr);
+
+        Task* placed = nullptr;
         try {
-            return SpawnTask(std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
+            placed = ::new (task_mem) Task(std::forward<Fn>(fn));
         } catch (const std::bad_alloc&) {
+            RecycleUnstartedFiber(fiber);
             return Error::FailErrno(ENOMEM, "spawn");
         } catch (...) {
+            RecycleUnstartedFiber(fiber);
             return Error::FailErrno(EINVAL, "spawn");
         }
+
+        fiber->task_ptr = placed;
+        fiber->destroy_task = [](void* p) noexcept { static_cast<Task*>(p)->~Task(); };
+        return EnqueueFiber(fiber, task_mem, &IO::FiberEntry<Task>);
     }
 
     /// Runs the cooperative scheduler until stop is requested.
@@ -185,27 +218,14 @@ public:
     template <class Fn>
         requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
     [[nodiscard]] bool Post(Fn&& fn) noexcept {
-        uint64_t cur = post_state_.load(std::memory_order_relaxed);
-        do {
-            if ((cur & k_post_closed_bit) != 0) {
-                return false;
-            }
-        } while (!post_state_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed));
-
-        bool enqueued = false;
-        try {
-            enqueued = post_queue_.Enqueue(
-                std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
-        } catch (...) {
-            enqueued = false;
-        }
-        if (!enqueued) {
-            post_state_.fetch_sub(1, std::memory_order_acq_rel);
+        if ((post_state_.load(std::memory_order_relaxed) & k_post_closed_bit) != 0) {
             return false;
         }
-        Wake();
-        return true;
+        try {
+            return EnqueuePost(std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
+        } catch (...) {
+            return false;
+        }
     }
 
     /// Suspend the current fiber to give back the control to the runtime
@@ -626,12 +646,29 @@ private:
 
     /// MPSC queue for tasks posted from remote threads via post().
     /// Drained on the owner thread inside tick().
-    detail::MpscQueue<std::move_only_function<void(IO&) noexcept>> post_queue_;
+    std::unique_ptr<detail::MpscQueue<std::move_only_function<void(IO&) noexcept>>> post_queue_;
+
+    [[nodiscard]] bool EnqueuePost(std::move_only_function<void(IO&) noexcept> task) noexcept;
 
     [[noreturn]] TIO_NO_SANITIZE_ADDRESS void FinishCurrentFiber(
         detail::fiber::Fiber* fiber) noexcept;
-    /// Entry point of every fiber (a context::EntryFn); @p arg is the Fiber.
-    [[noreturn]] static void FiberEntry(void* arg) noexcept;
+    static TIO_NO_SANITIZE_ADDRESS void EnterFiber(detail::fiber::Fiber* fiber) noexcept;
+
+    /// Typed entry point for a fiber whose callable of type @p Task lives on its stack.
+    template <class Task>
+    [[noreturn]] TIO_NO_SANITIZE_ADDRESS static void FiberEntry(void* arg) noexcept {
+        auto* fiber = static_cast<detail::fiber::Fiber*>(arg);
+        EnterFiber(fiber);
+        auto* task = static_cast<Task*>(fiber->task_ptr);
+        (void)(*task)(*fiber->runtime);
+        fiber->DestroyTask();
+        fiber->runtime->FinishCurrentFiber(fiber);
+    }
+
+    [[nodiscard]] Result<detail::fiber::Fiber*> AllocateFiber() noexcept;
+    void RecycleUnstartedFiber(detail::fiber::Fiber* fiber) noexcept;
+    [[nodiscard]] FiberId EnqueueFiber(detail::fiber::Fiber* fiber, void* stack_top,
+                                       detail::context::EntryFn entry) noexcept;
 
     void PushReady(detail::fiber::Fiber* fiber) noexcept;
     [[nodiscard]] detail::fiber::Fiber* PopReady() noexcept;
@@ -670,10 +707,6 @@ private:
     /// Aborts if a fiber is still live once the runtime has quiesced: it is
     /// parked on a sync primitive that nothing can ever signal (a deadlock).
     void AbortIfParkedFibers() const noexcept;
-
-    /// Spawns a fiber from an already-erased task object.
-    [[nodiscard]] Result<FiberId> SpawnTask(
-        std::move_only_function<void(IO&) noexcept> task) noexcept;
 
     void PinToCpu() const;
 };

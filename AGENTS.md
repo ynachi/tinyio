@@ -197,34 +197,39 @@ Concretely, when measuring a change to tinyio:
 ### Reference numbers for the current baseline
 
 Measured on 2026-10-25 from `4bfd719` (plus the WAL compile fix), release
-preset, GCC 15.2 on srv401 (Ubuntu 26.04, kernel 7.0.0).
+preset, GCC 15.2 and Clang 21.1.8 (`--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15`)
+on srv401 (Ubuntu 26.04, kernel 7.0.0).
 
 Disk — one thread, one shared **pre-created** 64 MiB file (recreated right
-before the run, see below), 4 KiB `O_DIRECT`, random offsets, median of 12
-rounds:
+before the run, see below), 4 KiB `O_DIRECT`, random offsets, 24 rounds on
+GCC 15.2 (and 12-round Clang 21.1.8 reference):
 
-| QD | IOPS | mean µs | p50 µs | p99 µs | noise floor (stdev) |
-|----|------|---------|--------|--------|---------------------|
-| 1   | 11,881 | 80.3 | 79.6 | 90.8 | 149 IOPS (1.3 %) |
-| 32  | 120,146 | 262.9 | 259.0 | 350.8 | 1,328 IOPS (1.1 %) |
-| 128 | 133,460 | 947.0 | 924.2 | 1,148.3 | 463 IOPS (0.35 %) |
+| QD | GCC 15.2 (24 rounds) | Clang 21.1.8 (12 rounds) | mean µs | p50 µs | p99 µs | noise floor / notes |
+|----|----------------------|--------------------------|---------|--------|--------|---------------------|
+| 1   | 11,861 | 11,954 (+0.8 %) | 80.5 | 79.6 | 90.8 | 23 healthy rounds: 11,630–12,055, stdev 154 (1.30 %) |
+| 32  | 120,134 fast / 98,181 degraded | 122,122 (+1.7 %) | 262.9 / 321.9 | 259.0 | 350.8 | bimodal at 40k ops (~0.3 s window) — see below |
+| 128 | 133,468 | 135,244 (+1.3 %) | 947.0 | 924.2 | 1,148.3 | 23 healthy rounds: stdev 1,350 (1.01 %) |
 
 The stdev is the noise floor: a candidate has to beat the baseline by more
-than ~1 % at QD 1/32 and ~0.5 % at QD 128 to mean anything. At QD 1 fio reads
-the same file at 12,749 IOPS, so that ~7 % is what the runtime costs against
-raw syscalls.
+than ~1 % at QD 1/128 to mean anything. At QD 1 fio reads the same file at
+12,749 IOPS, so that ~7 % is what the runtime costs against raw syscalls.
+Always compare A/B arms built with the **same compiler** (Clang 21 shifts
+disk throughput up by +0.8 % to +1.7 % over GCC 15.2 on identical code).
 
-Network — 512 connections, 15 s, 4 worker threads, saturation, median of 17
-interleaved samples, **fast-tier median** (the link is tri-modal, see below):
+Network — 512 connections, 15 s, 4 worker threads, saturation, 17
+interleaved samples per run, **fast-tier median** (the link is tri-modal, see
+below):
 
-| req/s | p50 | p90 | p99 | p99.9 | cpu |
-|-------|-----|-----|-----|-------|-----|
-| 334,231 | 1.489 ms | 1.870 ms | 2.554 ms | 3.440 ms | 352 % |
+| run | compiler | fast-tier req/s | p50 | p90 | p99 | p99.9 | cpu |
+|-----|----------|-----------------|-----|-----|-----|-------|-----|
+| run 1 (n=7/17) | GCC 15.2 | 334,231 | 1.489 ms | 1.870 ms | 2.554 ms | 3.440 ms | 352 % |
+| run 2 (n=6/17) | GCC 15.2 | 329,105 | 1.470 ms | — | 2.780 ms | 11.480 ms | — |
+| ab3 base (n=9/17) | Clang 21.1.8 | 333,805 | — | — | 2.627 ms | 4.268 ms | — |
 
-7 of the 17 samples landed in the fast tier (328,205 – 336,397 req/s,
-stdev 2,645). The other 10 sat at a 302,998 req/s median with a p99 of
-9.7 – 14.0 ms: that is the box's other moods, not the runtime. Every sample
-had a 100 % success rate.
+Throughput and p50 reproduce within ~1.5 % across runs; `p99.9` is dominated
+by a single bad sample per run and is not a usable baseline estimator (use
+paired fast-tier `req/s`, `p50`, `p90`, and `p99`). Every sample had a 100 %
+success rate.
 
 ## Measuring on srv401 (192.168.1.155)
 
@@ -298,8 +303,16 @@ The rest of the protocol stands:
    at the same path, keeps the blocks where they were and the pages hot.
 3. **Interleave** baseline and candidate round-by-round; never run all of A
    then all of B.
-4. Report the **median over ≥9 rounds**, and state how many runs landed in
-   the slow mode.
+4. **Compare arms paired per round, not by un-paired median-over-rounds, and
+   use sufficiently long phases at high QD.** At the default 20k–40k
+   operations, a QD 32 or QD 128 phase lasts only ~0.3 s (40,000 ops ÷ ~130k
+   IOPS), so a single short transient flips an entire phase in one arm without
+   touching its neighbours in the same round (producing the apparent QD 32
+   120k / 98k bimodality, where two 12-round runs of the *exact same binary*
+   differed by −16 % on plain medians). Report paired per-round deltas, state
+   how many rounds each arm landed in each mode, and raise `--operations` to
+   ~400k for QD 32/128 (~3 s per phase, matching QD 1's 3.3 s window) when you
+   need stable phase medians.
 5. fio still needs `--time_based=1`, otherwise it stops after one pass over
    the file and reports nonsense.
 
@@ -408,6 +421,15 @@ The reasoning behind all of this is in `docs/buffer-pool.md`.
   `SINGLE_ISSUER|DEFER_TASKRUN|TASKRUN_FLAG` — note it does **not** include
   `IORING_SETUP_COOP_TASKRUN`, unlike kio's default. The kernel rejects
   `TASKRUN_FLAG` without `COOP_TASKRUN` unless `DEFER_TASKRUN` is also set.
+- **Keep `IORING_ENTER_GETEVENTS` on the non-blocking `SubmitOrWait()` path
+  whenever `DEFER_TASKRUN` is set.** Even with `IORING_SETUP_TASKRUN_FLAG`
+  enabled, calling `io_uring_submit()` instead of
+  `io_uring_submit_and_get_events()` when `runnable` is true omits
+  `IORING_ENTER_GETEVENTS` whenever `IORING_SQ_TASKRUN` was not yet visible in
+  userspace before the syscall. The kernel then submits the batch of SQEs
+  without flushing `task_work` completions generated during
+  `ResumeReadyFibers()` / `io_submit_sqes()`, delaying those completions by a
+  full tick and regressing HTTP `p99` by ~8–11 % in every fast-tier sample.
 - **The kernel floor is 6.1**, and it is not negotiable: `DEFER_TASKRUN` is
   in the default flags (6.1) and the shutdown path cancels every request
   with `IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY` (5.19). There is

@@ -40,7 +40,7 @@ void IO::DestroyFiber(detail::fiber::Fiber* fiber) noexcept {
     // A fiber finishes while it runs: it is out of the ready queue, and its
     // last operation completed, which took it out of the timer wheel.
     assert(fiber->state == detail::fiber::FiberState::done && !fiber->timer_armed);
-    fiber->task = nullptr;
+    fiber->DestroyTask();
 
     detail::ToolsDestroyFiber(fiber->tools);
 
@@ -61,6 +61,7 @@ void IO::DestroyAllFibers() noexcept {
     // all_fibers_ owns every fiber, idle ones included, so the other
     // containers only need to forget their pointers.
     for (detail::fiber::Fiber* fiber : all_fibers_) {
+        fiber->DestroyTask();
         detail::ToolsDestroyFiber(fiber->tools);
         detail::stack::ReleaseStack(fiber->stack);
         delete fiber;
@@ -70,37 +71,54 @@ void IO::DestroyAllFibers() noexcept {
     ready_queue_.Clear();
 }
 
-Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) noexcept {
+Result<detail::fiber::Fiber*> IO::AllocateFiber() noexcept {
     if (!IsOwnerThread()) {
         return Error::FailErrno(EPERM, "spawn");
     }
 
-    detail::fiber::Fiber* fiber = nullptr;
     if (!idle_fibers_.empty()) {
-        fiber = idle_fibers_.back();
+        detail::fiber::Fiber* fiber = idle_fibers_.back();
         idle_fibers_.pop_back();
-    } else {
-        // unique_ptr frees the Fiber if the stack allocation fails, and the
-        // fiber joins all_fibers_ only once both allocations succeeded.
-        std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow) detail::fiber::Fiber());
-        if (!owned) {
-            return Error::FailErrno(ENOMEM, "spawn");
-        }
-        TRY(const stack, detail::stack::AllocateStack(opts_.stack_size, opts_.guard_size));
-        owned->runtime = this;
-        owned->stack = stack;
-        owned->all_fibers_index = all_fibers_.size();
-        all_fibers_.push_back(owned.get());
-        fiber = owned.release();
+        return fiber;
     }
 
+    // unique_ptr frees the Fiber if the stack allocation fails, and the
+    // fiber joins all_fibers_ only once both allocations succeeded.
+    std::unique_ptr<detail::fiber::Fiber> owned(new (std::nothrow) detail::fiber::Fiber());
+    if (!owned) {
+        return Error::FailErrno(ENOMEM, "spawn");
+    }
+    TRY(const stack, detail::stack::AllocateStack(opts_.stack_size, opts_.guard_size));
+    owned->runtime = this;
+    owned->stack = stack;
+    owned->all_fibers_index = all_fibers_.size();
+    try {
+        all_fibers_.push_back(owned.get());
+    } catch (...) {
+        detail::stack::ReleaseStack(owned->stack);
+        return Error::FailErrno(ENOMEM, "spawn");
+    }
+    return owned.release();
+}
+
+void IO::RecycleUnstartedFiber(detail::fiber::Fiber* fiber) noexcept {
+    if (idle_fibers_.size() >= opts_.max_idle_fibers) {
+        RemoveFromAllFibers(fiber);
+        detail::stack::ReleaseStack(fiber->stack);
+        delete fiber;
+    } else {
+        idle_fibers_.push_back(fiber);
+    }
+}
+
+FiberId IO::EnqueueFiber(detail::fiber::Fiber* fiber, void* stack_top,
+                         const detail::context::EntryFn entry) noexcept {
     ++live_fibers_;
 
     // Every execution gets a fresh id, a recycled fiber included.
     fiber->id = next_fiber_id_++;
-    fiber->task = std::move(task);
     detail::ToolsCreateFiber(fiber->tools, fiber->stack);
-    detail::context::Make(fiber->context, fiber->stack.high, &IO::FiberEntry, fiber);
+    detail::context::Make(fiber->context, stack_top, entry, fiber);
 
     // A new or recycled fiber is in no queue yet.
     fiber->state = detail::fiber::FiberState::ready;
@@ -157,8 +175,7 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
 // First code a new fiber runs, on its own stack, reached through the
 // trampoline in context.cc. ResumeFiber() saved the scheduler's context in
 // the switch that got us here, so there is nothing to record.
-[[noreturn]] void IO::FiberEntry(void* arg) noexcept {
-    auto* fiber = static_cast<detail::fiber::Fiber*>(arg);
+TIO_NO_SANITIZE_ADDRESS void IO::EnterFiber(detail::fiber::Fiber* fiber) noexcept {
     assert(fiber != nullptr && fiber->runtime != nullptr);
 
     // Complete the ASAN fiber switch ResumeFiber() started and capture the
@@ -166,8 +183,6 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
     // fiber has no fake stack to restore: fiber->tools.asan_fake_stack is still
     // the nullptr ToolsCreateFiber() set.
     detail::ToolsAfterSwitch(fiber->tools, &fiber->runtime->scheduler_tools_);
-    fiber->task(*fiber->runtime);
-    fiber->runtime->FinishCurrentFiber(fiber);
 }
 
 }  // namespace tinyio

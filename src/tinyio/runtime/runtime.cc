@@ -16,11 +16,15 @@
 #include <utility>
 #include <vector>
 
+#include "tinyio/detail/mpsc_queue.hpp"
 #include "tinyio/logging.hpp"
 
 namespace tinyio {
 IO::IO(const size_t id, const IoOptions& opts)
-    : id_(id), opts_(opts), post_queue_(opts.post_queue_capacity) {
+    : id_(id),
+      opts_(opts),
+      post_queue_(std::make_unique<detail::MpscQueue<std::move_only_function<void(IO&) noexcept>>>(
+          opts.post_queue_capacity)) {
     if (opts.buffer_pool) {
         buffer_pool_.emplace(opts.buffer_pool->slot_size, opts.buffer_pool->slots);
         buffer_pool_->SetOwner(this);
@@ -52,7 +56,7 @@ IO::~IO() noexcept {
     {
         ELOGFMT(INFO, "discarding ready tasks, worker {}", id_);
         std::move_only_function<void(IO&) noexcept> fn;
-        while (post_queue_.TryDequeue(fn)) {
+        while (post_queue_->TryDequeue(fn)) {
         }
         post_state_.store(k_post_closed_bit, std::memory_order_release);
     }

@@ -141,15 +141,15 @@ public:
 
         // 1. Remainder of the starting 64-slot word [start_bit, 63].
         if (const uint64_t mask = occupied_[start_word] >> start_bit; mask != 0) {
-            return wake_at_offset(static_cast<uint64_t>(std::countr_zero(mask)));
+            return wake_at_offset(CountrZero(mask));
         }
 
         // 2. The intermediate 7 words.
         for (size_t w = 1; w < k_words; ++w) {
             if (const uint64_t word = occupied_[(start_word + w) & (k_words - 1)]; word != 0) {
                 const uint64_t off =
-                    (static_cast<uint64_t>(w) * 64ULL - static_cast<uint64_t>(start_bit)) +
-                    static_cast<uint64_t>(std::countr_zero(word));
+                    (static_cast<uint64_t>(w) * uint64_t{64} - static_cast<uint64_t>(start_bit)) +
+                    CountrZero(word);
                 return wake_at_offset(off);
             }
         }
@@ -158,7 +158,7 @@ public:
         if (const uint64_t word = occupied_[start_word]; word != 0) {
             const uint64_t off =
                 (static_cast<uint64_t>(k_slots) - static_cast<uint64_t>(start_bit)) +
-                static_cast<uint64_t>(std::countr_zero(word));
+                CountrZero(word);
             return wake_at_offset(off);
         }
 
@@ -167,8 +167,12 @@ public:
     }
 
 private:
+    [[nodiscard]] static constexpr uint64_t CountrZero(const uint64_t word) noexcept {
+        return static_cast<uint64_t>(static_cast<unsigned int>(std::countr_zero(word)));
+    }
+
     [[nodiscard]] static size_t SlotOf(const uint64_t deadline_ns) noexcept {
-        return static_cast<size_t>((deadline_ns / k_tick_ns) & (k_slots - 1));
+        return deadline_ns / k_tick_ns & k_slots - 1;
     }
 
     // Swap-and-pop: move the slot's last fiber into f's position.

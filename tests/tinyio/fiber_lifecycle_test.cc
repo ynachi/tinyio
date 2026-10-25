@@ -1,3 +1,6 @@
+#include <array>
+#include <cstdint>
+#include <memory>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -74,4 +77,69 @@ TEST_F(FiberTest, NestedSpawn) {
 
     EXPECT_TRUE(outer_done);
     EXPECT_TRUE(inner_done);
+}
+
+namespace {
+struct DropCounter {
+    int* drops = nullptr;
+    explicit DropCounter(int* d) noexcept : drops(d) {}
+    DropCounter(DropCounter&& other) noexcept : drops(other.drops) { other.drops = nullptr; }
+    DropCounter& operator=(DropCounter&&) = delete;
+    DropCounter(const DropCounter&) = delete;
+    DropCounter& operator=(const DropCounter&) = delete;
+    ~DropCounter() {
+        if (drops != nullptr) {
+            ++(*drops);
+        }
+    }
+};
+}  // namespace
+
+TEST_F(FiberTest, LargeCaptureLivesOnFiberStackAndDestroysCleanly) {
+    std::array<std::uint64_t, 32> payload{};
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = i + 100U;
+    }
+
+    int drops = 0;
+    std::uint64_t observed_sum = 0;
+    bool on_fiber_stack = false;
+
+    auto res = io_.Spawn(
+        [payload, tracker = DropCounter(&drops), &observed_sum, &on_fiber_stack](IO& rt) noexcept {
+            (void)tracker;
+            const auto* self = rt.RunningFiber();
+            ASSERT_NE(self, nullptr);
+            const auto addr = reinterpret_cast<std::uintptr_t>(&payload);
+            const auto low = reinterpret_cast<std::uintptr_t>(self->stack.low);
+            const auto high = reinterpret_cast<std::uintptr_t>(self->stack.high);
+            on_fiber_stack = (addr >= low && addr < high);
+            for (const auto v : payload) {
+                observed_sum += v;
+            }
+        });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(drops, 0);
+
+    io_.RunUntilDone();
+
+    EXPECT_TRUE(on_fiber_stack);
+    EXPECT_EQ(observed_sum, 32U * 100U + (31U * 32U) / 2U);
+    EXPECT_EQ(drops, 1);
+}
+
+TEST(FiberTeardownTest, UnstartedFiberDestroysStackPlacedCallable) {
+    int drops = 0;
+    {
+        IO io{0, IoOptions{}};
+        std::array<std::uint64_t, 32> payload{};
+        payload.fill(42U);
+        auto res = io.Spawn([payload, tracker = DropCounter(&drops)](IO&) noexcept {
+            (void)payload;
+            (void)tracker;
+        });
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(drops, 0);
+    }
+    EXPECT_EQ(drops, 1);
 }

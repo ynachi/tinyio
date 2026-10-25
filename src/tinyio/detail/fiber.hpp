@@ -1,7 +1,6 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 
 #include "tinyio/detail/context.hpp"
 #include "tinyio/detail/sanitizer_hooks.hpp"
@@ -145,7 +144,20 @@ struct alignas(64) Fiber {
     /// A unique, monotonically increasing identifier for debugging.
     FiberId id = 0;
 
-    /// The actual user-provided function or lambda that this fiber executes.
-    std::move_only_function<void(IO&) noexcept> task;
+    /// Pointer to the callable constructed at the top of this fiber's stack.
+    void* task_ptr = nullptr;
+
+    /// Type-erased destructor for the stack-allocated callable; cleared once run.
+    void (*destroy_task)(void*) noexcept = nullptr;
+
+    void DestroyTask() noexcept {
+        if (destroy_task != nullptr) {
+            auto fn = destroy_task;
+            void* ptr = task_ptr;
+            destroy_task = nullptr;
+            task_ptr = nullptr;
+            fn(ptr);
+        }
+    }
 };
 }  // namespace tinyio::detail::fiber
