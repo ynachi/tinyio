@@ -44,7 +44,7 @@ struct Harness {
         }
         child_stack = *allocated;
         ToolsCaptureCurrentThread(main_tools);
-        ToolsCreateFiber(child_tools);
+        ToolsCreateFiber(child_tools, child_stack);
         context::Make(child_ctx, child_stack.high, entry, this);
     }
 
@@ -65,13 +65,13 @@ struct Harness {
     TIO_NO_SANITIZE_ADDRESS void Suspend() noexcept {
         ToolsBeforeSwitch(child_tools, &main_tools, nullptr);
         context::Switch(child_ctx, main_ctx);
-        ToolsAfterSwitch(child_tools);
+        ToolsAfterSwitch(child_tools, &main_tools);
     }
 
     // First thing every child entry does (see IO::FiberEntry).
     static Harness& Enter(void* arg) noexcept {
         auto& h = *static_cast<Harness*>(arg);
-        ToolsAfterSwitch(h.child_tools);
+        ToolsAfterSwitch(h.child_tools, &h.main_tools);
         h.received_arg = arg;
         return h;
     }

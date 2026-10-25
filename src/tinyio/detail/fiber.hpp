@@ -83,51 +83,32 @@ struct Operation {
     /// Pointer back to the fiber that initiated this operation.
     Fiber* fiber = nullptr;
 
+    /// Absolute CLOCK_MONOTONIC deadline (ns) while this op is armed in the
+    /// runtime's TimerWheel; 0 when no timeout is attached.
+    uint64_t deadline_ns = 0;
+
     /// The kernel's result, copied from the CQE: a negative errno on failure,
     /// otherwise the operation's result (bytes transferred, a new fd, or 0).
     /// IO::Syscall() turns it into a Result once the fiber resumes.
     int cqe_res = 0;
 
-    /// Absolute CLOCK_MONOTONIC deadline (ns) while this op is armed in the
-    /// runtime's TimerWheel; 0 when no timeout is attached.
-    uint64_t deadline_ns = 0;
-
     /// Set by the timer wheel when it expires this op (before issuing the
-    /// ASYNC_CANCEL). Lets syscall_timed() map the resulting -ECANCELED to
+    /// ASYNC_CANCEL). Lets Syscall() map the resulting -ECANCELED to
     /// ETIMEDOUT instead of ECANCELED.
     bool timed_out = false;
 };
 
-/// \brief Represents a single cooperative thread of execution (coroutine).
-struct Fiber {
-    /// Pointer to the main event loop / scheduler that owns this fiber.
-    IO* runtime = nullptr;
-
-    /// A unique, monotonically increasing identifier for debugging.
-    FiberId id = 0;
-
-    /// Holds the CPU register state (Stack Pointer, Instruction Pointer, etc.)
-    /// when the fiber is suspended.
+/// \brief Represents a single cooperative thread of execution (fiber).
+///
+/// Fields are ordered so the hot CQE-drain and context-switch path
+/// (context, runtime, state, wait_kind, timer_armed, operation) fits inside
+/// a single 64-byte cache line in release builds.
+struct alignas(64) Fiber {
+    /// Holds the CPU register state (Stack Pointer) when the fiber is suspended.
     context::Context context{};
 
-    /// The allocated memory region for the fiber's local execution stack.
-    stack::Stack stack{};
-
-    /// Integration state for Address Sanitizer (ASAN) and Thread Sanitizer (TSAN).
-    ToolFiberState tools{};
-
-    /// The actual user-provided function or lambda that this fiber executes.
-    std::move_only_function<void(IO&) noexcept> task;
-
-    /// The pre-allocated I/O operation data. By embedding this inside the fiber,
-    /// we avoid heap allocations for every single read/write operation.
-    ///
-    /// Invariant: only one operation may be in flight per fiber at a time.
-    /// This is enforced structurally — the fiber is suspended (state == waiting)
-    /// for the entire duration of an operation, so it cannot submit a second one
-    /// until the first CQE is received and the fiber is resumed. The assertion
-    /// `state == FiberState::running` in IO::Syscall() makes this explicit.
-    Operation operation{};
+    /// Pointer to the main event loop / scheduler that owns this fiber.
+    IO* runtime = nullptr;
 
     /// The current lifecycle status of the fiber. `ready` means exactly "in the
     /// runtime's ready queue": PushReady() relies on it to queue a fiber once.
@@ -139,10 +120,32 @@ struct Fiber {
     /// True while the fiber is armed in the TimerWheel.
     bool timer_armed = false;
 
+    /// The pre-allocated I/O operation data. By embedding this inside the fiber,
+    /// we avoid heap allocations for every single read/write operation.
+    ///
+    /// Invariant: only one operation may be in flight per fiber at a time.
+    /// This is enforced structurally — the fiber is suspended (state == waiting)
+    /// for the entire duration of an operation, so it cannot submit a second one
+    /// until the first CQE is received and the fiber is resumed. The assertion
+    /// `state == FiberState::running` in IO::Syscall() makes this explicit.
+    Operation operation{};
+
+    /// Integration state for Address Sanitizer (ASAN) and Thread Sanitizer (TSAN).
+    [[no_unique_address]] ToolFiberState tools{};
+
+    /// The allocated memory region for the fiber's local execution stack.
+    stack::Stack stack{};
+
     /// Position in its TimerWheel slot while timer_armed (O(1) disarm).
     std::size_t timer_index = 0;
 
     /// Position in the runtime's all_fibers_ vector (O(1) removal).
     std::size_t all_fibers_index = 0;
+
+    /// A unique, monotonically increasing identifier for debugging.
+    FiberId id = 0;
+
+    /// The actual user-provided function or lambda that this fiber executes.
+    std::move_only_function<void(IO&) noexcept> task;
 };
 }  // namespace tinyio::detail::fiber

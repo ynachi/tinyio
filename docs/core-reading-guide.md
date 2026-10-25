@@ -225,23 +225,11 @@ prediction marks the part you don't own yet. Turn each one into a test.
 
 ## Open findings from the review
 
-Good first changes once the reading is done; each touches a different layer.
-
-1. **ASan fiber hooks** (`detail/sanitizer_hooks.hpp`):
-   `FinishCurrentFiber` should pass `nullptr` as `fake_stack_save` on the
-   final switch, or every finished fiber leaks its fake stack (the `asan`
-   preset enables `detect_stack_use_after_return`). `SuspendFiber` passes no
-   destination stack, so ASan sees the scheduler stack as `[0,0)`: capture
-   `bottom_old`/`size_old` from the first `__sanitizer_finish_switch_fiber` in
-   `FiberEntry` and pass them back.
-2. **Stack guard and fiber count**: a frame larger than the 4 KB guard can
-   land in the neighbouring fiber's stack; build with
-   `-fstack-clash-protection` or enlarge the guard. Each stack is two VMAs, so
-   `vm.max_map_count` (65,530) caps a process at ~32K fibers.
-3. **x86 shadow stack**: the switch assembly lives in a C++ file, so
-   `-fcf-protection` marks the binary shadow-stack compatible while the
-   switch breaks shadow stacks. Latent until SHSTK is enabled. Build
-   `detail/context.cc` with `-fcf-protection=branch`, or move the asm to a `.S`.
-4. Minor: no CFI on `TinyioSwitchContext`; idle fibers keep dirty stack
-   pages (`MADV_FREE` on caching); `TimerWheel::NsUntilNext()` scans all 512
-   slots on every sleep.
+1. **Fiber VMA count at scale**: each stack is two VMAs (`PROT_NONE` guard +
+   `PROT_READ|PROT_WRITE` stack), so the default `vm.max_map_count` (65,530)
+   caps a process at ~32K fibers. Build flags now enable
+   `-fstack-clash-protection` so large stack frames cannot jump the 4 KiB
+   guard page.
+2. **Idle stack RSS**: finished fibers cached in `idle_fibers_` keep dirty
+   stack pages warm for reuse; applications with deep stack bursts can
+   consider `MADV_FREE` beyond the top page on recycle.

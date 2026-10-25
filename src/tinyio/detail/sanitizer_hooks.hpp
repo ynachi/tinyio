@@ -65,28 +65,45 @@ extern "C" void __tsan_switch_to_fiber(void* fiber, unsigned flags);
 namespace tinyio::detail {
 
 struct ToolFiberState {
+#if TINYIO_ASAN_ENABLED
     void* asan_fake_stack = nullptr;
+    const void* asan_stack_bottom = nullptr;
+    std::size_t asan_stack_size = 0;
+#endif
+#if TINYIO_TSAN_ENABLED
     void* tsan_fiber = nullptr;
     bool owns_tsan_fiber = false;
+#endif
 };
 
 inline void ToolsCaptureCurrentThread(ToolFiberState& state) noexcept {
+#if TINYIO_ASAN_ENABLED
+    state.asan_fake_stack = nullptr;
+    state.asan_stack_bottom = nullptr;
+    state.asan_stack_size = 0;
+#endif
 #if TINYIO_TSAN_ENABLED
     state.tsan_fiber = __tsan_get_current_fiber();
     state.owns_tsan_fiber = false;
-#else
+#endif
+#if !TINYIO_ASAN_ENABLED && !TINYIO_TSAN_ENABLED
     (void)state;
 #endif
 }
 
-inline void ToolsCreateFiber(ToolFiberState& state) noexcept {
+inline void ToolsCreateFiber(ToolFiberState& state, const stack::Stack& stack) noexcept {
 #if TINYIO_ASAN_ENABLED
     state.asan_fake_stack = nullptr;
+    state.asan_stack_bottom = stack.low;
+    state.asan_stack_size = stack.usable_size;
+#else
+    (void)stack;
 #endif
 #if TINYIO_TSAN_ENABLED
     state.tsan_fiber = __tsan_create_fiber(0);
     state.owns_tsan_fiber = true;
-#else
+#endif
+#if !TINYIO_ASAN_ENABLED && !TINYIO_TSAN_ENABLED
     (void)state;
 #endif
 }
@@ -104,16 +121,23 @@ inline void ToolsDestroyFiber(ToolFiberState& state) noexcept {
 }
 
 inline void ToolsBeforeSwitch(ToolFiberState& from, ToolFiberState* to_tools,
-                              const stack::Stack* to_stack) noexcept {
+                              const stack::Stack* to_stack,
+                              const bool from_exiting = false) noexcept {
 #if TINYIO_ASAN_ENABLED
-    const void* bottom = to_stack == nullptr ? nullptr : to_stack->low;
-    const std::size_t size = to_stack == nullptr ? 0U : to_stack->usable_size;
+    const void* bottom = to_stack != nullptr
+                             ? to_stack->low
+                             : (to_tools != nullptr ? to_tools->asan_stack_bottom : nullptr);
+    const std::size_t size = to_stack != nullptr
+                                 ? to_stack->usable_size
+                                 : (to_tools != nullptr ? to_tools->asan_stack_size : 0U);
     if (__sanitizer_start_switch_fiber != nullptr) {
-        __sanitizer_start_switch_fiber(&from.asan_fake_stack, bottom, size);
+        __sanitizer_start_switch_fiber(from_exiting ? nullptr : &from.asan_fake_stack, bottom,
+                                       size);
     }
 #else
     (void)from;
     (void)to_stack;
+    (void)from_exiting;
 #endif
 
 #if TINYIO_TSAN_ENABLED
@@ -125,13 +149,22 @@ inline void ToolsBeforeSwitch(ToolFiberState& from, ToolFiberState* to_tools,
 #endif
 }
 
-inline void ToolsAfterSwitch(const ToolFiberState& current) noexcept {
+inline void ToolsAfterSwitch(const ToolFiberState& current,
+                             ToolFiberState* previous = nullptr) noexcept {
 #if TINYIO_ASAN_ENABLED
     if (__sanitizer_finish_switch_fiber != nullptr) {
-        __sanitizer_finish_switch_fiber(current.asan_fake_stack, nullptr, nullptr);
+        const void* bottom_old = nullptr;
+        std::size_t size_old = 0;
+        __sanitizer_finish_switch_fiber(current.asan_fake_stack, &bottom_old, &size_old);
+        if (previous != nullptr && previous->asan_stack_bottom == nullptr &&
+            bottom_old != nullptr) {
+            previous->asan_stack_bottom = bottom_old;
+            previous->asan_stack_size = size_old;
+        }
     }
 #else
     (void)current;
+    (void)previous;
 #endif
 }
 

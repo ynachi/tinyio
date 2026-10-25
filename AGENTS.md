@@ -196,22 +196,35 @@ Concretely, when measuring a change to tinyio:
 
 ### Reference numbers for the current baseline
 
+Measured on 2026-10-25 from `4bfd719` (plus the WAL compile fix), release
+preset, GCC 15.2 on srv401 (Ubuntu 26.04, kernel 7.0.0).
+
 Disk — one thread, one shared **pre-created** 64 MiB file (recreated right
 before the run, see below), 4 KiB `O_DIRECT`, random offsets, median of 12
 rounds:
 
-| QD | IOPS | mean µs | p50 µs | p99 µs |
-|----|------|---------|--------|--------|
-| 1   | 12,102 | 79.1 | 78.4 | 89.1 |
-| 32  | 120,060 | 263.1 | 259.5 | 349.2 |
-| 128 | 133,889 | 944.0 | 921.3 | 1,143.5 |
+| QD | IOPS | mean µs | p50 µs | p99 µs | noise floor (stdev) |
+|----|------|---------|--------|--------|---------------------|
+| 1   | 11,881 | 80.3 | 79.6 | 90.8 | 149 IOPS (1.3 %) |
+| 32  | 120,146 | 262.9 | 259.0 | 350.8 | 1,328 IOPS (1.1 %) |
+| 128 | 133,460 | 947.0 | 924.2 | 1,148.3 | 463 IOPS (0.35 %) |
+
+The stdev is the noise floor: a candidate has to beat the baseline by more
+than ~1 % at QD 1/32 and ~0.5 % at QD 128 to mean anything. At QD 1 fio reads
+the same file at 12,749 IOPS, so that ~7 % is what the runtime costs against
+raw syscalls.
 
 Network — 512 connections, 15 s, 4 worker threads, saturation, median of 17
 interleaved samples, **fast-tier median** (the link is tri-modal, see below):
 
-| req/s | p50 | p90 | p99 |
-|-------|-----|-----|-----|
-| 332,771 | 1.483 ms | 1.877 ms | 2.672 ms |
+| req/s | p50 | p90 | p99 | p99.9 | cpu |
+|-------|-----|-----|-----|-------|-----|
+| 334,231 | 1.489 ms | 1.870 ms | 2.554 ms | 3.440 ms | 352 % |
+
+7 of the 17 samples landed in the fast tier (328,205 – 336,397 req/s,
+stdev 2,645). The other 10 sat at a 302,998 req/s median with a p99 of
+9.7 – 14.0 ms: that is the box's other moods, not the runtime. Every sample
+had a 100 % success rate.
 
 ## Measuring on srv401 (192.168.1.155)
 
@@ -220,9 +233,21 @@ interleaved samples, **fast-tier median** (the link is tri-modal, see below):
 - The load generator must **never** share the box with the server: client is
   srv501 (192.168.1.177), `10.10.10.1` ↔ `10.10.10.2` over the direct 2.5 Gbit
   link.
+- **srv401 cannot ssh to itself.** `ssh ynachi@192.168.1.155` *from* srv401
+  fails with "Host key verification failed" — the box does not know its own
+  host key. A benchmark script that runs *on* srv401 has to start and stop the
+  server locally and use ssh only for the client box (srv501, which works
+  fine). The Oct 2026 `ab_net.sh` script ssh'd to both boxes and therefore
+  only ever worked when it was launched from a workstation, not from the box.
+  A script that gets this wrong fails silently: the server never starts, the
+  samples come back empty, and the whole run is wasted.
 - Code lives under `/tmp/bench/` on the remote: `tinyio` (working clone),
   `tinyio_port` (clean clone of this tree used to build the benchmarks),
-  `kio_v2`, `ylt`.
+  `kio_v2`, `ylt`. The 2026-10-25 baseline lives in `base_4bfd719/`, with
+  `base_disk.sh`, `base_net.sh`, `agg_base_disk.py` and `agg_base_net.py`
+  next to it in `/tmp/bench/`. `/tmp` there is tmpfs, so the baseline binaries
+  and the raw TSVs are also copied to `~/baseline_2026_10_25/` on srv401
+  (`bin/`, `scripts/`, `data/`), which survives a reboot.
 - **After an `rsync` to a remote build tree, touch the sources.** `rsync -a`
   preserves mtimes, so an object compiled before a header edit can look newer
   than that header and ninja will not rebuild it. The tree then mixes objects
@@ -232,14 +257,34 @@ interleaved samples, **fast-tier median** (the link is tri-modal, see below):
   `find <tree>/src <tree>/tests -name '*.cc' -o -name '*.hpp' | xargs touch`
   before rebuilding a tree that was synced.
 
-### The disk box has two modes — always control for it
+### The disk box has two modes — but fio is not the detector for it
 
-The NVMe alternates between roughly **133k** and **102k** IOPS at QD 128. This
-is the device or the block layer, not the runtime: fio shows the same two modes
-on the same file, and the slow mode raises the *median* request latency ~32%
-and per-read CPU ~40%. Every runtime gets caught in both.
+The NVMe alternates between roughly **133k** and **102k** IOPS at QD 128, and
+in the slow mode the *median* request latency rises ~32% and per-read CPU
+~40%. Every runtime gets caught in both.
 
-Therefore, for any disk A/B:
+**But fio's QD 128 number does not tell you which mode the box is in.**
+Measured on 2026-10-25, same file, same CPUs, same runtime:
+
+| | QD 1 | QD 32 | QD 128 |
+|---|------|-------|--------|
+| tinyio | 11,881 | 120,146 | **133,460** |
+| fio, io_uring | 12,749 | 104,750 – 123,199 | 112,607 – 122,302 |
+| fio, libaio | 12,721 | 100,614 – 113,336 | 96,745 – 113,670 |
+
+fio never gets near 133k — with either engine — and its own numbers swing by
+~25% between runs. On 2026-10-25 the old "fio QD 128 < 115k ⇒ slow mode"
+rule fired in **10 of 12 rounds** while tinyio was at 133k in **all 12** of
+them: the rule is a fio artifact, not a reading of the box. tinyio itself
+landed in the slow mode in 1 round out of 12 on 2026-10-24, and in none on
+2026-10-25.
+
+So use **tinyio's own per-round spread** as the noise floor, and keep fio as a
+QD 1 anchor only (at QD 1 fio is the faster one, by ~7%: that is what the
+runtime costs against raw syscalls). A second tinyio build is a better device
+control than fio.
+
+The rest of the protocol stands:
 
 1. Use a **pre-created fixed data file** (`--file PATH`), so file placement on
    the NVMe cannot vary between arms.
@@ -249,14 +294,14 @@ Therefore, for any disk A/B:
    to ~155 µs, which silently invalidates every absolute number. A fresh
    copy of an old file is fast again; the content does not matter, only how
    recently the file was written. Check the pre-flight QD 1 number against
-   the table below before trusting a run.
+   the table above before trusting a run. Recreating the file **per round**,
+   at the same path, keeps the blocks where they were and the pages hot.
 3. **Interleave** baseline and candidate round-by-round; never run all of A
    then all of B.
 4. Report the **median over ≥9 rounds**, and state how many runs landed in
    the slow mode.
-5. Keep fio on the same file as a **device control** — it is how you know
-   whether a shift is the box or the code. fio needs `--time_based=1`,
-   otherwise it stops after one pass over the file and reports nonsense.
+5. fio still needs `--time_based=1`, otherwise it stops after one pass over
+   the file and reports nonsense.
 
 A single run means nothing here.
 
@@ -278,6 +323,13 @@ landed on opposite sides of the gap and produced an apparent −2.5 % that was
 pure mix. Bucket the samples by tier first (the largest gap in the sorted p99
 values splits them cleanly: ~3.3 ms → ~7.8 ms), then compare the arms inside
 each tier. Per tier the arms agree to well under 1 %.
+
+The 2026-10-25 baseline run split on a single gap (2.78 ms → 9.67 ms):
+7 samples in the fast tier, 10 in the slow one. The fast tier was tight
+(328,205 – 336,397 req/s, stdev 2,645) and is the estimator; the slow tier
+sat at a 302,998 req/s median with p99 between 9.7 ms and 14.0 ms. When the
+run produces only a handful of fast-tier samples, say so — a fast-tier median
+over 3 samples is not a baseline.
 
 ## Fixed buffers
 

@@ -99,7 +99,7 @@ Result<FiberId> IO::SpawnTask(std::move_only_function<void(IO&) noexcept> task) 
     // Every execution gets a fresh id, a recycled fiber included.
     fiber->id = next_fiber_id_++;
     fiber->task = std::move(task);
-    detail::ToolsCreateFiber(fiber->tools);
+    detail::ToolsCreateFiber(fiber->tools, fiber->stack);
     detail::context::Make(fiber->context, fiber->stack.high, &IO::FiberEntry, fiber);
 
     // A new or recycled fiber is in no queue yet.
@@ -124,7 +124,7 @@ TIO_NO_SANITIZE_ADDRESS void IO::ResumeFiber(detail::fiber::Fiber* fiber) noexce
 TIO_NO_SANITIZE_ADDRESS void IO::SuspendFiber(detail::fiber::Fiber* fiber) noexcept {
     detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr);
     detail::context::Switch(fiber->context, scheduler_context_);
-    detail::ToolsAfterSwitch(fiber->tools);
+    detail::ToolsAfterSwitch(fiber->tools, &scheduler_tools_);
 }
 
 [[nodiscard]] Result<void> IO::Yield() noexcept {
@@ -146,7 +146,7 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
     detail::fiber::Fiber* fiber) noexcept {
     fiber->state = detail::fiber::FiberState::done;
 
-    detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr);
+    detail::ToolsBeforeSwitch(fiber->tools, &scheduler_tools_, nullptr, true);
     // Last switch out. The stack pointer saved into fiber->context is never
     // resumed: a recycled fiber gets a fresh frame from context::Make().
     detail::context::Switch(fiber->context, scheduler_context_);
@@ -161,10 +161,11 @@ bool IO::HasLiveFibers() const noexcept { return live_fibers_ > 0; }
     auto* fiber = static_cast<detail::fiber::Fiber*>(arg);
     assert(fiber != nullptr && fiber->runtime != nullptr);
 
-    // Complete the ASAN fiber switch ResumeFiber() started. A brand-new fiber
-    // has no fake stack to restore: fiber->tools.asan_fake_stack is still the
-    // nullptr ToolsCreateFiber() set.
-    detail::ToolsAfterSwitch(fiber->tools);
+    // Complete the ASAN fiber switch ResumeFiber() started and capture the
+    // scheduler's stack bounds on the very first switch out of it. A brand-new
+    // fiber has no fake stack to restore: fiber->tools.asan_fake_stack is still
+    // the nullptr ToolsCreateFiber() set.
+    detail::ToolsAfterSwitch(fiber->tools, &fiber->runtime->scheduler_tools_);
     fiber->task(*fiber->runtime);
     fiber->runtime->FinishCurrentFiber(fiber);
 }

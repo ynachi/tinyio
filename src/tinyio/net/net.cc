@@ -79,8 +79,20 @@ Result<SocketAddress> ResolveIp(const std::string_view host, const uint16_t port
     const std::string hostname(host);
 
     if (const int rc = getaddrinfo(hostname.c_str(), service.c_str(), &hints, &res); rc != 0) {
-        // EAI_SYSTEM means check errno; all other EAI_* codes map to EIO.
-        return Error::FailErrno(rc == EAI_SYSTEM ? errno : EIO, "getaddrinfo");
+        int code = EIO;
+        if (rc == EAI_SYSTEM) {
+            code = errno;
+        } else if (rc == EAI_AGAIN) {
+            code = EAGAIN;
+        } else if (rc == EAI_MEMORY) {
+            code = ENOMEM;
+        } else if (rc == EAI_NONAME || rc == EAI_FAIL) {
+            code = EHOSTUNREACH;
+        } else if (rc == EAI_FAMILY || rc == EAI_SOCKTYPE || rc == EAI_BADFLAGS ||
+                   rc == EAI_SERVICE) {
+            code = EINVAL;
+        }
+        return Error::FailErrno(code, "getaddrinfo");
     }
 
     if (!res) {

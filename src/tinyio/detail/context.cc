@@ -48,13 +48,27 @@ asm(R"(
   .type   TinyioSwitchContext, @function
   .p2align 4
 TinyioSwitchContext:
+  .cfi_startproc
   pushq   %rbp
+  .cfi_adjust_cfa_offset 8
+  .cfi_offset %rbp, -16
   pushq   %rbx
+  .cfi_adjust_cfa_offset 8
+  .cfi_offset %rbx, -24
   pushq   %r12
+  .cfi_adjust_cfa_offset 8
+  .cfi_offset %r12, -32
   pushq   %r13
+  .cfi_adjust_cfa_offset 8
+  .cfi_offset %r13, -40
   pushq   %r14
+  .cfi_adjust_cfa_offset 8
+  .cfi_offset %r14, -48
   pushq   %r15
+  .cfi_adjust_cfa_offset 8
+  .cfi_offset %r15, -56
   subq    $8, %rsp
+  .cfi_adjust_cfa_offset 8
   stmxcsr (%rsp)
   fnstcw  4(%rsp)
 
@@ -64,13 +78,27 @@ TinyioSwitchContext:
   ldmxcsr (%rsp)
   fldcw   4(%rsp)
   addq    $8, %rsp
+  .cfi_adjust_cfa_offset -8
   popq    %r15
+  .cfi_adjust_cfa_offset -8
+  .cfi_restore %r15
   popq    %r14
+  .cfi_adjust_cfa_offset -8
+  .cfi_restore %r14
   popq    %r13
+  .cfi_adjust_cfa_offset -8
+  .cfi_restore %r13
   popq    %r12
+  .cfi_adjust_cfa_offset -8
+  .cfi_restore %r12
   popq    %rbx
+  .cfi_adjust_cfa_offset -8
+  .cfi_restore %rbx
   popq    %rbp
+  .cfi_adjust_cfa_offset -8
+  .cfi_restore %rbp
   ret
+  .cfi_endproc
   .size   TinyioSwitchContext, .-TinyioSwitchContext
 
   .globl  TinyioContextTrampoline
@@ -104,13 +132,17 @@ asm(R"(
   .type   TinyioSwitchContext, %function
   .p2align 4
 TinyioSwitchContext:
+  .cfi_startproc
   sub     sp, sp, #176
+  .cfi_adjust_cfa_offset 176
   stp     x19, x20, [sp, #0]
   stp     x21, x22, [sp, #16]
   stp     x23, x24, [sp, #32]
   stp     x25, x26, [sp, #48]
   stp     x27, x28, [sp, #64]
   stp     x29, x30, [sp, #80]
+  .cfi_offset x29, -96
+  .cfi_offset x30, -88
   stp     d8,  d9,  [sp, #96]
   stp     d10, d11, [sp, #112]
   stp     d12, d13, [sp, #128]
@@ -130,12 +162,16 @@ TinyioSwitchContext:
   ldp     x25, x26, [sp, #48]
   ldp     x27, x28, [sp, #64]
   ldp     x29, x30, [sp, #80]
+  .cfi_restore x29
+  .cfi_restore x30
   ldp     d8,  d9,  [sp, #96]
   ldp     d10, d11, [sp, #112]
   ldp     d12, d13, [sp, #128]
   ldp     d14, d15, [sp, #144]
   add     sp, sp, #176
+  .cfi_adjust_cfa_offset -176
   ret
+  .cfi_endproc
   .size   TinyioSwitchContext, .-TinyioSwitchContext
 
   .globl  TinyioContextTrampoline

@@ -50,15 +50,15 @@ inline void ParkOn(IO& io, FiberWaitQueue& waiters, const detail::fiber::WaitKin
 ///
 /// @code
 /// tinyio::Latch latch(io, 2);
-/// io.spawn([&](tinyio::IO& io) {
+/// (void)io.Spawn([&](tinyio::IO&) noexcept {
 ///     // do work
-///     latch.count_down();
+///     latch.CountDown();
 /// });
-/// io.spawn([&](tinyio::IO& io) {
+/// (void)io.Spawn([&](tinyio::IO&) noexcept {
 ///     // do work
-///     latch.count_down();
+///     latch.CountDown();
 /// });
-/// latch.wait(); // suspends until both fibers call count_down
+/// (void)latch.Wait(); // suspends until both fibers call CountDown
 /// @endcode
 struct Latch {
     explicit Latch(IO& io, const std::ptrdiff_t count) : io_(io), count_(count) {}
@@ -107,10 +107,10 @@ private:
 /// @code
 /// tinyio::Semaphore sem(io, 2); // At most 2 fibers can acquire concurrently
 ///
-/// io.spawn([&sem](tinyio::IO& io) {
-///     sem.acquire();
+/// (void)io.Spawn([&sem](tinyio::IO&) noexcept {
+///     (void)sem.Acquire();
 ///     // critical section limited to 2 concurrent fibers
-///     sem.release();
+///     sem.Release();
 /// });
 /// @endcode
 struct Semaphore {
@@ -168,8 +168,8 @@ private:
 /// tinyio::Mutex mutex(io);
 /// int shared_counter = 0;
 ///
-/// io.spawn([&](tinyio::IO& io) {
-///     auto guard = mutex.scoped_lock();
+/// (void)io.Spawn([&](tinyio::IO&) noexcept {
+///     auto guard = mutex.ScopedLock().value();
 ///     shared_counter++; // safely incremented
 /// });
 /// @endcode
@@ -264,13 +264,13 @@ struct TaskGroup;
 /// @code
 /// {
 ///     tinyio::TaskGroup group(io);
-///     group.spawn([](tinyio::IO& io) {
+///     (void)group.Spawn([](tinyio::IO&) noexcept {
 ///         // Task 1
 ///     });
-///     group.spawn([](tinyio::IO& io) {
+///     (void)group.Spawn([](tinyio::IO&) noexcept {
 ///         // Task 2
 ///     });
-///     group.wait(); // Suspends until Task 1 and Task 2 are finished
+///     (void)group.Wait(); // Suspends until Task 1 and Task 2 are finished
 /// }
 /// @endcode
 template <>
@@ -341,15 +341,15 @@ TaskGroup(IO&) -> TaskGroup<void>;
 ///
 /// @code
 /// tinyio::TaskGroup<int> group(io, 2);
-/// group.spawn([](tinyio::IO& io) -> tinyio::Result<int> {
+/// (void)group.Spawn([](tinyio::IO&) noexcept -> tinyio::Result<int> {
 ///     return 42;
 /// });
-/// group.spawn([](tinyio::IO& io) -> tinyio::Result<int> {
+/// (void)group.Spawn([](tinyio::IO&) noexcept -> tinyio::Result<int> {
 ///     return 100;
 /// });
-/// group.wait();
+/// (void)group.Wait();
 ///
-/// for (const auto& res : group.results()) {
+/// for (const auto& res : group.Results()) {
 ///     if (res && res->has_value()) {
 ///         // res->value() contains 42, then 100
 ///     }

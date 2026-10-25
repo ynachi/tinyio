@@ -53,6 +53,9 @@ Result<void> IO::Close(UniqueFd fd) noexcept {
 
 Result<uint32_t> IO::Read(const UniqueFd& fd, const std::span<std::byte> buf, const off_t offset,
                           const std::chrono::nanoseconds timeout) noexcept {
+    if (offset < -1) {
+        return Error::FailErrno(EINVAL, "read");
+    }
     // A span past the kernel's per-op cap would truncate through the unsigned
     // SQE length; clamp so the caller gets a short read instead of a wrong one.
     const auto len = static_cast<unsigned int>(std::min(buf.size(), kMaxRwLen));
@@ -64,8 +67,29 @@ Result<uint32_t> IO::Read(const UniqueFd& fd, const std::span<std::byte> buf, co
         timeout);
 }
 
+Result<void> IO::ReadExact(const UniqueFd& fd, std::span<std::byte> buf, off_t offset,
+                           const std::chrono::nanoseconds timeout) noexcept {
+    if (offset < -1) {
+        return Error::FailErrno(EINVAL, "read_exact");
+    }
+    while (!buf.empty()) {
+        TRY(const n, Read(fd, buf, offset, timeout));
+        if (n == 0) {
+            return Error::FailErrno(EIO, "read_exact");
+        }
+        buf = buf.subspan(n);
+        if (offset >= 0) {
+            offset += static_cast<off_t>(n);
+        }
+    }
+    return {};
+}
+
 Result<uint32_t> IO::Write(const UniqueFd& fd, const std::span<const std::byte> buf,
                            const off_t offset, const std::chrono::nanoseconds timeout) noexcept {
+    if (offset < -1) {
+        return Error::FailErrno(EINVAL, "write");
+    }
     // Same clamp as Read: a partial write beats a truncated length.
     const auto len = static_cast<unsigned int>(std::min(buf.size(), kMaxRwLen));
     return Syscall(
@@ -76,52 +100,96 @@ Result<uint32_t> IO::Write(const UniqueFd& fd, const std::span<const std::byte> 
         timeout);
 }
 
-Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf, const size_t len,
-                               const off_t file_offset, const size_t buffer_offset) noexcept {
-    TRY(const safe_len, FixedRange(buf, len, buffer_offset, "read_fixed"));
-    auto* start_addr = buf.Ptr() + buffer_offset;
-    return Syscall("read_fixed", [&](io_uring_sqe* sqe) {
-        io_uring_prep_read_fixed(sqe, fd.Get(), start_addr, safe_len,
-                                 static_cast<std::uint64_t>(file_offset),
-                                 static_cast<int>(buf.Index()));
-    });
+Result<void> IO::WriteAll(const UniqueFd& fd, std::span<const std::byte> buf, off_t offset,
+                          const std::chrono::nanoseconds timeout) noexcept {
+    if (offset < -1) {
+        return Error::FailErrno(EINVAL, "write_all");
+    }
+    while (!buf.empty()) {
+        TRY(const n, Write(fd, buf, offset, timeout));
+        if (n == 0) {
+            return Error::FailErrno(EIO, "write_all");
+        }
+        buf = buf.subspan(n);
+        if (offset >= 0) {
+            offset += static_cast<off_t>(n);
+        }
+    }
+    return {};
 }
 
-Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf,
-                               const off_t file_offset) noexcept {
-    return ReadFixed(fd, buf, buf.Size(), file_offset, 0);
+Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf, const size_t len,
+                               const off_t file_offset, const size_t buffer_offset,
+                               const std::chrono::nanoseconds timeout) noexcept {
+    if (file_offset < -1) {
+        return Error::FailErrno(EINVAL, "read_fixed");
+    }
+    TRY(const safe_len, FixedRange(buf, len, buffer_offset, "read_fixed"));
+    auto* start_addr = buf.Ptr() + buffer_offset;
+    return Syscall(
+        "read_fixed",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_read_fixed(sqe, fd.Get(), start_addr, safe_len,
+                                     static_cast<std::uint64_t>(file_offset),
+                                     static_cast<int>(buf.Index()));
+        },
+        timeout);
+}
+
+Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf) noexcept {
+    return ReadFixed(fd, buf, buf.Size(), -1, 0);
 }
 
 Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf, const size_t len,
-                                const off_t file_offset, const size_t buffer_offset) noexcept {
+                                const off_t file_offset, const size_t buffer_offset,
+                                const std::chrono::nanoseconds timeout) noexcept {
+    if (file_offset < -1) {
+        return Error::FailErrno(EINVAL, "write_fixed");
+    }
     TRY(const safe_len, FixedRange(buf, len, buffer_offset, "write_fixed"));
     const auto* start_addr = buf.Ptr() + buffer_offset;
-    return Syscall("write_fixed", [&](io_uring_sqe* sqe) {
-        io_uring_prep_write_fixed(sqe, fd.Get(), start_addr, safe_len,
-                                  static_cast<std::uint64_t>(file_offset),
-                                  static_cast<int>(buf.Index()));
-    });
+    return Syscall(
+        "write_fixed",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_write_fixed(sqe, fd.Get(), start_addr, safe_len,
+                                      static_cast<std::uint64_t>(file_offset),
+                                      static_cast<int>(buf.Index()));
+        },
+        timeout);
 }
 
-Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
-                                const off_t file_offset) noexcept {
-    return WriteFixed(fd, buf, buf.Size(), file_offset, 0);
+Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf) noexcept {
+    return WriteFixed(fd, buf, buf.Size(), -1, 0);
 }
 
-Result<uint32_t> IO::Readv(const UniqueFd& fd, std::span<const iovec> iovecs,
-                           const off_t offset) noexcept {
-    return Syscall("readv", [&](io_uring_sqe* sqe) {
-        io_uring_prep_readv(sqe, fd.Get(), iovecs.data(), static_cast<unsigned int>(iovecs.size()),
-                            static_cast<std::uint64_t>(offset));
-    });
+Result<uint32_t> IO::Readv(const UniqueFd& fd, std::span<const iovec> iovecs, const off_t offset,
+                           const std::chrono::nanoseconds timeout) noexcept {
+    if (offset < -1) {
+        return Error::FailErrno(EINVAL, "readv");
+    }
+    return Syscall(
+        "readv",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_readv(sqe, fd.Get(), iovecs.data(),
+                                static_cast<unsigned int>(iovecs.size()),
+                                static_cast<std::uint64_t>(offset));
+        },
+        timeout);
 }
 
-Result<uint32_t> IO::Writev(const UniqueFd& fd, std::span<const iovec> iovecs,
-                            const off_t offset) noexcept {
-    return Syscall("writev", [&](io_uring_sqe* sqe) {
-        io_uring_prep_writev(sqe, fd.Get(), iovecs.data(), static_cast<unsigned int>(iovecs.size()),
-                             static_cast<std::uint64_t>(offset));
-    });
+Result<uint32_t> IO::Writev(const UniqueFd& fd, std::span<const iovec> iovecs, const off_t offset,
+                            const std::chrono::nanoseconds timeout) noexcept {
+    if (offset < -1) {
+        return Error::FailErrno(EINVAL, "writev");
+    }
+    return Syscall(
+        "writev",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_writev(sqe, fd.Get(), iovecs.data(),
+                                 static_cast<unsigned int>(iovecs.size()),
+                                 static_cast<std::uint64_t>(offset));
+        },
+        timeout);
 }
 
 Result<void> IO::Fsync(const UniqueFd& fd, const bool datasync) noexcept {
@@ -139,6 +207,9 @@ Result<UniqueFd> IO::Open(const std::filesystem::path& path, const int flags,
 
 Result<void> IO::Fallocate(const UniqueFd& fd, const int mode, const off_t offset,
                            const off_t len) noexcept {
+    if (offset < 0 || len <= 0) {
+        return Error::FailErrno(EINVAL, "fallocate");
+    }
     return Syscall<void>("fallocate", [&](io_uring_sqe* sqe) {
         io_uring_prep_fallocate(sqe, fd.Get(), mode, static_cast<std::uint64_t>(offset),
                                 static_cast<std::uint64_t>(len));
@@ -146,6 +217,9 @@ Result<void> IO::Fallocate(const UniqueFd& fd, const int mode, const off_t offse
 }
 
 Result<void> IO::Ftruncate(const UniqueFd& fd, const off_t len) noexcept {
+    if (len < 0) {
+        return Error::FailErrno(EINVAL, "ftruncate");
+    }
     return Syscall<void>("ftruncate",
                          [&](io_uring_sqe* sqe) { io_uring_prep_ftruncate(sqe, fd.Get(), len); });
 }

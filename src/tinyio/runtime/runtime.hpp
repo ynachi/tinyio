@@ -181,19 +181,27 @@ public:
     /// as a fiber on the next tick() on the owner thread. The owner thread is
     /// woken up via the internal eventfd if it is currently sleeping.
     ///
-    /// @return true if the task was successfully enqueued; false on OOM.
+    /// @return true if the task was successfully enqueued; false on OOM or when stopping.
     template <class Fn>
         requires std::constructible_from<std::move_only_function<void(IO&) noexcept>, Fn>
     [[nodiscard]] bool Post(Fn&& fn) noexcept {
-        if (stopping_.load(std::memory_order_acquire)) {
-            return false;
-        }
-        try {
-            if (!post_queue_.Enqueue(
-                    std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)))) {
+        uint64_t cur = post_state_.load(std::memory_order_relaxed);
+        do {
+            if ((cur & k_post_closed_bit) != 0) {
                 return false;
             }
+        } while (!post_state_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed));
+
+        bool enqueued = false;
+        try {
+            enqueued = post_queue_.Enqueue(
+                std::move_only_function<void(IO&) noexcept>(std::forward<Fn>(fn)));
         } catch (...) {
+            enqueued = false;
+        }
+        if (!enqueued) {
+            post_state_.fetch_sub(1, std::memory_order_acq_rel);
             return false;
         }
         Wake();
@@ -212,7 +220,9 @@ public:
     }
 
     /// Returns true if the runtime is currently stopping
-    [[nodiscard]] bool Stopping() const noexcept { return stopping_; }
+    [[nodiscard]] bool Stopping() const noexcept {
+        return stopping_.load(std::memory_order_acquire);
+    }
 
     /// @name Fixed buffers
     ///
@@ -272,12 +282,12 @@ public:
     /// @endcode
     [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                               size_t len, off_t file_offset = -1,
-                                              size_t buffer_offset = 0) noexcept;
+                                              size_t buffer_offset = 0,
+                                              std::chrono::nanoseconds timeout = {}) noexcept;
 
-    /// Write the whole contents of @p buf to @p fd starting at @p file_offset.
-    /// Equivalent to write_fixed(fd, buf, buf.size(), file_offset).
-    [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
-                                              off_t file_offset = -1) noexcept;
+    /// Write the whole contents of @p buf to @p fd at its current position.
+    /// Equivalent to WriteFixed(fd, buf, buf.Size(), -1, 0).
+    [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf) noexcept;
     /// Read up to @p len bytes from @p fd into @p buf (a registered fixed buffer)
     /// starting at @p offset.
     ///
@@ -295,13 +305,12 @@ public:
     ///                          static_cast<size_t>(n)};
     /// @endcode
     [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf, size_t len,
-                                             off_t file_offset = -1,
-                                             size_t buffer_offset = 0) noexcept;
+                                             off_t file_offset = -1, size_t buffer_offset = 0,
+                                             std::chrono::nanoseconds timeout = {}) noexcept;
 
-    /// Read up to buf.size() bytes from @p fd into @p buf starting at @p file_offset.
-    /// Equivalent to read_fixed(fd, buf, buf.size(), file_offset).
-    [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf,
-                                             off_t file_offset = -1) noexcept;
+    /// Read up to buf.Size() bytes from @p fd into @p buf at its current position.
+    /// Equivalent to ReadFixed(fd, buf, buf.Size(), -1, 0).
+    [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf) noexcept;
 
     /// Read up to buf.size() bytes from @p fd into the caller-provided span @p buf.
     ///
@@ -314,6 +323,12 @@ public:
                                         off_t offset = -1,
                                         std::chrono::nanoseconds timeout = {}) noexcept;
 
+    /// Read exactly @p buf.size() bytes from @p fd into @p buf, retrying on short reads.
+    /// Fails with EEOF / EIO if EOF is reached before @p buf is filled.
+    [[nodiscard]] Result<void> ReadExact(const UniqueFd& fd, std::span<std::byte> buf,
+                                         off_t offset = -1,
+                                         std::chrono::nanoseconds timeout = {}) noexcept;
+
     /// Write up to buf.size() bytes from the caller-provided span @p buf to @p fd.
     ///
     /// Pass @p offset = -1 to use the file's current position.
@@ -323,6 +338,11 @@ public:
                                          off_t offset = -1,
                                          std::chrono::nanoseconds timeout = {}) noexcept;
 
+    /// Write all @p buf.size() bytes from @p buf to @p fd, retrying on short writes.
+    [[nodiscard]] Result<void> WriteAll(const UniqueFd& fd, std::span<const std::byte> buf,
+                                        off_t offset = -1,
+                                        std::chrono::nanoseconds timeout = {}) noexcept;
+
     /// Write the scatter-gather vector @p iovecs to @p fd starting at @p offset.
     ///
     /// Wraps pwritev2 via io_uring's WRITEV operation.
@@ -330,7 +350,8 @@ public:
     ///
     /// @return Total bytes written, or an error code.
     [[nodiscard]] Result<uint32_t> Writev(const UniqueFd& fd, std::span<const iovec> iovecs,
-                                          off_t offset = -1) noexcept;
+                                          off_t offset = -1,
+                                          std::chrono::nanoseconds timeout = {}) noexcept;
 
     /// Read the scatter-gather vector @p iovecs from @p fd starting at @p offset.
     ///
@@ -339,7 +360,8 @@ public:
     ///
     /// @return Total bytes read, or an error code.
     [[nodiscard]] Result<uint32_t> Readv(const UniqueFd& fd, std::span<const iovec> iovecs,
-                                         off_t offset = -1) noexcept;
+                                         off_t offset = -1,
+                                         std::chrono::nanoseconds timeout = {}) noexcept;
 
     /// Flush pending writes on @p fd to the storage device.
     ///
@@ -434,6 +456,7 @@ public:
 private:
     static constexpr uint64_t k_wakeup_sentinel = 0xDEAD'C0DE'DEAD'C0DEULL;
     static constexpr uint64_t k_fiber_cancel_sentinel = 0xDEAD'C0DE'DEAD'C0CCULL;
+    static constexpr uint64_t k_post_closed_bit = 1ULL << 63U;
 
     /// Consecutive tick failures tolerated before the runtime gives up on a
     /// drain. A tick error used to abandon the drain on the first one, which
@@ -507,8 +530,7 @@ private:
         io_uring_sqe_set_data64(sqe, reinterpret_cast<__u64>(&op));
 
         if (timeout.count() > 0) {
-            timer_wheel_.Arm(current_fiber_,
-                             detail::MonotonicNowNs() + static_cast<uint64_t>(timeout.count()));
+            timer_wheel_.Arm(current_fiber_, NowNs() + static_cast<uint64_t>(timeout.count()));
         }
 
         current_fiber_->state = detail::fiber::FiberState::waiting;
@@ -534,8 +556,22 @@ private:
     /// Cancel every op whose wheel deadline has passed (rare path).
     void ProcessExpiredTimers() noexcept;
 
+    /// Lazily populated monotonic timestamp for the current tick's Phase 1,
+    /// avoiding repeated clock_gettime calls when many fibers arm timeouts.
+    [[nodiscard]] uint64_t NowNs() noexcept {
+        if (cached_now_ns_ == 0) {
+            cached_now_ns_ = detail::MonotonicNowNs();
+        }
+        return cached_now_ns_;
+    }
+
+    [[nodiscard]] bool HasPendingPosts() const noexcept {
+        return (post_state_.load(std::memory_order_acquire) & ~k_post_closed_bit) != 0;
+    }
+
     /// Per-op timeout bookkeeping. Owner-thread only.
     detail::TimerWheel timer_wheel_;
+    uint64_t cached_now_ns_ = 0;
 
     //
     // event fd for cross-thread signaling
@@ -558,6 +594,8 @@ private:
     /// must not block on a completion that can never arrive.
     bool drain_to_completion_{false};
     std::atomic<bool> stopping_{false};
+    /// Low 63 bits: pending posted tasks; bit 63 (k_post_closed_bit): closed.
+    std::atomic<uint64_t> post_state_{0};
     std::thread::id owner_tid_;
 
     //

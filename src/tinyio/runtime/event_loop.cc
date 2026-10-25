@@ -28,6 +28,7 @@ Result<void> IO::Tick() noexcept {
     // Phase 1: harvest tasks posted from remote threads, then resume the
     // ready fibers. Resuming is what arms the SQEs, so doing it first means
     // the submit below carries them into the kernel in this very iteration.
+    cached_now_ns_ = 0;
     DrainRemote();
     ResumeReadyFibers();
 
@@ -35,11 +36,12 @@ Result<void> IO::Tick() noexcept {
     // blocking in submit_and_wait now would wait for a completion that can
     // never arrive. Live fibers do not count: one parked on a sync primitive
     // waits for no completion either.
-    if (drain_to_completion_ && inflight_ops_ == 0 && ready_queue_.Empty() && post_queue_.Empty()) {
+    if (drain_to_completion_ && inflight_ops_ == 0 && ready_queue_.Empty() && !HasPendingPosts()) {
         return {};
     }
 
     // Phase 2: submit, and sleep only when nothing is runnable.
+    cached_now_ns_ = 0;
     auto submitted = SubmitOrWait();
 
     // Phase 3: reap, even when the submit failed: completions already in the
@@ -57,6 +59,10 @@ Result<void> IO::Tick() noexcept {
 }
 
 void IO::DrainRemote() {
+    if (!HasPendingPosts()) {
+        return;
+    }
+
     constexpr size_t k_max_bulk = 64;
     std::array<std::move_only_function<void(IO&) noexcept>, k_max_bulk> fns;
 
@@ -68,6 +74,7 @@ void IO::DrainRemote() {
         if (dequeued == 0) {
             break;
         }
+        post_state_.fetch_sub(dequeued, std::memory_order_acq_rel);
 
         for (size_t i = 0; i < dequeued; ++i) {
             if (auto res = SpawnTask(std::move(fns[i])); !res) {
@@ -76,6 +83,9 @@ void IO::DrainRemote() {
             }
         }
         total += dequeued;
+        if (!HasPendingPosts()) {
+            break;
+        }
     }
 }
 
@@ -97,11 +107,17 @@ void IO::ResumeReadyFibers() {
 Result<void> IO::SubmitOrWait() noexcept {
     // Only block when there is no local work to do.
     const bool runnable =
-        io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || !post_queue_.Empty();
+        io_uring_cq_ready(&ring_) > 0 || !ready_queue_.Empty() || HasPendingPosts();
 
     if (runnable) {
-        const bool get_events = (opts_.additional_uring_flags & IORING_SETUP_DEFER_TASKRUN) != 0;
-        if (const int ret = SubmitSqes(get_events); ret < 0) {
+        // When IORING_SETUP_TASKRUN_FLAG is set alongside DEFER_TASKRUN (the
+        // default), liburing's io_uring_submit() inspects IORING_SQ_TASKRUN and
+        // enters the kernel with GETEVENTS only when SQEs are queued or kernel
+        // task_work is pending, avoiding a syscall on pure-CPU ticks.
+        const bool force_get_events = (opts_.additional_uring_flags &
+                                       (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG)) ==
+                                      IORING_SETUP_DEFER_TASKRUN;
+        if (const int ret = SubmitSqes(force_get_events); ret < 0) {
             return Error::FailErrno(-ret, "submit_or_wait.io_uring_submit");
         }
         return {};
@@ -112,7 +128,7 @@ Result<void> IO::SubmitOrWait() noexcept {
     // (IORING_ENTER_EXT_ARG) - no timeout SQE exists anywhere.
     __kernel_timespec ts{};
     __kernel_timespec* tsp = nullptr;
-    if (const auto ns = timer_wheel_.NsUntilNext(detail::MonotonicNowNs()); ns.has_value()) {
+    if (const auto ns = timer_wheel_.NsUntilNext(NowNs()); ns.has_value()) {
         ts.tv_sec = static_cast<long long>(*ns / 1'000'000'000ULL);
         ts.tv_nsec = static_cast<long long>(*ns % 1'000'000'000ULL);
         tsp = &ts;
@@ -120,6 +136,7 @@ Result<void> IO::SubmitOrWait() noexcept {
 
     io_uring_cqe* cqe = nullptr;
     const auto ret = io_uring_submit_and_wait_timeout(&ring_, &cqe, 1, tsp, nullptr);
+    cached_now_ns_ = 0;
     if (ret >= 0 || ret == -EINTR || ret == -ETIME) {
         return {};
     }
@@ -200,7 +217,7 @@ std::size_t IO::DrainCompletions() noexcept {
 
     io_uring_cq_advance(&ring_, count);
 
-    if (needs_rearm) {
+    if (needs_rearm && !stopping_.load(std::memory_order_relaxed)) {
         if (auto res = ArmWakeRead(); !res) {
             ELOGFMT(WARN, "failed to re-arm eventfd read: [{}] {}", res.error().Context(),
                     res.error().Message());
@@ -232,14 +249,15 @@ void IO::ProcessExpiredTimers() noexcept {
         return;
     }
 
+    const uint64_t now_ns = NowNs();
     bool issued = false;
-    timer_wheel_.Expire(detail::MonotonicNowNs(), [&](detail::fiber::Fiber* fiber) noexcept {
+    timer_wheel_.Expire(now_ns, [&](detail::fiber::Fiber* fiber) noexcept {
         auto res = GetSqe();
         if (!res) {
             // Could not cancel now: re-arm one tick out and retry.
             ELOGFMT(ERROR, "timeout cancel SQE alloc failed: [{}] {}", res.error().Context(),
                     res.error().Message());
-            timer_wheel_.Arm(fiber, detail::MonotonicNowNs() + detail::TimerWheel::k_tick_ns);
+            timer_wheel_.Arm(fiber, now_ns + detail::TimerWheel::k_tick_ns);
             return;
         }
         fiber->operation.timed_out = true;
@@ -253,7 +271,7 @@ void IO::ProcessExpiredTimers() noexcept {
         // Submit immediately (rare path, cheap insurance): the cancel must
         // reach the kernel before any future SQE that reuses this fiber's
         // &Operation as user_data, so it can never match a successor op.
-        io_uring_submit(&ring_);
+        (void)SubmitSqes(false);
     }
 }
 
@@ -280,7 +298,6 @@ Result<void> IO::ArmWakeRead() noexcept {
     TRY(sqe, GetSqe());
     io_uring_prep_read(sqe, wake_fd_, &wake_value_, sizeof(wake_value_), 0);
     io_uring_sqe_set_data64(sqe, k_wakeup_sentinel);
-    io_uring_submit(&ring_);
     return {};
 }
 

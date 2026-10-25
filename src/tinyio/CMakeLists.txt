@@ -22,7 +22,7 @@ target_sources(tinyio
         runtime/io_ops.cc
         runtime/runtime.cc
         runtime/scheduler.cc
-        wal/wal.cc
+#        wal/wal.cc
 
         # The headers are a file set, so they belong to the target: IDEs index
         # them as project files, the base directories become the include path,
@@ -51,10 +51,23 @@ target_sources(tinyio
         runtime/buffer_pool.hpp
         runtime/fiber_sync.hpp
         runtime/runtime.hpp
-        wal/wal.hpp
+#        wal/wal.hpp
 )
 
 target_compile_features(tinyio PUBLIC cxx_std_23)
+
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-fcf-protection=branch" TINYIO_HAVE_FCF_PROTECTION_BRANCH)
+    if (TINYIO_HAVE_FCF_PROTECTION_BRANCH)
+        # TinyioSwitchContext pivots %rsp and returns to another stack, which is
+        # incompatible with hardware shadow stacks (SHSTK). Marking context.cc
+        # with branch-only protection drops GNU_PROPERTY_X86_FEATURE_1_SHSTK from
+        # the binary so the loader does not enable shadow stacks for it.
+        set_source_files_properties(detail/context.cc PROPERTIES
+                COMPILE_OPTIONS "-fcf-protection=branch")
+    endif ()
+endif ()
 
 target_link_libraries(tinyio
         PUBLIC

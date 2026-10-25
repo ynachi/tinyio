@@ -89,14 +89,18 @@ struct std::formatter<tinyio::Error> : std::formatter<std::string> {
 
 namespace tinyio::detail {
 
-/// Move the value out of an expected; yields nothing when it holds void.
+/// Extract the value from an expected, moving when given an rvalue and
+/// copying when given an lvalue; yields nothing when it holds void.
 template <class Exp>
-auto UnwrapExpected(Exp&& exp) noexcept {
+decltype(auto) UnwrapExpected(Exp&& exp) noexcept(
+    std::is_void_v<typename std::decay_t<Exp>::value_type> ||
+    std::is_nothrow_constructible_v<typename std::decay_t<Exp>::value_type,
+                                    decltype(*std::forward<Exp>(exp))>) {
     using ValueT = std::decay_t<Exp>::value_type;
     if constexpr (std::is_void_v<ValueT>) {
         return;
     } else {
-        return std::move(*std::forward<Exp>(exp));
+        return ValueT(*std::forward<Exp>(exp));
     }
 }
 }  // namespace tinyio::detail
@@ -107,10 +111,9 @@ auto UnwrapExpected(Exp&& exp) noexcept {
 // These are plain if-statements, not GNU statement expressions: every
 // expansion is standard C++ and works under -Wpedantic.
 //
-// ARGUMENT LIFETIME: pass an RVALUE. The expansion binds auto&& to the
-// argument and then moves out of it -- handed an lvalue, the macro silently
-// empties the caller's object (the expected keeps has_value() == true with
-// a moved-from value). `TRY(n, helper(1));`, not `TRY(n, member_result);`.
+// Rvalues are moved out of; lvalues are copied from (or rejected at compile
+// time when the value type is move-only, preventing accidental silent moves
+// out of an lvalue Result).
 // ---------------------------------------------------------------------------
 
 #define TINYIO_DETAIL_CAT_I(a, b) a##b
@@ -122,34 +125,41 @@ auto UnwrapExpected(Exp&& exp) noexcept {
 ///   TRY(n, io.Read(fd, buf));   // n is the unwrapped value
 ///   TRY_VOID(io.Close(fd));     // Result<void>: just propagate
 /// \endcode
-#define TRY(var, ...) TRY_IMPL(var, __COUNTER__, __VA_ARGS__)
+#define TINYIO_TRY(var, ...) TINYIO_TRY_IMPL(var, __COUNTER__, __VA_ARGS__)
 
-#define TRY_IMPL(var, id, ...)                                                          \
-    auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (__VA_ARGS__);                         \
-    if (!TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]]                  \
-        return std::unexpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)).error()); \
-    auto var = ::tinyio::detail::UnwrapExpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)))
+#define TINYIO_TRY_IMPL(var, id, ...)                                                       \
+    auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (__VA_ARGS__);                             \
+    if (!TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]]                      \
+        return std::unexpected(std::forward<decltype(TINYIO_DETAIL_CAT(_tinyio_try_, id))>( \
+                                   TINYIO_DETAIL_CAT(_tinyio_try_, id))                     \
+                                   .error());                                               \
+    auto var = ::tinyio::detail::UnwrapExpected(                                            \
+        std::forward<decltype(TINYIO_DETAIL_CAT(_tinyio_try_, id))>(                        \
+            TINYIO_DETAIL_CAT(_tinyio_try_, id)))
 
 /// \brief Propagate the error of a Result<void>; binds nothing.
 ///
 /// A Result<void> cannot be bound to a variable, so every void operation
 /// (close, fsync, drain, ...) needs this form.
-#define TRY_VOID(...) TRY_VOID_IMPL(__COUNTER__, __VA_ARGS__)
+#define TINYIO_TRY_VOID(...) TINYIO_TRY_VOID_IMPL(__COUNTER__, __VA_ARGS__)
 
-#define TRY_VOID_IMPL(id, ...)                                         \
-    if (auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (__VA_ARGS__);    \
-        !TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] \
-    return std::unexpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)).error())
+#define TINYIO_TRY_VOID_IMPL(id, ...)                                                   \
+    if (auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (__VA_ARGS__);                     \
+        !TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]]                  \
+    return std::unexpected(std::forward<decltype(TINYIO_DETAIL_CAT(_tinyio_try_, id))>( \
+                               TINYIO_DETAIL_CAT(_tinyio_try_, id))                     \
+                               .error())
 
-/// \brief Like \c TRY but logs the error before propagating it.
+/// \brief Like \c TINYIO_TRY but logs the error before propagating it.
 ///
 /// \param var The variable the value is bound to.
 /// \param expr A \c Result<T>.
 /// \param fmt  A format string for the context of the failure; extra
 ///              arguments are appended to it.
-#define TRY_LOG_ERR(var, expr, fmt, ...) TRY_LOG_ERR_IMPL(var, __COUNTER__, expr, fmt, __VA_ARGS__)
+#define TINYIO_TRY_LOG_ERR(var, expr, fmt, ...) \
+    TINYIO_TRY_LOG_ERR_IMPL(var, __COUNTER__, expr, fmt, __VA_ARGS__)
 
-#define TRY_LOG_ERR_IMPL(var, id, expr, fmt, ...)                              \
+#define TINYIO_TRY_LOG_ERR_IMPL(var, id, expr, fmt, ...)                       \
     auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (expr);                       \
     if (!TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] {       \
         const auto& _tinyio_err = TINYIO_DETAIL_CAT(_tinyio_try_, id).error(); \
@@ -157,12 +167,15 @@ auto UnwrapExpected(Exp&& exp) noexcept {
                 _tinyio_err.Value() __VA_OPT__(, ) __VA_ARGS__);               \
         return std::unexpected(_tinyio_err);                                   \
     }                                                                          \
-    auto var = ::tinyio::detail::UnwrapExpected(std::move(TINYIO_DETAIL_CAT(_tinyio_try_, id)))
+    auto var = ::tinyio::detail::UnwrapExpected(                               \
+        std::forward<decltype(TINYIO_DETAIL_CAT(_tinyio_try_, id))>(           \
+            TINYIO_DETAIL_CAT(_tinyio_try_, id)))
 
-/// \brief Like \c TRY_VOID but logs the error before propagating it.
-#define TRY_LOG_ERR_VOID(expr, fmt, ...) TRY_LOG_ERR_VOID_IMPL(__COUNTER__, expr, fmt, __VA_ARGS__)
+/// \brief Like \c TINYIO_TRY_VOID but logs the error before propagating it.
+#define TINYIO_TRY_LOG_ERR_VOID(expr, fmt, ...) \
+    TINYIO_TRY_LOG_ERR_VOID_IMPL(__COUNTER__, expr, fmt, __VA_ARGS__)
 
-#define TRY_LOG_ERR_VOID_IMPL(id, expr, fmt, ...)                              \
+#define TINYIO_TRY_LOG_ERR_VOID_IMPL(id, expr, fmt, ...)                       \
     if (auto&& TINYIO_DETAIL_CAT(_tinyio_try_, id) = (expr);                   \
         !TINYIO_DETAIL_CAT(_tinyio_try_, id).has_value()) [[unlikely]] {       \
         const auto& _tinyio_err = TINYIO_DETAIL_CAT(_tinyio_try_, id).error(); \
@@ -170,3 +183,10 @@ auto UnwrapExpected(Exp&& exp) noexcept {
                 _tinyio_err.Value() __VA_OPT__(, ) __VA_ARGS__);               \
         return std::unexpected(_tinyio_err);                                   \
     }
+
+#ifndef TINYIO_NO_SHORT_MACROS
+#    define TRY(var, ...) TINYIO_TRY(var, __VA_ARGS__)
+#    define TRY_VOID(...) TINYIO_TRY_VOID(__VA_ARGS__)
+#    define TRY_LOG_ERR(var, expr, fmt, ...) TINYIO_TRY_LOG_ERR(var, expr, fmt, __VA_ARGS__)
+#    define TRY_LOG_ERR_VOID(expr, fmt, ...) TINYIO_TRY_LOG_ERR_VOID(expr, fmt, __VA_ARGS__)
+#endif

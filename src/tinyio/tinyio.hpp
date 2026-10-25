@@ -4,13 +4,14 @@
 /// \code
 ///   auto listener = TcpListener::Bind(8080).value();
 ///   IO io{0, IoOptions{}};
-///   io.spawn([&listener](tinyio::IO& io) noexcept {
+///   (void)io.Spawn([&listener](tinyio::IO& rt) noexcept {
 ///       while (true) {
-///           TRY(client, io.Accept(listener));
+///           auto client = rt.Accept(listener);
+///           if (!client) break;
 ///           // handle client ...
 ///       }
 ///   });
-///   io.run_until_done();
+///   io.RunUntilDone();
 /// \endcode
 #pragma once
 

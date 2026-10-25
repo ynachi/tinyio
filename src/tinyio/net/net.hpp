@@ -80,15 +80,10 @@ struct NonBlocking {
 
 /// @brief Wrapper for sockaddr_storage supporting both IPv4 and IPv6.
 ///
-/// Provides convenient factory methods for creating addresses and async DNS
-/// resolution that doesn't block the event loop.
+/// Provides convenient factory methods for creating IPv4 and IPv6 addresses.
 ///
 /// @code
-///   // Direct IPv4 address
-///   auto addr = SocketAddress::v4(8080, "0.0.0.0");
-///
-///   // Async DNS resolution (non-blocking)
-///   auto addr = co_await SocketAddress::ResolveAsync(ctx, pool, "example.com", 443);
+///   auto addr = SocketAddress::V4(8080, "0.0.0.0");
 /// @endcode
 struct SocketAddress {
     sockaddr_storage addr{};
@@ -143,11 +138,10 @@ struct SocketAddress {
 /// @return Result<SocketAddress> with resolved address or error
 ///
 /// @warning This is a BLOCKING call that may take seconds for DNS resolution.
-///          Use ResolveAsync() in async code paths to avoid blocking the event loop.
+///          Resolve hostnames up front before starting the event loop.
 ///
 /// @code
-///   // OK in initialization code
-///   auto addr = SocketAddress::Resolve("database.local", 5432);
+///   auto addr = ResolveIp("database.local", 5432);
 /// @endcode
 Result<SocketAddress> ResolveIp(std::string_view host, uint16_t port);
 

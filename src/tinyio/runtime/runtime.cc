@@ -44,6 +44,7 @@ IO::IO(const size_t id, const IoOptions& opts)
 }
 
 IO::~IO() noexcept {
+    post_state_.fetch_or(k_post_closed_bit, std::memory_order_acq_rel);
     const bool was_stopping = stopping_.exchange(true, std::memory_order_release);
 
     // Discard any tasks that were posted but not yet spawned.
@@ -53,6 +54,7 @@ IO::~IO() noexcept {
         std::move_only_function<void(IO&) noexcept> fn;
         while (post_queue_.TryDequeue(fn)) {
         }
+        post_state_.store(k_post_closed_bit, std::memory_order_release);
     }
 
     // Quiesce in-flight work before releasing kernel resources.
@@ -190,11 +192,16 @@ void IO::CancelAndDrain() noexcept {
     // waking them early would let them destroy synchronization primitives
     // while the IO fibers are still unwinding, causing Use-After-Free.
     if (inflight_ops_ > 0) {
-        if (auto sqe = GetSqe(); sqe) {
+        auto sqe = GetSqe();
+        if (!sqe) {
+            ReapOverflow();
+            sqe = GetSqe();
+        }
+        if (sqe) {
             io_uring_prep_cancel64(*sqe, 0, IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY);
             io_uring_sqe_set_data64(*sqe, k_fiber_cancel_sentinel);
             ++inflight_ops_;
-            io_uring_submit(&ring_);
+            (void)SubmitSqes(false);
         } else {
             ELOGFMT(ERROR, "cancel SQE alloc failed: [{}] {}", sqe.error().Context(),
                     sqe.error().Message());
@@ -212,7 +219,7 @@ void IO::DriveToQuiescence(const char* who) noexcept {
     // runtime is quiesced: it would wait for a completion that can never come.
     drain_to_completion_ = true;
     int consecutive_errors = 0;
-    while (inflight_ops_ > 0 || !ready_queue_.Empty() || !post_queue_.Empty()) {
+    while (inflight_ops_ > 0 || !ready_queue_.Empty() || HasPendingPosts()) {
         // Giving up must not return: operations would still be in flight when
         // the ring is torn down, and the kernel would then reference Operation
         // objects that live inside the fibers about to be freed.
@@ -296,6 +303,8 @@ Result<void> IO::Activate() noexcept {
     if (auto res = ArmWakeRead(); !res) {
         ELOGFMT(WARN, "failed to arm eventfd read: [{}] {}", res.error().Context(),
                 res.error().Message());
+    } else {
+        (void)SubmitSqes(false);
     }
     is_activated_ = true;
 
@@ -343,6 +352,7 @@ void IO::Run(const std::stop_token& st) noexcept {
         }
     }
 
+    post_state_.fetch_or(k_post_closed_bit, std::memory_order_acq_rel);
     stopping_.store(true, std::memory_order_release);
     ELOGFMT(INFO, "Worker {} quiescing...", id_);
     CancelAndDrain();

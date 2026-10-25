@@ -139,10 +139,70 @@ TEST(IOCorrectnessTest, FixedBufferRangeOutsideTheSlotIsRejected) {
         ASSERT_TRUE(clamped.has_value());
         EXPECT_EQ(*clamped, 6u);
 
+        // 2-argument convenience overload writes/reads the full slot, and
+        // 3-argument overload specifies length unambiguously.
+        auto three_arg = fio.WriteFixed(fd, fixed_buf, 16);
+        ASSERT_TRUE(three_arg.has_value());
+        EXPECT_EQ(*three_arg, 16u);
+
+        // Negative file_offset < -1 is rejected with EINVAL.
+        auto neg_off = fio.ReadFixed(fd, fixed_buf, 16, -2);
+        ASSERT_FALSE(neg_off.has_value());
+        EXPECT_EQ(neg_off.error().Value(), EINVAL);
+
         (void)fio.Close(std::move(fd));
         (void)fio.Remove(file_path);
     });
     io.RunUntilDone();
+}
+
+TEST(IOCorrectnessTest, WriteAllAndReadExactRoundtrip) {
+    IoOptions opts;
+    IO io{0, opts};
+
+    (void)io.Spawn([](IO& fio) noexcept {
+        auto file_path = std::filesystem::temp_directory_path() / "tinyio_test_exact.txt";
+        auto fd_res = fio.Open(file_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        ASSERT_TRUE(fd_res.has_value());
+        UniqueFd fd = std::move(*fd_res);
+
+        std::string_view payload = "WriteAll + ReadExact verification payload";
+        auto w_res = fio.WriteAll(fd, std::as_bytes(std::span(payload)), 0);
+        ASSERT_TRUE(w_res.has_value());
+
+        std::array<char, 64> buf{};
+        auto r_res =
+            fio.ReadExact(fd, std::as_writable_bytes(std::span(buf).first(payload.size())), 0);
+        ASSERT_TRUE(r_res.has_value());
+        EXPECT_EQ(std::string_view(buf.data(), payload.size()), payload);
+
+        // Reading past EOF fails with EIO.
+        auto eof_res = fio.ReadExact(fd, std::as_writable_bytes(std::span(buf)), 0);
+        ASSERT_FALSE(eof_res.has_value());
+        EXPECT_EQ(eof_res.error().Value(), EIO);
+
+        // Negative offset < -1 fails with EINVAL.
+        auto bad_off = fio.Read(fd, std::as_writable_bytes(std::span(buf)), -2);
+        ASSERT_FALSE(bad_off.has_value());
+        EXPECT_EQ(bad_off.error().Value(), EINVAL);
+
+        (void)fio.Close(std::move(fd));
+        (void)fio.Remove(file_path);
+    });
+    io.RunUntilDone();
+}
+
+TEST(IOCorrectnessTest, TryMacroPreservesLvalueResult) {
+    auto helper = [](const Result<std::string>& lvalue_res) -> Result<std::string> {
+        TRY(copy_val, lvalue_res);
+        return copy_val;
+    };
+
+    Result<std::string> orig = std::string("preserved_lvalue_string_longer_than_sso");
+    auto out = helper(orig);
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(*out, "preserved_lvalue_string_longer_than_sso");
+    EXPECT_EQ(*orig, "preserved_lvalue_string_longer_than_sso");
 }
 
 // The destructor does not run when the constructor throws, so a failed
