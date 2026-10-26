@@ -58,7 +58,7 @@ public:
         f->timer_armed = true;
         f->timer_index = slot.size();
         slot.push_back(f);
-        occupied_[idx >> 6U] |= (1ULL << (idx & 63U));
+        occupied_[idx >> 6U] |= (uint64_t{1} << (idx & 63U));
         ++armed_;
     }
 
@@ -94,7 +94,7 @@ public:
 
         for (uint64_t t = from; t <= cur; ++t) {
             const size_t idx = static_cast<size_t>(t & (k_slots - 1));
-            if ((occupied_[idx >> 6U] & (1ULL << (idx & 63U))) == 0) {
+            if ((occupied_[idx >> 6U] & (uint64_t{1} << (idx & 63U))) == 0) {
                 continue;
             }
             Slot& slot = slots_[idx];
@@ -172,7 +172,7 @@ private:
     }
 
     [[nodiscard]] static size_t SlotOf(const uint64_t deadline_ns) noexcept {
-        return deadline_ns / k_tick_ns & k_slots - 1;
+        return static_cast<size_t>((deadline_ns / k_tick_ns) & (k_slots - 1));
     }
 
     // Swap-and-pop: move the slot's last fiber into f's position.
@@ -191,7 +191,7 @@ private:
         slot.pop_back();
         f->timer_armed = false;
         if (slot.empty()) {
-            occupied_[idx >> 6U] &= ~(1ULL << (idx & 63U));
+            occupied_[idx >> 6U] &= ~(uint64_t{1} << (idx & 63U));
         }
     }
 

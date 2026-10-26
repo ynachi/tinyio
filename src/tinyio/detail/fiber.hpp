@@ -1,4 +1,5 @@
 #pragma once
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 
@@ -119,6 +120,12 @@ struct alignas(64) Fiber {
     /// True while the fiber is armed in the TimerWheel.
     bool timer_armed = false;
 
+    /// True when FixedBufferPool::Release() handed a slot directly to this fiber.
+    bool has_handed_slot = false;
+
+    /// The slot ordinal handed to this fiber by FixedBufferPool::Release().
+    std::uint32_t handed_slot = 0;
+
     /// The pre-allocated I/O operation data. By embedding this inside the fiber,
     /// we avoid heap allocations for every single read/write operation.
     ///
@@ -128,6 +135,12 @@ struct alignas(64) Fiber {
     /// until the first CQE is received and the fiber is resumed. The assertion
     /// `state == FiberState::running` in IO::Syscall() makes this explicit.
     Operation operation{};
+
+    /// Intrusive next-pointer while parked in a FiberWaitQueue.
+    Fiber* wait_next = nullptr;
+
+    /// A unique, monotonically increasing identifier for debugging.
+    FiberId id = 0;
 
     /// Integration state for Address Sanitizer (ASAN) and Thread Sanitizer (TSAN).
     [[no_unique_address]] ToolFiberState tools{};
@@ -140,9 +153,6 @@ struct alignas(64) Fiber {
 
     /// Position in the runtime's all_fibers_ vector (O(1) removal).
     std::size_t all_fibers_index = 0;
-
-    /// A unique, monotonically increasing identifier for debugging.
-    FiberId id = 0;
 
     /// Pointer to the callable constructed at the top of this fiber's stack.
     void* task_ptr = nullptr;
@@ -160,4 +170,62 @@ struct alignas(64) Fiber {
         }
     }
 };
+
+/// \brief Zero-allocation intrusive FIFO queue of parked fibers.
+///
+/// Uses Fiber::wait_next as the link pointer. A fiber can be parked on at most
+/// one synchronization primitive at a time, and is popped from the wait queue
+/// before being pushed to the runtime's ready queue.
+class FiberWaitQueue {
+public:
+    constexpr FiberWaitQueue() noexcept = default;
+
+    FiberWaitQueue(const FiberWaitQueue&) = delete;
+    FiberWaitQueue& operator=(const FiberWaitQueue&) = delete;
+    FiberWaitQueue(FiberWaitQueue&&) = delete;
+    FiberWaitQueue& operator=(FiberWaitQueue&&) = delete;
+
+    [[nodiscard]] bool Empty() const noexcept { return head_ == nullptr; }
+    [[nodiscard]] std::size_t Size() const noexcept { return size_; }
+
+    void PushBack(Fiber* fiber) noexcept {
+        assert(fiber != nullptr && fiber->wait_next == nullptr);
+        if (tail_ != nullptr) {
+            tail_->wait_next = fiber;
+        } else {
+            head_ = fiber;
+        }
+        tail_ = fiber;
+        ++size_;
+    }
+
+    /// The oldest waiter, or nullptr when there is none.
+    [[nodiscard]] Fiber* PopFront() noexcept {
+        Fiber* fiber = head_;
+        if (fiber == nullptr) {
+            return nullptr;
+        }
+        head_ = fiber->wait_next;
+        if (head_ == nullptr) {
+            tail_ = nullptr;
+        }
+        fiber->wait_next = nullptr;
+        --size_;
+        return fiber;
+    }
+
+    void Clear() noexcept {
+        while (PopFront() != nullptr) {
+        }
+    }
+
+private:
+    Fiber* head_ = nullptr;
+    Fiber* tail_ = nullptr;
+    std::size_t size_ = 0;
+};
 }  // namespace tinyio::detail::fiber
+
+namespace tinyio {
+using FiberWaitQueue = detail::fiber::FiberWaitQueue;
+}  // namespace tinyio

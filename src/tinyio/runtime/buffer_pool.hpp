@@ -11,7 +11,6 @@
 
 #include "tinyio/check.hpp"
 #include "tinyio/detail/fiber.hpp"
-#include "tinyio/detail/ring_buffer.hpp"
 #include "tinyio/error.hpp"
 
 namespace tinyio {
@@ -223,10 +222,7 @@ public:
     /// pool must not unpark it afterwards.
     void Detach() noexcept {
         owner_ = nullptr;
-        detail::fiber::Fiber* fiber = nullptr;
-        while (waiters_.Pop(fiber)) {
-        }
-        handed_.Clear();
+        waiters_.Clear();
     }
 
     /// @brief Append this pool's <= 1 GiB chunks to a registration table.
@@ -287,13 +283,8 @@ private:
     // stay hot in cache.
     std::vector<uint32_t> free_slots_;
 
-    // Parked Acquire() fibers, FIFO.
-    detail::RingBuffer<detail::fiber::Fiber*> waiters_;
-
-    // Slots handed to woken waiters, in wake order. A woken fiber picks the
-    // oldest one: all slots of a pool are interchangeable, so the assignment
-    // does not have to match.
-    detail::RingBuffer<uint32_t> handed_;
+    // Parked Acquire() fibers, FIFO (intrusive zero-allocation queue).
+    FiberWaitQueue waiters_;
 
     // The runtime that unparks the waiters.
     IO* owner_ = nullptr;

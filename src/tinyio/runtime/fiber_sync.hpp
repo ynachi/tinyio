@@ -9,24 +9,6 @@
 
 namespace tinyio {
 
-// A wait list is a FIFO of the fibers waiting on a condition. Small initial
-// capacity, allocated on the first wait: most primitives never see one.
-class FiberWaitQueue {
-public:
-    [[nodiscard]] bool Empty() const noexcept { return fibers_.Empty(); }
-
-    void PushBack(detail::fiber::Fiber* fiber) noexcept { fibers_.Push(fiber); }
-
-    /// The oldest waiter, or nullptr when there is none.
-    [[nodiscard]] detail::fiber::Fiber* PopFront() noexcept {
-        detail::fiber::Fiber* fiber = nullptr;
-        return fibers_.Pop(fiber) ? fiber : nullptr;
-    }
-
-private:
-    detail::RingBuffer<detail::fiber::Fiber*> fibers_{8};
-};
-
 /// Parks the running fiber on @p waiters until someone pops and unparks it.
 ///
 /// A park is not cancelled by shutdown: only the primitive wakes it. A fiber

@@ -227,9 +227,11 @@ prediction marks the part you don't own yet. Turn each one into a test.
 
 1. **Fiber VMA count at scale**: each stack is two VMAs (`PROT_NONE` guard +
    `PROT_READ|PROT_WRITE` stack), so the default `vm.max_map_count` (65,530)
-   caps a process at ~32K fibers. Build flags now enable
-   `-fstack-clash-protection` so large stack frames cannot jump the 4 KiB
-   guard page.
+   caps a process at ~32K fibers.
 2. **Idle stack RSS**: finished fibers cached in `idle_fibers_` keep dirty
    stack pages warm for reuse; applications with deep stack bursts can
    consider `MADV_FREE` beyond the top page on recycle.
+3. **Deterministic Simulation Testing**: see [`docs/rfc-deterministic-simulator.md`](rfc-deterministic-simulator.md)
+   for the event-loop interception architecture (virtual time, staged CQE
+   min-heap over real `io_uring`, chaos ready-queue scheduling, and power-cut /
+   torn-write crash simulation on real files).

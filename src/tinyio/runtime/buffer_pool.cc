@@ -111,14 +111,15 @@ Result<FixedBuffer> FixedBufferPool::Acquire(IO& io) noexcept {
     CHECK(fiber != nullptr) << "FixedBufferPool::acquire called outside a fiber";
 
     // Park until a slot is handed to us, or the pool is closed.
-    waiters_.Push(fiber);
+    fiber->has_handed_slot = false;
+    waiters_.PushBack(fiber);
     io.ParkRunning(detail::fiber::WaitKind::buffer_pool);
 
     // Resumed. A slot handed over is ours even if the pool closed before we
-    // ran: checking closed_ first would strand it in handed_ for good.
-    uint32_t ordinal = 0;
-    if (handed_.Pop(ordinal)) {
-        return MakeLease(ordinal);
+    // ran: checking closed_ first would strand it for good.
+    if (fiber->has_handed_slot) {
+        fiber->has_handed_slot = false;
+        return MakeLease(fiber->handed_slot);
     }
     // Woken without a slot: only Close() does that.
     return Error::FailErrc(std::errc::operation_canceled, "pool closed");
@@ -131,11 +132,7 @@ void FixedBufferPool::Close() noexcept {
     closed_ = true;
 
     // Wake every parked fiber: each one resumes with operation_canceled.
-    while (!waiters_.Empty()) {
-        detail::fiber::Fiber* fiber = nullptr;
-        if (!waiters_.Pop(fiber)) {
-            break;
-        }
+    while (detail::fiber::Fiber* fiber = waiters_.PopFront()) {
         if (owner_ != nullptr) {
             owner_->Unpark(fiber);
         }
@@ -164,9 +161,9 @@ void FixedBufferPool::Release(const uint32_t ordinal) noexcept {
 
     // Direct handoff (Invariant 4): the slot goes to the oldest waiter instead
     // of back on the free list, so a new arrival cannot steal it.
-    detail::fiber::Fiber* fiber = nullptr;
-    if (!waiters_.Empty() && waiters_.Pop(fiber)) {
-        handed_.Push(ordinal);
+    if (detail::fiber::Fiber* fiber = waiters_.PopFront(); fiber != nullptr) {
+        fiber->handed_slot = ordinal;
+        fiber->has_handed_slot = true;
         if (owner_ != nullptr) {
             owner_->Unpark(fiber);
         }
