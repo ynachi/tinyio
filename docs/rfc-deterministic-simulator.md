@@ -40,10 +40,10 @@ By intercepting inside `IO`'s event loop (`Tick`, `ResumeReadyFibers`, `Syscall`
 Every `Open`, `Read`, `Write`, `ReadFixed`, `WriteFixed`, `Readv`, `Writev`, `Fsync`, `Fallocate`, `Ftruncate`, `Rename`, `Remove`, and `Close` still allocates a real `io_uring_sqe`, attaches the fiber's `&current_fiber_->operation` via `io_uring_sqe_set_data64`, submits it to the Linux kernel via `io_uring_enter`, and reaps the resulting `io_uring_cqe`.
 
 The only operations that bypass or modify the SQE before submission are:
-- **`SleepForNs(duration)`**: Uses the virtual clock `sim_now_ns_` and `TimerWheel` (or staging heap) directly in userspace so a `30 s` sleep completes in `0 ns` of wall-clock time without asking the kernel to sleep.
+- **`SleepForNs(duration)`**: In production ([`io_ops.cc:277-294`](file:///Users/ynachi/codes/tinyio/src/tinyio/runtime/io_ops.cc#L277-L294)), `SleepForNs()` prepares an `IORING_OP_TIMEOUT` SQE (`io_uring_prep_timeout`), which would block the kernel for real wall-clock time if waited on. In simulation mode, `SleepForNs(duration)` instead prepares an `IORING_OP_NOP` (`io_uring_prep_nop(sqe)`) stamped with `sim_complete_at_ns = sim_->NowNs() + duration.count()` (and maps its `0` CQE result to `-ETIME` before the `res == -ETIME` check in `SleepForNs()`). Because `IORING_OP_NOP` is a real SQE that completes in `0 ns` of wall-clock time in the kernel and is held in the CQE Staging Min-Heap until `sim_complete_at_ns`, a `30 s` sleep finishes in nanoseconds of wall-clock time while preserving `inflight_ops_` accounting and `CancelAndDrain()` shutdown cancellation.
 - **Pre-submission fault injection**:
-  - If the seeded PRNG decides an operation fails immediately with `-EIO` or `-ENOSPC`, `Syscall()` returns that error without submitting an SQE.
-  - If the seeded PRNG decides a write is a **torn write** (e.g., during a simulated power cut), `Syscall()` clamps the SQE length (e.g., from `4096` bytes to `512` bytes) before submitting the real SQE to `io_uring`.
+  - If the seeded PRNG decides an operation fails immediately with `-EIO` or `-ENOSPC`, `Syscall()` either returns that error directly or submits an `IORING_OP_NOP` whose staged CQE result is overwritten with `-injected_errno` at `sim_complete_at_ns`.
+  - If the seeded PRNG decides a write is a **torn write** (or short read), `Syscall()` clamps the SQE length (e.g., from `4096` bytes to `512` bytes) before submitting the real SQE to `io_uring`.
 
 ---
 
@@ -80,26 +80,31 @@ Fiber B: ReadFixed() ──► assigned complete_at_ns = t0 + 20 µs (seq=2) ─
 ```
 
 1. **Deterministic Virtual Timestamp Assignment (at `Syscall()` time):**
-   When a fiber prepares an SQE in `Syscall()`, `sim_` draws a virtual duration $\Delta t$ from the seeded PRNG (according to a configurable latency profile) and stamps the operation:
+   When a fiber prepares an SQE in `Syscall()`, `sim_` draws a virtual duration $\Delta t$ from the seeded PRNG (according to a configurable latency profile) and associates `(sim_complete_at_ns, sim_seq)` with the operation's `user_data`:
    ```cpp
-   op.sim_complete_at_ns = sim_->NowNs() + sim_->SampleLatencyNs(op_kind);
-   op.sim_seq = sim_->NextSeq();
+   sim_->RegisterInflightOp(user_data, sim_->NowNs() + sim_->SampleLatencyNs(op_kind), is_self_completing);
    ```
-2. **Barrier Harvest of Self-Completing Kernel Ops (at `SubmitOrWait()` time):**
-   Instead of calling `io_uring_submit_and_wait_timeout(..., wait_nr = 1)` (which allows the kernel to return a non-deterministic subset of in-flight ops), simulation mode waits for **all** submitted self-completing SQEs in the current batch to complete in the kernel:
+2. **Self-Completing vs. Peer-Dependent Operations (in `SubmitOrWait()`):**
+   Operations submitted to `io_uring` fall into two categories:
+   - **Self-completing operations (`self_completing_inflight_`)**: Regular file/disk operations (`Open`, `Read`, `Write`, `ReadFixed`, `WriteFixed`, `Readv`, `Writev`, `Fsync`, `Fallocate`, `Ftruncate`, `Rename`, `Remove`, `Close`) and simulated `SleepForNs` (`IORING_OP_NOP`). These never depend on a future action by another fiber and always complete in the kernel within microseconds.
+   - **Peer-dependent operations (`peer_dependent_inflight_`)**: Socket `Accept`, `Connect`, `Poll`, and socket/pipe `Read`/`Write` waiting on another fiber. Waiting unconditionally on `peer_dependent_inflight_` in the kernel would deadlock if the peer fiber is currently parked in userspace waiting for a virtual timer or staged CQE before writing to the socket.
+
+   Accordingly, `SubmitOrWait()` in simulation mode drains all `self_completing_inflight_` operations via a barrier wait, while submitting `peer_dependent_inflight_` operations non-blockingly (`wait_nr = 0`) whenever runnable fibers, staged CQEs, or armed timers exist:
    ```cpp
-   // Wait until every submitted file/disk SQE in this batch has produced a CQE:
-   while (kernel_inflight_ > 0) {
-       (void)io_uring_submit_and_wait(&ring_, static_cast<unsigned>(kernel_inflight_));
+   // Wait until every self-completing SQE in this batch has produced a kernel CQE:
+   while (sim_->SelfCompletingInflight() > 0) {
+       (void)io_uring_submit_and_wait(&ring_, sim_->SelfCompletingInflight());
+       HarvestKernelCqesToStagingHeap();
+   }
+   if (sim_->PeerDependentInflight() > 0) {
+       (void)io_uring_submit_and_get_events(&ring_);
        HarvestKernelCqesToStagingHeap();
    }
    ```
-   Because local disk/file operations (`Open`, `Read`, `Write`, `ReadFixed`, `WriteFixed`, `Fsync`, `Fallocate`, `Ftruncate`, `Close`) never depend on a future action by another fiber, `io_uring_submit_and_wait(&ring_, kernel_inflight_)` always completes in microseconds without deadlocking.
 3. **Virtual-Time Release (in `DrainCompletions()`):**
    Once the real kernel CQEs are sitting in `staged_cqes_` (a min-heap ordered by `(sim_complete_at_ns, sim_seq)`):
-   - The event loop compares the top of `staged_cqes_` (`next_cqe_ns`) against the next `TimerWheel` expiration (`next_timer_ns`).
-   - It advances `sim_now_ns_ = std::min(next_cqe_ns, next_timer_ns)`.
-   - Every staged CQE with `sim_complete_at_ns <= sim_now_ns_` is popped in exact `(sim_complete_at_ns, sim_seq)` order, writes `op->cqe_res`, disarms `timer_wheel_`, and calls `PushReady(op->fiber)`.
+   - When `ready_queue_` is empty, the event loop compares the top of `staged_cqes_` (`next_cqe_ns`) against the next `TimerWheel` expiration (`next_timer_ns`) and advances `sim_now_ns_ = std::min(next_cqe_ns, next_timer_ns)`.
+   - Every staged CQE with `sim_complete_at_ns <= sim_now_ns_` is popped in exact `(sim_complete_at_ns, sim_seq)` order, writes `op->cqe_res`, decrements `inflight_ops_`, disarms `timer_wheel_`, and calls `PushReady(op->fiber)`.
 
 #### Consequence: Dynamic Causality Is Preserved
 Suppose in Tick 1:
@@ -113,16 +118,12 @@ Suppose in Tick 1:
 
 Even though the real kernel executed Fiber A's read during Tick 1, Fiber A cannot observe its completion until virtual time reaches `55 µs`, and any writes Fiber B performs at `t = 20 µs` or `t = 45 µs` happen strictly earlier in virtual time.
 
-*(Wait: what if Fiber B at `t = 20 µs` overwrites the exact same file block that Fiber A was reading at `t = 0..55 µs`? Because Fiber A's read was already executed by the kernel at `t = 0`, Fiber A read the old bytes—which is a valid concurrent read/write outcome! If you even want to randomize whether a concurrent overlapping read/write sees the old or new bytes, you can hold the SQE submission itself in the staging heap until `sim_execute_at_ns` before submitting it to `io_uring`!)*
-
-Wait — read that parenthetical again! That is an even deeper insight:
-- **Option A (Stage at CQE):** Submit SQEs immediately, stage CQEs in the min-heap until `sim_complete_at_ns`.
-- **Option B (Stage SQE execution at `sim_complete_at_ns`):** Hold the prepared SQE parameters in the min-heap until `sim_now_ns_` reaches `sim_complete_at_ns`, and at that exact virtual timestamp submit the SQE to `io_uring` and reap it immediately!
-Look at what **Option B (or staging SQE submission at virtual completion time)** gives you:
-1. If Fiber A submits a slow `Read(block 0)` that completes at `t = 55 µs`, and Fiber B submits a fast `Write(block 0)` at `t = 20 µs` that completes at `t = 45 µs`, executing the kernel SQE at `sim_complete_at_ns` means Fiber B's write hits the file at `t = 45 µs` and Fiber A's read hits the file at `t = 55 µs`!
-2. Even better: what about **sockets** (`Accept`, `Connect`, `Read` on a socket)?
-   If Fiber 1 calls `Read(socket_fd)` at `t = 0`, and Fiber 2 calls `Write(peer_fd)` at `t = 30 µs`:
-   With non-blocking `io_uring_submit_and_get_events` (`wait_nr = 0`) for sockets and barrier `io_uring_submit_and_wait` for self-completing file ops, both file ops and loopback socket ops work seamlessly!
+#### Serializing Concurrent Overlapping Reads and Writes
+What if two fibers issue concurrent operations to the **same** byte range in the same tick (or overlapping virtual intervals)?
+- Within a single tick, SQEs are prepared in the deterministic order that `ResumeReadyFibers()` pops fibers. However, the kernel's NVMe or workqueue threads could execute two concurrently submitted `WRITE` SQEs to the same file offset in arbitrary order unless constrained.
+- To guarantee 100% deterministic disk state under concurrent overlapping I/O, `SimController` supports two submission policies for self-completing file operations:
+  1. **Immediate Submission with `IOSQE_IO_LINK` on Overlapping Ranges (Default):** Non-overlapping file operations submit in batch; if two in-flight operations target overlapping `[offset, offset + len)` ranges on the same file, `SimController` serializes their kernel execution order by `(sim_complete_at_ns, sim_seq)`.
+  2. **Deferred Submission at `sim_complete_at_ns`:** Self-completing file SQEs are held in a pending submission min-heap until `sim_now_ns_` reaches `sim_complete_at_ns`, at which point they are submitted to `io_uring` and reaped in exact `(sim_complete_at_ns, sim_seq)` order. Under this policy, if Fiber A issues a slow read (`t = 0..55 µs`) and Fiber B issues a fast overwrite (`t = 20..45 µs`) to the same block, the kernel executes Fiber B's write at `t = 45 µs` and Fiber A's read at `t = 55 µs`.
 
 ---
 
@@ -141,15 +142,17 @@ Because both the CQE Staging Min-Heap and `TimerWheel` read `IO::NowNs()` (`sim_
 #### 2. Deterministic Timeout vs. Completion Races (Zero Kernel Cancel Races)
 In real life, testing what happens when an I/O operation times out (`ETIMEDOUT`) vs. completes just in time is notoriously flaky because `IORING_OP_ASYNC_CANCEL` races against the hardware interrupt in the kernel.
 
-In simulation mode, timeout vs. completion is a **pure integer comparison** between two virtual timestamps:
+In simulation mode, timeout vs. completion is a **pure integer comparison** between two virtual timestamps.
+
+Note how `tinyio`'s [`TimerWheel`](file:///Users/ynachi/codes/tinyio/src/tinyio/detail/timer_wheel.hpp#L38-L55) quantizes deadlines: `TimerWheel::k_tick_ns` is `64 ms` (`64'000'000 ns`), and `NsUntilNext(now_ns)` returns the end of the target `64 ms` slot (`(cur + off + 1) * k_tick_ns - now_ns`), while `Expire(now_ns)` checks `op->deadline_ns <= now_ns` when advancing ticks.
 1. Suppose at `sim_now_ns_ = 0`, a fiber calls:
    ```cpp
-   auto res = io.ReadFixed(fd, buf, 4096, offset, 0, /*timeout=*/std::chrono::milliseconds(10));
+   auto res = io.ReadFixed(fd, buf, 4096, offset, 0, /*timeout=*/std::chrono::milliseconds(100));
    ```
-2. `Syscall()` arms the `TimerWheel` with `op.deadline_ns = 10'000'000` (`10 ms`).
+2. `Syscall()` sets `op.deadline_ns = 100'000'000` (`100 ms`) and places the operation in `TimerWheel` slot `1` (which fires when `TimerWheel` advances to tick `2` at `128 ms`, or at exact `op.deadline_ns = 100 ms` if `SimConfig::exact_timer_deadlines` is enabled).
 3. `SimController` draws a simulated kernel latency for this read from `SimRng`:
-   - **Case A (`sim_complete_at_ns = 9'500'000`):** When the event loop advances `sim_now_ns_`, `9.5 ms < 10 ms`. The staged CQE is popped at `sim_now_ns_ = 9.5 ms`, disarms the `TimerWheel`, and the fiber deterministically resumes with `4096` bytes read.
-   - **Case B (`sim_complete_at_ns = 10'500'000`):** The `TimerWheel` slot expires first (`10 ms < 10.5 ms`). At `sim_now_ns_ = 10 ms`, `ProcessExpiredTimers()` marks `op.timed_out = true`, intercepts the staged CQE in `staged_cqes_` (overwriting its `cqe_res = -ECANCELED` without even needing a racy kernel cancel!), and the fiber deterministically resumes with `ETIMEDOUT`!
+   - **Case A (`sim_complete_at_ns < timer_fire_ns`, e.g., `95 ms`):** When the event loop advances `sim_now_ns_`, the staged CQE is popped first at `sim_now_ns_ = 95 ms`, disarms the `TimerWheel`, and the fiber deterministically resumes with `4096` bytes read.
+   - **Case B (`sim_complete_at_ns > timer_fire_ns`, e.g., `140 ms`):** The `TimerWheel` expires first. `ProcessExpiredTimers()` marks `op.timed_out = true` and calls `sim_->CancelStagedOp(user_data, sim_now_ns_)` (which moves the already-harvested CQE in `staged_cqes_` to `sim_now_ns_` with `res = -ECANCELED`, avoiding a racy kernel `IORING_OP_ASYNC_CANCEL` whenever the CQE is already staged). The fiber deterministically resumes on the very next tick with `ETIMEDOUT`.
 
 ---
 
@@ -157,37 +160,44 @@ In simulation mode, timeout vs. completion is a **pure integer comparison** betw
 
 A key requirement for testing `tinyio::wal` is verifying crash recovery after a sudden power loss. How do we simulate a power cut on a **real Linux file** (`tmpfs` or `ext4`) without writing a fake in-memory `SimDisk`?
 
-When a program writes to a real Linux file via `io_uring` (`WRITE` / `WRITE_FIXED`), the bytes land in the file immediately—so if we simply close the file descriptor without calling `Fsync()`, a reader opening that file on Linux would still see the un-`Fsync`ed bytes.
+When a program writes to a real Linux file via `io_uring` (`WRITE` / `WRITE_FIXED`), the bytes land in the OS page cache immediately—so if we simply close the file descriptor without calling `Fsync()`, a reader opening that file on Linux would still see the un-`Fsync`ed bytes.
 
-To model volatile drive caches and power cuts on a real file, `SimController` tracks a lightweight **Dirty Write Log** per open file descriptor between `Fsync()` calls:
+To model volatile drive caches and power cuts on a real file, `SimController` tracks a **Dirty Write Log** keyed by canonical file path / `(dev, ino)` (mapped from `fd` on `Open()`, so closing and re-opening an `fd` before `SimulatePowerCut()` does not lose track of unflushed writes or confuse recycled descriptor numbers):
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                Real Linux File + Dirty Write Tracker (Sim)                 │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ 1. On Write / WriteFixed(fd, buf, len, offset):                            │
-│    - Save pre-write contents of [offset, offset + len) into DirtyWriteLog  │
-│      (or record the dirty range + new bytes)                               │
+│    - Resolve effective offset (if offset == -1, query lseek(fd, 0, SEEK_CUR│
+│      before submission)                                                    │
+│    - For each 512B/4KiB sector in [offset, offset + len):                  │
+│      * If the sector has no recorded pre-image since the last Fsync(),     │
+│        pread() and store its original post-Fsync bytes in baseline_sectors │
+│    - Append the write record (offset, new_bytes) to uncommitted_writes     │
 │    - Submit the real WRITE / WRITE_FIXED SQE to io_uring                   │
 │                                                                            │
 │ 2. On Fsync(fd, datasync):                                                 │
 │    - Submit the real FSYNC SQE to io_uring                                 │
-│    - Clear DirtyWriteLog[fd] (all prior writes are now durable!)           │
+│    - Clear baseline_sectors and uncommitted_writes for that file           │
 │                                                                            │
-│ 3. On SimController::SimulatePowerCut(fd):                                 │
-│    - For each dirty write in DirtyWriteLog[fd] since the last Fsync():     │
-│      * Roll SimRng:                                                        │
-│        - Keep whole write (flushed by drive controller before power died)  │
-│        - Revert to pre-write bytes (lost in volatile drive DRAM cache)     │
-│        - Tear on 512B/4KiB boundary (first k sectors new, rest old/garbage)│
+│ 3. On SimController::SimulatePowerCut():                                   │
+│    - First restore all dirty sectors of each file to baseline_sectors      │
+│      (the exact durable state as of the last completed Fsync())            │
+│    - Replay uncommitted_writes in submission order through SimRng:         │
+│      * Keep whole write (flushed by drive controller before power died)    │
+│      * Drop write (lost in volatile drive DRAM cache)                      │
+│      * Tear on 512B/4KiB sector boundary (apply only a subset of sectors)  │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Look at what this achieves:
+Recording the **first** post-`Fsync` pre-image per sector (`baseline_sectors`) plus the ordered `uncommitted_writes` list solves the multiple-overwrite problem: if a fiber overwrites the same WAL header block twice before calling `Fsync()`, reverting to `baseline_sectors` and selectively replaying `uncommitted_writes` can faithfully produce the state after the last `Fsync()`, the state after the first uncommitted write, a torn first/second write, or the state after both writes.
+
+What this achieves:
 - **During normal operation**, every `WriteFixed` and `ReadFixed` goes straight through `io_uring` on the real file using real registered `FixedBuffer`s.
-- **When `Fsync()` completes**, the dirty log for `fd` is cleared (`O(1)` vector clear).
-- **When `SimulatePowerCut()` is called**, the simulator uses `pwrite` on the real file to revert or tear a PRNG-selected subset of the writes that occurred *after* the last `Fsync()`, then abandons the old `IO` instance.
-- A new `IO` instance then runs `wal::Reader::Recover()` on that **exact real file** through real `io_uring`!
+- **When `Fsync()` completes**, `baseline_sectors` and `uncommitted_writes` for that file are cleared (`O(1)` clear).
+- **When `SimulatePowerCut()` is called**, the simulator modifies the real file via `pwrite` to reflect the exact post-crash sector state and abandons the crashed `IO` instance.
+- A new `IO` instance then runs `wal::Reader::Recover()` on that **exact real file** through real `io_uring`.
 
 ---
 
@@ -230,7 +240,7 @@ struct SimConfig {
     double io_error_prob = 0.0;
     int injected_errno = EIO;
 
-    /// Probability of clamping a Write/WriteFixed to a partial sector on PowerCut.
+    /// Probability of tearing or dropping uncommitted writes on SimulatePowerCut().
     double torn_write_prob = 0.0;
 };
 
@@ -239,7 +249,7 @@ struct SimConfig {
 
 ---
 
-### 4.2. Staged CQE Min-Heap Inside `SimController`
+### 4.2. Staged CQE Min-Heap & `inflight_ops_` Lifecycle Inside `SimController`
 
 ```cpp
 struct StagedCqe {
@@ -272,12 +282,17 @@ Inside `IO`:
    ```
 2. **`IO::PopReady()`**:
    - When `sim_ != nullptr && sim_->Config().chaos_scheduler && ready_queue_.Size() > 1`, pick a random index `idx = sim_->Rng().Bounded(ready_queue_.Size())`, swap `ready_queue_[idx]` with the front element, and pop it.
-3. **`IO::Syscall()`**:
+3. **`IO::Syscall()` & `IO::SleepForNs()`**:
    - When `sim_ != nullptr`:
      - Check fault injection (`sim_->MaybeInjectError(op_name)`).
-     - Stamp `op.sim_complete_at_ns = sim_->NowNs() + sim_->SampleLatencyNs()`.
+     - In `SleepForNs(duration)`, prepare `io_uring_prep_nop(sqe)` instead of `io_uring_prep_timeout` and register `sim_complete_at_ns = sim_->NowNs() + duration.count()`.
+     - For normal operations, register `sim_complete_at_ns = sim_->NowNs() + sim_->SampleLatencyNs()`.
 4. **`IO::SubmitOrWait()` & `IO::DrainCompletions()`**:
-   - Submit queued SQEs to `io_uring`, reap kernel CQEs into `sim_->StageCqe(...)`, advance `sim_now_ns_` to the earliest staged CQE or `TimerWheel` deadline, and wake only the fibers whose virtual completion time has arrived (`complete_at_ns <= sim_now_ns_`).
+   - Submit queued SQEs to `io_uring` and harvest kernel CQEs into `sim_->StageCqe(...)`.
+   - **Important `inflight_ops_` invariant**: `inflight_ops_` is decremented when a CQE is popped from `staged_cqes_` and delivered to its fiber (not when it is harvested from the kernel CQ ring into `staged_cqes_`). This ensures `IO::IsQuiescent()` remains `false` while staged CQEs are still pending in virtual time.
+   - Advance `sim_now_ns_` to the earliest staged CQE or `TimerWheel` deadline when `ready_queue_` is empty, and wake only the fibers whose virtual completion time has arrived (`complete_at_ns <= sim_now_ns_`).
+5. **Shutdown Cancellation (`IO::CancelAndDrain()`)**:
+   - When `CancelAndDrain()` runs on shutdown, in addition to submitting `IORING_ASYNC_CANCEL_ALL` for any peer-dependent ops still in the kernel, it calls `sim_->CancelAllStaged(sim_now_ns_)`, which sets `complete_at_ns = sim_now_ns_` and `res = -ECANCELED` on all entries in `staged_cqes_` so `DriveToQuiescence()` drains deterministically in a single tick.
 
 ---
 

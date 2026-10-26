@@ -93,7 +93,7 @@ public:
         }
 
         for (uint64_t t = from; t <= cur; ++t) {
-            const size_t idx = static_cast<size_t>(t & (k_slots - 1));
+            const auto idx = t & (k_slots - 1);
             if ((occupied_[idx >> 6U] & (uint64_t{1} << (idx & 63U))) == 0) {
                 continue;
             }
@@ -128,7 +128,7 @@ public:
         }
 
         const uint64_t cur = now_ns / k_tick_ns;
-        const size_t start_slot = static_cast<size_t>(cur & (k_slots - 1));
+        const auto start_slot = cur & (k_slots - 1);
         const size_t start_word = start_slot >> 6U;
         const size_t start_bit = start_slot & 63U;
 
@@ -148,7 +148,7 @@ public:
         for (size_t w = 1; w < k_words; ++w) {
             if (const uint64_t word = occupied_[(start_word + w) & (k_words - 1)]; word != 0) {
                 const uint64_t off =
-                    (static_cast<uint64_t>(w) * uint64_t{64} - static_cast<uint64_t>(start_bit)) +
+                    (w * uint64_t{64} - static_cast<uint64_t>(start_bit)) +
                     CountrZero(word);
                 return wake_at_offset(off);
             }
