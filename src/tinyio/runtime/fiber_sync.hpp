@@ -2,25 +2,138 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "tinyio/runtime/runtime.hpp"
 
 namespace tinyio {
+/// @brief A one-shot baton: one Wait(), released by one Post().
+///
+/// Closer to absl::Notification than to folly::Baton: there is no Reset(), a
+/// posted baton stays posted forever, and a fresh wait is a fresh object.
+/// Removing Reset() removes the hardest part — the window where a Post()
+/// lands between "work done" and "reset" and is wiped out.
+///
+/// State machine:
+///
+///     Empty ──Wait()──▶ Waiting ──Post()──▶ Posted   (terminal)
+///       └───────────────Post()──────────────▶ Posted   (terminal)
+///
+/// - Post() on Posted does nothing, so posting is idempotent.
+/// - Wait() on Posted returns at once; repeated waits after the post are
+///   harmless and allowed.
+/// - A second concurrent Wait() is a hard failure: one-shot means one
+///   waiter, and a second one could only be dropped silently.
+///
+/// The re-check rule (how to sleep on a Baton):
+///
+///     Baton* wake_ = nullptr;              // the published sleeping baton
+///     void Wake() noexcept {               // called by producers
+///         if (wake_ != nullptr) {
+///             std::exchange(wake_, nullptr)->Post();
+///         }
+///     }
+///     while (!shutting_down_) {
+///         if (!HasWork()) {                // (1) re-check the predicate FIRST
+///             Baton wake{io_};             // (2) fresh, one-shot
+///             wake_ = &wake;               // (3) publish
+///             wake.Wait();                 //     sleep
+///             continue;                    //     loop back to the re-check
+///         }
+///         // ... do the work (may suspend in I/O) ...
+///     }
+///
+/// A Wake() that fires while the sleeper is away doing I/O finds
+/// wake_ == nullptr and is dropped. That is NOT a lost wakeup: the producer
+/// advances the predicate — the sticky state — before calling Wake(), so the
+/// sleeper's re-check at (1) sees the work and never sleeps. Steps (1)–(3)
+/// need no lock: the runtime is cooperative, no other fiber runs between the
+/// check and the publish.
+///
+/// Lifetime rules:
+/// 1. Clear the published pointer before (or inside) Post(), as
+///    std::exchange does in Wake() above. Once the waiter resumes, its stack
+///    frame and the baton on it are gone; a stale wake_ would point at a
+///    dead stack frame.
+/// 2. Post() must not touch the baton after Unpark(). In tinyio this holds
+///    by construction — Unpark() only queues the fiber ready, it does not
+///    run until the poster yields — but it is the bug class folly's Baton
+///    had to defend against across threads, so it is stated here as a
+///    contract on every caller.
+///
+/// @note Not thread-safe. Must be used within a single io runtime instance.
+///
+/// @code
+/// tinyio::Baton baton(io);
+/// (void)io.Spawn([&](tinyio::IO&) noexcept { baton.Post(); });
+/// (void)baton.Wait(); // suspends until the Post()
+/// @endcode
+struct Baton {
+    explicit Baton(IO& io) noexcept : io_(io) {}
 
-/// Parks the running fiber on @p waiters until someone pops and unparks it.
-///
-/// A park is not cancelled by shutdown: only the primitive wakes it. A fiber
-/// still parked once the runtime has quiesced has no one left to wake it,
-/// and the runtime aborts (see IO::AbortIfParkedFibers()).
-///
-/// @p reason names the primitive the fiber is parked on, so a runtime that
-/// aborts can say WHICH primitive is stuck instead of printing a count.
-inline void ParkOn(IO& io, FiberWaitQueue& waiters, const detail::fiber::WaitKind reason) noexcept {
-    waiters.PushBack(io.RunningFiber());
-    io.ParkRunning(reason);
-}
+    Baton(const Baton&) = delete;
+    Baton& operator=(const Baton&) = delete;
+
+    /// Suspends the calling fiber until Post(). Returns at once when the
+    /// baton is already posted.
+    [[nodiscard]] Result<void> Wait() noexcept {
+        assert(io_.RunningFiber() != nullptr && "Wait() called outside a fiber");
+        switch (state_) {
+            case State::posted:
+                return {};
+            case State::waiting:
+                // The first waiter is parked inside this call, so only a
+                // second fiber can get here. One-shot means one waiter; a
+                // second one would have to be silently dropped.
+                ELOGFMT(FATAL, "Baton: second concurrent Wait() is not allowed (one-shot)");
+                std::abort();
+            case State::empty:
+                waiter_ = io_.RunningFiber();
+                state_ = State::waiting;
+                io_.ParkRunning(detail::fiber::WaitKind::baton);
+                return {};
+        }
+        return {};
+    }
+
+    /// True once Post() has been called. Never suspends.
+    [[nodiscard]] bool TryWait() const noexcept { return state_ == State::posted; }
+
+    /// Releases the waiter, or makes any future Wait() return at once.
+    /// Idempotent.
+    ///
+    /// The state flips to posted BEFORE the waiter is queued, so a resumed
+    /// waiter always observes Posted. The waiter's fiber only runs once the
+    /// poster yields, and the poster clears any published pointer BEFORE
+    /// calling Post() — after Unpark() the baton may live on the waiter's
+    /// dying stack frame and must not be touched again.
+    void Post() noexcept {
+        if (state_ == State::posted) {
+            return;
+        }
+        state_ = State::posted;
+        if (waiter_ != nullptr) {
+            io_.Unpark(std::exchange(waiter_, nullptr));
+        }
+    }
+
+    ~Baton() {
+        if (state_ == State::waiting) {
+            ELOGFMT(FATAL, "Baton destroyed with its waiter still parked");
+            std::abort();
+        }
+    }
+
+private:
+    enum class State : std::uint8_t { empty, waiting, posted };
+
+    IO& io_;
+    State state_ = State::empty;
+    detail::fiber::Fiber* waiter_ = nullptr;
+};
 
 /// @brief Mirrors std::latch. A one-shot countdown: N fibers do work, one waiter proceeds
 /// when all are done.
@@ -56,7 +169,7 @@ struct Latch {
     [[nodiscard]] Result<void> Wait() noexcept {
         assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
         if (count_ > 0) {
-            ParkOn(io_, waiters_, detail::fiber::WaitKind::latch);
+            io_.ParkOn(waiters_, detail::fiber::WaitKind::latch);
         }
         return {};
     }
@@ -105,7 +218,7 @@ struct Semaphore {
             --count_;
             return {};
         }
-        ParkOn(io_, waiters_, detail::fiber::WaitKind::semaphore);
+        io_.ParkOn(waiters_, detail::fiber::WaitKind::semaphore);
         return {};
     }
 
@@ -164,7 +277,7 @@ struct Mutex {
             held_ = true;
             return {};
         }
-        ParkOn(io_, waiters_, detail::fiber::WaitKind::mutex);
+        io_.ParkOn(waiters_, detail::fiber::WaitKind::mutex);
         return {};
     }
 
@@ -278,7 +391,7 @@ struct TaskGroup<void> {
     [[nodiscard]] Result<void> Wait() noexcept {
         assert(io_.RunningFiber() != nullptr && "wait() called outside a fiber");
         if (active_tasks_ > 0) {
-            ParkOn(io_, waiters_, detail::fiber::WaitKind::task_group);
+            io_.ParkOn(waiters_, detail::fiber::WaitKind::task_group);
         }
         return {};
     }

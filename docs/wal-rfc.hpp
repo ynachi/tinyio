@@ -154,26 +154,26 @@
  * ============================================================================
  * 4. FIBER CONCURRENCY, OVERFLOW ADMISSION & CRASH-RECOVERY INVARIANTS
  * ============================================================================
- *   Invariant 1 (Zero-Allocation Group Commit via `tinyio::FiberWaitQueue`):
- *      `tinyio::detail::fiber::Fiber` already embeds `Fiber* wait_next` and
- *      provides `tinyio::FiberWaitQueue` (`tinyio::ParkOn()`). `WalWriter`
- *      pairs two `tinyio::FiberWaitQueue sync_waiters_[2]` with `dma_buffers_[2]`:
+ *   Invariant 1 (Zero-Allocation Group Commit via Intrusive Stack `tinyio::Baton` Nodes):
+ *      `WalWriter` pairs two singly-linked lists of stack nodes `SyncWaiterNode* sync_waiters_[2]`
+ *      with `dma_buffers_[2]`:
  *        - A fiber that finishes staging `my_lsn` into `dma_buffers_[active_buf_idx_]`
- *          parks on `sync_waiters_[active_buf_idx_]`.
+ *          links a stack-allocated `SyncWaiterNode { Baton done; ... }` into
+ *          `sync_waiters_[active_buf_idx_]` and calls `node.done.Wait()`.
  *        - Flipping `active_buf_idx_ ^= 1` in `SwapAndPrepareFlush()`
  *          automatically isolates the in-flight batch (`sync_waiters_[flush_idx]`)
  *          from incoming fibers staging into the new active buffer.
  *        - When `WriteFixed()` completes, `FlusherFiberLoop()` updates
  *          `durable_lsn_ = flush_max_lsn` (or latches `fatal_io_err_`) and
- *          unparks every fiber in `sync_waiters_[flush_idx]`.
+ *          posts the `Baton` of every node in `sync_waiters_[flush_idx]`.
  *
  *   Invariant 2 (Strict FIFO Admission & Atomic Multi-Block Staging):
  *      A record > 4064 bytes fragments into `FIRST` -> `MIDDLE`* -> `LAST`.
  *      If a record > 256 KiB overflows the active `FixedBuffer`, `StageRecord()`
  *      suspends inside `EnsureBufferSpace()` until `FlusherFiberLoop()` swaps
  *      the buffers. While `staging_busy_` is true or
- *      `!space_overflow_waiters_.Empty()`, newly arriving fibers in
- *      `AppendAndSync()` MUST park on `space_overflow_waiters_` BEFORE
+ *      `space_overflow_head_ != nullptr`, newly arriving fibers in
+ *      `AppendAndSync()` MUST park on `SpaceWaiterNode` BEFORE
  *      acquiring `next_lsn_++`. This guarantees:
  *        (a) No fiber can interleave a `FULL` record between another fiber's
  *            `FIRST`/`MIDDLE`/`LAST` fragments across a buffer swap.
@@ -182,11 +182,11 @@
  *
  *   Invariant 3 (Flushing Mid-Record Overflow When `sync_waiters_` Is Empty):
  *      When a >256 KiB record fills all 64 blocks of `dma_buffers_[0]` with
- *      `FIRST`/`MIDDLE` fragments, the owning fiber parks in `space_overflow_waiters_`
+ *      `FIRST`/`MIDDLE` fragments, the owning fiber parks in `space_overflow_head_`
  *      (it has not parked on `sync_waiters_` yet because its `LAST` fragment
  *      has not been staged). Therefore, `FlusherFiberLoop()` MUST trigger
  *      `WriteFixed()` whenever `out_bytes_to_write > 0`, even when
- *      `sync_waiters_[flush_idx].Empty()` is true, and `durable_lsn_` only
+ *      `sync_waiters_[flush_idx] == nullptr`, and `durable_lsn_` only
  *      advances to `staged_complete_lsn_` (the highest LSN whose `FULL` or
  *      `LAST` fragment is completely staged in the flushed buffer).
  *
@@ -211,10 +211,6 @@
 
 #pragma once
 
-#ifdef BLOCK_SIZE
-#undef BLOCK_SIZE
-#endif
-
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -227,13 +223,20 @@
 #include <crc32c/crc32c.h>
 
 #include "tinyio/check.hpp"
-#include "tinyio/detail/fiber.hpp"
 #include "tinyio/error.hpp"
 #include "tinyio/logging.hpp"
 #include "tinyio/net/fd.hpp"
 #include "tinyio/runtime/buffer_pool.hpp"
 #include "tinyio/runtime/fiber_sync.hpp"
 #include "tinyio/runtime/runtime.hpp"
+
+// `linux/fs.h` (pulled in transitively by <liburing.h> above) defines a
+// `BLOCK_SIZE` macro. The guard must sit AFTER the includes that define it —
+// an #undef placed above them is dead, because the macro comes back with the
+// next include, and `BLOCK_SIZE = 4096` below fails to parse.
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
 
 namespace storage::wal::split {
 
@@ -327,8 +330,9 @@ static_assert(sizeof(WalSegmentHeader) == BLOCK_SIZE, "WalSegmentHeader must be 
  */
 struct alignas(8) WalBlockHeader {
     uint64_t block_header_crc;  // [0x00..0x07] ComputeWalChecksum64 of bytes [0x08..0x0F]
-    uint32_t segment_epoch;     // [0x08..0x0B] Lower 32 bits of WalSegmentHeader::segment_epoch (!= 0)
-    uint16_t first_rec_offset;  // [0x0C..0x0D] Offset (16..4079) of first FULL/FIRST record, or NO_NEW_RECORD
+    uint32_t segment_epoch;  // [0x08..0x0B] Lower 32 bits of WalSegmentHeader::segment_epoch (!= 0)
+    uint16_t first_rec_offset;  // [0x0C..0x0D] Offset (16..4079) of first FULL/FIRST record, or
+                                // NO_NEW_RECORD
     uint16_t reserved;          // [0x0E..0x0F] Must be 0
 };
 static_assert(sizeof(WalBlockHeader) == BLOCK_HDR_SIZE, "WalBlockHeader must be 16 bytes");
@@ -466,23 +470,36 @@ static_assert(sizeof(WalRecordHeader) == REC_HDR_SIZE, "WalRecordHeader must be 
  *   `tail_sector_data` (4096 B) is placed at byte offset 0 followed by the
  *   64-byte scalar metadata line so `sizeof(RecoveredTailState) == 4160` bytes
  *   with zero internal alignment holes.
+ *
+ * Design Rule:
+ *   Only independent facts are stored; every derivable value is a method.
+ *   Append-in-place eligibility used to be a stored `bool` denormalized from
+ *   `valid_bytes_in_tail` — a stale or hand-built mismatch could silently
+ *   resume the writer at the wrong block. As a method it cannot lie, and the
+ *   scalar line lands at exactly 64 bytes.
  */
 struct alignas(64) RecoveredTailState {
     // Raw 4KB bytes of `last_valid_block_idx` captured during recovery (with any
     // trailing uncommitted `FIRST` fragment already stripped and zero-padded).
-    uint8_t  tail_sector_data[BLOCK_SIZE]{};
+    uint8_t tail_sector_data[BLOCK_SIZE]{};
 
-    uint32_t shard_id                 = 0;                   // From WalSegmentHeader::shard_id
-    uint16_t valid_bytes_in_tail      = 0;                   // 0..4080 active committed payload bytes in tail block
-    uint16_t tail_first_rec_offset    = NO_NEW_RECORD;       // WalBlockHeader::first_rec_offset of tail block
-    uint64_t segment_id               = 0;                   // From WalSegmentHeader::segment_id
-    uint64_t segment_epoch            = 1;                   // From WalSegmentHeader::segment_epoch
-    uint64_t base_lsn                 = 1;                   // From WalSegmentHeader::base_lsn
-    uint64_t total_segment_blocks     = DEFAULT_SEG_BLOCKS;  // From WalSegmentHeader::segment_size_blocks
-    uint64_t last_valid_block_idx     = 0;                   // 0 if segment has no valid data blocks
-    uint64_t durable_lsn              = 0;                   // Highest complete record LSN on disk
-    uint64_t next_lsn_to_assign       = 1;                   // `durable_lsn + 1` (or `base_lsn` if empty)
-    bool     tail_can_append_in_place = false;               // True if `valid_bytes_in_tail > 0` and `4080 - valid_bytes_in_tail >= MIN_REC_SPACE`
+    uint32_t shard_id = 0;             // From WalSegmentHeader::shard_id
+    uint16_t valid_bytes_in_tail = 0;  // 0..4080 active committed payload bytes in tail block
+    uint16_t tail_first_rec_offset = NO_NEW_RECORD;           // WalBlockHeader::first_rec_offset of tail block
+    uint64_t segment_id = 0;     // From WalSegmentHeader::segment_id
+    uint64_t segment_epoch = 1;  // From WalSegmentHeader::segment_epoch
+    uint64_t base_lsn = 1;       // From WalSegmentHeader::base_lsn
+    uint64_t total_segment_blocks = DEFAULT_SEG_BLOCKS;             // From WalSegmentHeader::segment_size_blocks
+    uint64_t last_valid_block_idx = 0;  // 0 if segment has no valid data blocks
+    uint64_t durable_lsn = 0;           // Highest complete record LSN on disk
+    uint64_t next_lsn_to_assign = 1;    // `durable_lsn + 1` (or `base_lsn` if empty)
+
+    /// True when the tail block holds committed bytes AND still has room for
+    /// at least one minimal fragment: `WalWriter` then rewrites Block K in
+    /// place instead of sealing it and appending at Block K + 1.
+    [[nodiscard]] constexpr bool CanAppendInPlace() const noexcept {
+        return valid_bytes_in_tail > 0 && MAX_BLOCK_PAYLOAD - valid_bytes_in_tail >= MIN_REC_SPACE;
+    }
 };
 static_assert(sizeof(RecoveredTailState) == BLOCK_SIZE + 64,
               "RecoveredTailState must pack into 4096B sector + one 64B cache line");
@@ -494,16 +511,35 @@ static_assert(sizeof(RecoveredTailState) == BLOCK_SIZE + 64,
 /**
  * @brief Dedicated, zero-virtual per-core WAL Writer built on `tinyio::IO`.
  *
- * How `WalWriter` Exploits `tinyio::IO::Tick()` & `tinyio::FiberWaitQueue`:
+ * How `WalWriter` Exploits `tinyio::IO::Tick()` & `tinyio::Baton`:
  * +--------------------------------------------------------------------------+
  * |                Single `tinyio::IO::Tick()` Execution Cycle               |
  * +------------------------+------------------------+------------------------+
  * | 1. Worker Fibers 1..N  | 2. FlusherFiber runs   | 3. SubmitOrWait()      |
  * | stage into Buffer[0],  | from ready_queue_,     | submits WRITE_FIXED    |
- * | Unpark(flusher), and   | swaps Buffer[0]<->[1], | SQE to NVMe in the     |
- * | ParkOn(sync_waiters_0) | calls io_.WriteFixed() | exact same tick!       |
+ * | WakeFlusherIfNeeded(), | swaps Buffer[0]<->[1], | SQE to NVMe in the     |
+ * | and wait on Baton      | calls io_.WriteFixed() | exact same tick!       |
  * +------------------------+------------------------+------------------------+
  */
+
+/**
+ * @brief Stack-allocated wait node for `WalWriter::AppendAndSync()` group commit.
+ */
+struct SyncWaiterNode {
+    tinyio::Baton   done;
+    SyncWaiterNode* next = nullptr;
+    explicit SyncWaiterNode(tinyio::IO& io) noexcept : done(io) {}
+};
+
+/**
+ * @brief Stack-allocated wait node for staging admission / buffer space overflow.
+ */
+struct SpaceWaiterNode {
+    tinyio::Baton    done;
+    SpaceWaiterNode* next = nullptr;
+    explicit SpaceWaiterNode(tinyio::IO& io) noexcept : done(io) {}
+};
+
 class WalWriter {
 private:
     // ------------------------------------------------------------------------
@@ -538,23 +574,26 @@ private:
     uint16_t            cur_block_offset_     = BLOCK_HDR_SIZE;  // Write cursor inside current 4KB block (16 .. 4096)
 
     // ------------------------------------------------------------------------
-    // 4. Dedicated Flusher Fiber & Zero-Allocation `tinyio::FiberWaitQueue`s
+    // 4. Dedicated Flusher Fiber & Zero-Allocation Sync Primitives
     // ------------------------------------------------------------------------
-    tinyio::detail::fiber::Fiber* flusher_fiber_       = nullptr;  // Persistent background flusher fiber
-    tinyio::detail::fiber::Fiber* flusher_exit_waiter_ = nullptr;  // Fiber parked inside Shutdown() waiting for flusher exit
-    bool                          flusher_parked_      = false;    // True when flusher_fiber_ is parked waiting for work
-    bool                          shutting_down_       = false;    // Set by Shutdown() to break FlusherFiberLoop()
-    bool                          flusher_exited_      = true;     // False while FlusherFiberLoop() is alive
-    tinyio::FiberWaitQueue        sync_waiters_[2]{};              // Paired with dma_buffers_[0..1]: fibers waiting for durability
-    tinyio::FiberWaitQueue        space_overflow_waiters_{};       // FIFO queue of fibers waiting for buffer space / staging admission
+    // The flusher sleeps on a fresh one-shot Baton published through
+    // `flusher_wake_` (re-check predicate, poster clears pointer with
+    // std::exchange before Post()).
+    tinyio::Baton*   flusher_wake_              = nullptr;  // Sleeping flusher's baton; null while busy
+    tinyio::Baton*   flusher_exit_waiter_       = nullptr;  // Fiber parked inside Shutdown() waiting for flusher exit
+    bool             shutting_down_             = false;    // Set by Shutdown() to break FlusherFiberLoop()
+    bool             flusher_exited_            = true;     // False while FlusherFiberLoop() is alive
+    SyncWaiterNode*  sync_waiters_[2]{};                    // Intrusive stack lists paired with dma_buffers_[0..1]
+    SpaceWaiterNode* space_overflow_head_       = nullptr;  // FIFO head of fibers waiting for staging admission
+    SpaceWaiterNode* space_overflow_tail_       = nullptr;  // FIFO tail of fibers waiting for staging admission
 
 public:
     explicit WalWriter(tinyio::IO& io) noexcept
         : io_(io), shard_id_(static_cast<uint32_t>(io.Id())) {}
 
     ~WalWriter() noexcept {
-        if (!flusher_exited_ || !sync_waiters_[0].Empty() || !sync_waiters_[1].Empty() ||
-            !space_overflow_waiters_.Empty()) {
+        if (!flusher_exited_ || sync_waiters_[0] != nullptr || sync_waiters_[1] != nullptr ||
+            space_overflow_head_ != nullptr) {
             ELOGFMT(FATAL,
                     "WalWriter destroyed on shard {} without calling Shutdown() "
                     "(flusher_exited={})",
@@ -635,6 +674,12 @@ public:
      *        wipe any post-tail DMA tear window so out-of-order phantom sectors
      *        cannot resurrect across a second crash, and prime `dma_buffers_[0]`
      *        + sub-sector write cursors directly from `RecoveredTailState`.
+     *
+     * Trust Boundary: before copying, CHECK that `tail_sector_data` bytes
+     * `[BLOCK_HDR_SIZE + valid_bytes_in_tail .. 4095]` are all zero — the
+     * zero-pad half of the Phase-4 contract — so a botched strip aborts loudly
+     * here instead of writing resurrected torn data to NVMe. The CHECK is what
+     * lets `CanAppendInPlace()` trust `valid_bytes_in_tail` unconditionally.
      */
     [[nodiscard]] tinyio::Result<void> ResumeFromTail(
         tinyio::UniqueFd          fd,
@@ -654,8 +699,8 @@ public:
     /**
      * @brief Stage a record into the active `FixedBuffer` (respecting strict
      *        FIFO overflow admission) and suspend the calling fiber on
-     *        `sync_waiters_[buf_idx]` via `tinyio::ParkOn()` until the NVMe
-     *        group-commit batch completes durability.
+     *        `sync_waiters_[buf_idx]` via a stack-allocated `SyncWaiterNode`
+     *        until the NVMe group-commit batch completes durability.
      */
     [[nodiscard]] tinyio::Result<uint64_t> AppendAndSync(
         std::span<const std::byte> payload,
@@ -678,9 +723,8 @@ private:
     }
 
     void WakeFlusherIfNeeded() noexcept {
-        if (flusher_parked_ && flusher_fiber_ != nullptr) {
-            flusher_parked_ = false;
-            io_.Unpark(flusher_fiber_);
+        if (flusher_wake_ != nullptr) {
+            std::exchange(flusher_wake_, nullptr)->Post();
         }
     }
 
@@ -722,7 +766,7 @@ private:
     [[nodiscard]] tinyio::Result<void> AcquireStagingAdmission() noexcept;
     [[nodiscard]] tinyio::Result<void> EnsureBufferSpace() noexcept;
     void WakeNextOverflowWaiter() noexcept;
-    void DrainWaitQueue(tinyio::FiberWaitQueue& q) noexcept;
+    void DrainSyncWaiters(uint8_t buf_idx) noexcept;
 };
 
 // ============================================================================
@@ -784,15 +828,19 @@ private:
  *        - Sub-case A (`FIRST(M)` started at `offset > 16` inside `Block K`
  *          after committed records `[16..offset)`):
  *          Strip `FIRST(M)` by zeroing `[offset .. 4095]` in `tail_sector_data`,
- *          set `valid_bytes_in_tail = offset - 16`, `durable_lsn = M - 1`,
- *          `next_lsn_to_assign = M`, and `tail_can_append_in_place = (4096 - offset >= MIN_REC_SPACE)`.
+ *          set `valid_bytes_in_tail = offset - 16`, `durable_lsn = M - 1`, and
+ *          `next_lsn_to_assign = M`. `CanAppendInPlace()` needs no explicit
+ *          setting: `MAX_BLOCK_PAYLOAD - (offset - 16) == 4096 - offset`, so
+ *          it evaluates true exactly when `4096 - offset >= MIN_REC_SPACE`.
  *        - Sub-case B (`FIRST(M)` or `MIDDLE(M)` started at offset 16 of
  *          `Block K`, so `Block K` contains no committed record boundary):
  *          Do NOT rewind `last_valid_block_idx` across earlier blocks (which
  *          would leave `> 64` blocks of `Epoch E` beyond the cursor). Keep
- *          `last_valid_block_idx = K`, set `tail_can_append_in_place = false`
- *          (so `WalWriter` appends at `Block K + 1`), set `durable_lsn = M - 1`,
- *          and set `next_lsn_to_assign = M + 1` (preserving monotonic block LSNs).
+ *          `last_valid_block_idx = K` and set `valid_bytes_in_tail = 0`
+ *          (rule 1's zero-fill already emptied `[16 .. 4095]`, so
+ *          `CanAppendInPlace()` is false by construction and `WalWriter`
+ *          appends at `Block K + 1`), set `durable_lsn = M - 1`, and set
+ *          `next_lsn_to_assign = M + 1` (preserving monotonic block LSNs).
  *
  * ----------------------------------------------------------------------------
  * 6.2. CHECKPOINT LSN BINARY SEARCH (`WalReader::FindBlockForLsn`)

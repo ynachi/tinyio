@@ -45,6 +45,8 @@ enum class WaitKind : std::uint8_t {
     semaphore,
     /// Parked on a Latch.
     latch,
+    /// Parked on a one-shot Baton.
+    baton,
     /// Parked on a TaskGroup.
     task_group,
     /// Parked waiting for a fixed buffer slot.
@@ -64,6 +66,8 @@ enum class WaitKind : std::uint8_t {
             return "Semaphore";
         case WaitKind::latch:
             return "Latch";
+        case WaitKind::baton:
+            return "Baton";
         case WaitKind::task_group:
             return "TaskGroup";
         case WaitKind::buffer_pool:

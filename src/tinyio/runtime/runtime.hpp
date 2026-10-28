@@ -49,7 +49,7 @@ inline constexpr unsigned k_uring_base_flags =
     IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP | IORING_SETUP_R_DISABLED;
 
 /// The largest length io_uring accepts for a single read or write.
-inline constexpr size_t kMaxRwLen = 0x7ffff000;
+inline constexpr size_t MAX_RW_LEN = 0x7ffff000;
 
 /// Default io accept flags
 inline constexpr int k_default_accept_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -106,32 +106,17 @@ struct IoOptions {
 };
 
 class IO final {
+    friend class FixedBuffer;
+    friend class FixedBufferPool;
+    friend struct Baton;
+    friend struct Latch;
+    friend struct Mutex;
+    friend struct Semaphore;
+    template <typename T>
+    friend struct TaskGroup;
 public:
-    /// @name Internal scheduler hooks for synchronization primitives.
-    /// @note Not for application code. Owner-thread only.
-    ///@{
-    [[nodiscard]] detail::fiber::Fiber* RunningFiber() const noexcept { return current_fiber_; }
-
-    /// Park the running fiber. Caller must have enqueued it on a wait list first.
-    ///
-    /// @p reason says WHAT the fiber is parked on. It costs nothing: the
-    /// reason is written into the fiber that is parking, and a runtime that
-    /// quiesces with parked fibers reports it instead of guessing.
-    /// @note Not for application code. Owner-thread only.
-    void ParkRunning(const detail::fiber::WaitKind reason) noexcept {
-        assert(current_fiber_ != nullptr && IsOwnerThread());
-        current_fiber_->state = detail::fiber::FiberState::waiting;
-        current_fiber_->wait_kind = reason;
-        SuspendFiber(current_fiber_);
-    }
-
-    /// Make a previously parked fiber runnable again.
-    /// @note Not for application code. Owner-thread only.
-    void Unpark(detail::fiber::Fiber* f) noexcept { PushReady(f); }
-    ///@}
-
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
-    explicit IO(size_t id, const IoOptions& opts);
+    explicit IO(uint32_t id, const IoOptions& opts);
 
     /// Destroys the runtime and releases ring resources and all fiber stacks.
     ///
@@ -392,6 +377,9 @@ public:
     /// @return {} on success, or an error code.
     [[nodiscard]] Result<void> Fsync(const UniqueFd& fd, bool datasync = false) noexcept;
 
+    Result<struct statx> Statx(const UniqueFd& fd, unsigned int mask) noexcept;
+    Result<struct statx> Statx(const std::filesystem::path& path, unsigned int mask, int flags) noexcept;
+
     /// Open or create the file at @p path and return a file descriptor.
     ///
     /// @param path
@@ -482,6 +470,48 @@ private:
     /// drain. A tick error used to abandon the drain on the first one, which
     /// left operations in flight while the ring was torn down.
     static constexpr int k_max_tick_errors = 3;
+
+    /// @name Internal scheduler hooks for synchronization primitives.
+    /// @note Not for application code. Owner-thread only.
+    ///@{
+    [[nodiscard]] detail::fiber::Fiber* RunningFiber() const noexcept { return current_fiber_; }
+
+    /// Park the running fiber. Caller must have enqueued it on a wait list first.
+    ///
+    /// @p reason says WHAT the fiber is parked on. It costs nothing: the
+    /// reason is written into the fiber that is parking, and a runtime that
+    /// quiesces with parked fibers reports it instead of guessing.
+    /// @note Not for application code. Owner-thread only.
+    void ParkRunning(const detail::fiber::WaitKind reason) noexcept {
+        assert(current_fiber_ != nullptr && IsOwnerThread());
+        current_fiber_->state = detail::fiber::FiberState::waiting;
+        current_fiber_->wait_kind = reason;
+        SuspendFiber(current_fiber_);
+    }
+
+    /// Make a sync-parked fiber runnable again.
+    /// Aborts if called on a fiber parked in IO::Syscall (WaitKind::io),
+    /// preventing premature wakeup while the kernel still holds &fiber->operation.
+    void Unpark(detail::fiber::Fiber* f) noexcept {
+        CHECK(f != nullptr && f->wait_kind != detail::fiber::WaitKind::io)
+            << "IO::Unpark called on a fiber waiting on in-flight kernel I/O";
+        f->wait_kind = detail::fiber::WaitKind::none;
+        PushReady(f);
+    }
+
+
+    /// Parks the running fiber on @p waiters until someone pops and unparks it.
+    ///
+    /// A park is not cancelled by shutdown: only the primitive wakes it. A fiber
+    /// still parked once the runtime has quiesced has no one left to wake it,
+    /// and the runtime aborts (see IO::AbortIfParkedFibers()).
+    ///
+    /// @p reason names the primitive the fiber is parked on, so a runtime that
+    /// aborts can say WHICH primitive is stuck instead of printing a count.
+    void ParkOn(FiberWaitQueue& waiters, const detail::fiber::WaitKind reason) noexcept {
+        waiters.PushBack(RunningFiber());
+        ParkRunning(reason);
+    }
 
     //
     // IO Uring management
@@ -621,7 +651,7 @@ private:
     //
     // Configs
     //
-    std::size_t id_;  ///  Id of the worker in a multi-threaded context
+    std::uint32_t id_;  ///  Id of the worker in a multi-threaded context
     IoOptions opts_;
 
     /// The fixed buffer pool, registered with the ring (IoOptions::buffer_pool).

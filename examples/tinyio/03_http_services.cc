@@ -117,7 +117,7 @@ int main() {
 
     // Parallel accept on all workers (SO_REUSEPORT allows multiple threads to bind to the
     // same port)
-    for (std::size_t i = 0; i < num_threads; ++i) {
+    for (std::uint32_t i = 0; i < num_threads; ++i) {
         stop_sources.emplace_back();
         auto st = stop_sources.back().get_token();
 

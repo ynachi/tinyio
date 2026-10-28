@@ -20,7 +20,7 @@
 #include "tinyio/logging.hpp"
 
 namespace tinyio {
-IO::IO(const size_t id, const IoOptions& opts)
+IO::IO(const uint32_t id, const IoOptions& opts)
     : id_(id),
       opts_(opts),
       post_queue_(std::make_unique<detail::MpscQueue<std::move_only_function<void(IO&) noexcept>>>(

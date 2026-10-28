@@ -144,7 +144,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::jthread> threads;
         std::vector<std::stop_source> stop_sources;
 
-        for (std::size_t i = 0; i < num_threads; ++i) {
+        for (std::uint32_t i = 0; i < num_threads; ++i) {
             stop_sources.emplace_back();
             auto st = stop_sources.back().get_token();
             threads.emplace_back([i, st, opts] {

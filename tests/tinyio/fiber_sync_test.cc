@@ -1,6 +1,7 @@
 #include "tinyio/runtime/fiber_sync.hpp"
 
 #include <chrono>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -303,6 +304,153 @@ TEST_F(FiberSyncTest, MutexWaitersWokenFifo) {
 
     io_.RunUntilDone();
     EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
+}
+
+// ── Baton ───────────────────────────────────────────────────────────────────
+
+// Wait() on an already-posted baton returns without parking.
+TEST_F(FiberSyncTest, BatonWaitReturnsImmediatelyWhenPosted) {
+    bool reached = false;
+
+    (void)io_.Spawn([&](IO& rt) noexcept {
+        Baton b(rt);
+        b.Post();
+        (void)b.Wait();
+        reached = true;
+    });
+
+    io_.RunUntilDone();
+    EXPECT_TRUE(reached);
+}
+
+// Post() is idempotent, and Wait() stays harmless after the baton is posted.
+TEST_F(FiberSyncTest, BatonPostIsIdempotent) {
+    bool reached = false;
+
+    (void)io_.Spawn([&](IO& rt) noexcept {
+        Baton b(rt);
+        b.Post();
+        b.Post();  // Posting twice must not break anything.
+        (void)b.Wait();
+        (void)b.Wait();  // Repeated waits on Posted are allowed.
+        reached = true;
+    });
+
+    io_.RunUntilDone();
+    EXPECT_TRUE(reached);
+}
+
+// try_wait reflects the posted state and never suspends.
+TEST_F(FiberSyncTest, BatonTryWaitTracksPostedState) {
+    bool before = true;
+    bool after = false;
+
+    (void)io_.Spawn([&](IO& rt) noexcept {
+        Baton b(rt);
+        before = b.TryWait();
+        b.Post();
+        after = b.TryWait();
+    });
+
+    io_.RunUntilDone();
+    EXPECT_FALSE(before);
+    EXPECT_TRUE(after);
+}
+
+// Post() only queues the waiter: it runs when the poster yields, not before.
+// This is lifetime rule 2 of the Baton contract — the poster may not touch
+// the baton after Post(), and the waiter may destroy it as soon as it runs.
+TEST_F(FiberSyncTest, BatonPostQueuesWaiterUntilPosterYields) {
+    bool waited = false;
+
+    (void)io_.Spawn([&](IO& rt) noexcept {
+        Baton b(rt);
+
+        (void)rt.Spawn([&](IO&) noexcept {
+            (void)b.Wait();
+            waited = true;
+        });
+
+        (void)rt.Yield();  // child runs to Wait() and parks
+        EXPECT_FALSE(waited);
+        b.Post();  // queues the child; it must not run yet
+        EXPECT_FALSE(waited);
+        (void)rt.Yield();  // only now does the waiter run
+        EXPECT_TRUE(waited);
+    });
+
+    io_.RunUntilDone();
+    EXPECT_TRUE(waited);
+}
+
+// The re-check sleep pattern the HybridLog flusher uses: a fresh one-shot
+// baton per sleep, published through a pointer the poster clears with
+// std::exchange. A wake that lands while the flusher is "in WriteFixed()"
+// (pointer null) is dropped — and must not be lost, because the producer
+// advanced the predicate before waking.
+TEST_F(FiberSyncTest, BatonRecheckPatternDropsNoWakeups) {
+    int pending = 0;  // the predicate / sticky state
+    int sleeps = 0;
+    int flushes = 0;
+    bool shutting_down = false;
+
+    (void)io_.Spawn([&](IO& rt) noexcept {
+        Baton* flusher_wake = nullptr;
+        Latch writer_done(rt, 1);
+        Latch flusher_done(rt, 1);
+
+        auto wake_flusher = [&]() noexcept {
+            if (flusher_wake != nullptr) {
+                std::exchange(flusher_wake, nullptr)->Post();
+            }
+        };
+
+        // The flusher loop: re-check the predicate, then publish a fresh
+        // baton; drains one unit of pending work per "WriteFixed()".
+        (void)rt.Spawn([&](IO& inner) noexcept {
+            while (!shutting_down) {
+                if (pending == 0) {        // (1) re-check FIRST
+                    Baton wake(inner);     // (2) fresh, one-shot
+                    flusher_wake = &wake;  // (3) publish
+                    ++sleeps;
+                    (void)wake.Wait();
+                    continue;  // loop back to the re-check
+                }
+                --pending;
+                ++flushes;
+                (void)inner.Yield();  // writers may wake us in this window
+            }
+            flusher_done.CountDown();
+        });
+
+        // A writer: advance the predicate, then wake — exactly the order the
+        // contract requires, twice hitting the window where the flusher is
+        // mid-flush and the wake is dropped.
+        (void)rt.Spawn([&](IO& inner) noexcept {
+            for (int i = 0; i < 3; ++i) {
+                ++pending;
+                wake_flusher();
+                (void)inner.Yield();
+            }
+            writer_done.CountDown();
+        });
+
+        // The outer fiber owns every local above; it must not return while
+        // either child can still touch them.
+        (void)writer_done.Wait();
+        while (pending > 0) {
+            (void)rt.Yield();
+        }
+        shutting_down = true;
+        wake_flusher();  // same path a real Shutdown() takes
+        (void)flusher_done.Wait();
+
+        EXPECT_EQ(flushes, 3);
+        EXPECT_GE(sleeps, 2);  // first sleep + at least the shutdown sleep
+    });
+
+    io_.RunUntilDone();
+    EXPECT_EQ(flushes, 3);
 }
 
 // ── TaskGroup<T> ────────────────────────────────────────────────────────────

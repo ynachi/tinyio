@@ -31,7 +31,7 @@ Result<unsigned int> IO::FixedRange(const FixedBuffer& buf, const size_t len,
     if (buffer_offset >= buf.Size() || len == 0) {
         return Error::FailErrno(EINVAL, op_name);
     }
-    return static_cast<unsigned int>(std::min({len, buf.Size() - buffer_offset, kMaxRwLen}));
+    return static_cast<unsigned int>(std::min({len, buf.Size() - buffer_offset, MAX_RW_LEN}));
 }
 
 Result<void> IO::Close(const int fd) noexcept {
@@ -58,7 +58,7 @@ Result<uint32_t> IO::Read(const UniqueFd& fd, const std::span<std::byte> buf, co
     }
     // A span past the kernel's per-op cap would truncate through the unsigned
     // SQE length; clamp so the caller gets a short read instead of a wrong one.
-    const auto len = static_cast<unsigned int>(std::min(buf.size(), kMaxRwLen));
+    const auto len = static_cast<unsigned int>(std::min(buf.size(), MAX_RW_LEN));
     return Syscall(
         "read",
         [&](io_uring_sqe* sqe) {
@@ -91,7 +91,7 @@ Result<uint32_t> IO::Write(const UniqueFd& fd, const std::span<const std::byte> 
         return Error::FailErrno(EINVAL, "write");
     }
     // Same clamp as Read: a partial write beats a truncated length.
-    const auto len = static_cast<unsigned int>(std::min(buf.size(), kMaxRwLen));
+    const auto len = static_cast<unsigned int>(std::min(buf.size(), MAX_RW_LEN));
     return Syscall(
         "write",
         [&](io_uring_sqe* sqe) {
@@ -244,6 +244,23 @@ Result<UniqueFd> IO::Accept(const UniqueFd& server_fd, const int flags,
             io_uring_prep_accept(sqe, server_fd.Get(), nullptr, nullptr, flags);
         },
         timeout);
+}
+
+Result<struct statx> IO::Statx(const UniqueFd& fd, const unsigned int mask) noexcept {
+    struct statx stx{};
+    TRY_VOID(Syscall<void>("statx", [&](io_uring_sqe* sqe) {
+        io_uring_prep_statx(sqe, fd.Get(), "", AT_EMPTY_PATH, mask, &stx);
+    }));
+    return stx;
+}
+
+Result<struct statx> IO::Statx(const std::filesystem::path& path, const unsigned int mask,
+                               const int flags) noexcept {
+    struct statx stx{};
+    TRY_VOID(Syscall<void>("statx", [&](io_uring_sqe* sqe) {
+        io_uring_prep_statx(sqe, AT_FDCWD, path.c_str(), flags, mask, &stx);
+    }));
+    return stx;
 }
 
 Result<void> IO::Connect(const UniqueFd& fd, const SocketAddress& addr,

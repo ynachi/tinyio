@@ -146,7 +146,7 @@
  * |                         | `written_end_offset`, `flushed_sector_offset`. |
  * +-------------------------+------------------------------------------------+
  * | `cold_scratch_bufs_`    | Pool of registered `tinyio::FixedBuffer` slots |
- * | + `scratch_waiters_`    | + `tinyio::FiberWaitQueue` for 4KB O_DIRECT    |
+ * | + `scratch_slots_`       | + `tinyio::Semaphore` for 4KB O_DIRECT         |
  * |                         | cold reads in `[BeginAddress, HeadAddress)`.   |
  * +-------------------------+------------------------------------------------+
  * | `segments_`             | Vector of `SegmentFileEntry` mapping `seg_id`  |
@@ -191,10 +191,11 @@
  *      - Step 3c (Enforce Circular Buffer Non-Overwrite Invariant Eq. 8):
  *        While `next_page - p(safe_head_address_) >= C` or
  *        `slots_[slot(next_page)].state != FREE_UNALLOCATED`:
- *          * Wake `PageFlusherFiber` and suspend calling fiber on
- *            `eviction_waiters_` via `tinyio::ParkOn()`.
+ *          * Call `WakeFlusher()` and `eviction_slots_->Acquire()` — a
+ *            `tinyio::Semaphore` holding one credit per evictable circular
+ *            slot — and re-check `p(tail_address_)` after resuming (Step 3d).
  *      - Step 3d (Multi-Fiber Wakeup Re-Check):
- *        After resuming from `eviction_waiters_`, if `p(tail_address_) >= next_page`
+ *        After resuming from `eviction_slots_->Acquire()`, if `p(tail_address_) >= next_page`
  *        (another fiber already rotated the tail onto `next_page`), loop back
  *        to Step 2! Otherwise, initialize `slots_[slot(next_page)]` as
  *        `ACTIVE_MUTABLE` for `next_page`, set `tail_address_ = next_page << m`,
@@ -231,8 +232,9 @@
  *   ^                  ^
  *   lba_off(L)         seg_off(L) = lba_off(L) + lba_delta(L)
  *
- *   1. Lease one registered `FixedBuffer` from `cold_scratch_bufs_` (parking
- *      on `scratch_waiters_` if all scratch slots are currently in use).
+ *   1. Lease one registered `FixedBuffer` from `cold_scratch_bufs_` via
+ *      `scratch_slots_->Acquire()` (parking the fiber if all scratch slots
+ *      are currently leased).
  *   2. Compute `seg_id(L)`, `lba_off(L)`, and `lba_delta(L)` via Eq. 4–6.
  *   3. Phase 1 Read (Header + First Sector):
  *      - Let `init_len = (lba_delta + sizeof(LogRecordHeader) > 4096) ? 8192 : 4096`.
@@ -264,6 +266,16 @@
  *   |        +------------ FLUSHED_CLEAN <--- FLUSH_IN_FLIGHT                |
  *   +------------------------------------------------------------------------+
  *
+ *   0. Sleeping (when `flushed_until_address_ >= safe_read_only_address_`):
+ *      Re-check the predicate FIRST, then create a fresh one-shot
+ *      `tinyio::Baton` on the flusher's stack, publish it through
+ *      `flusher_wake_`, and `Wait()` on it. A `WakeFlusher()` that lands
+ *      while the flusher is inside `io_.WriteFixed()` (step 1) finds
+ *      `flusher_wake_ == nullptr` and is dropped — not a lost wakeup,
+ *      because the writer advanced `safe_read_only_address_` before waking,
+ *      so the re-check sees the work. Shutdown is the same path: set
+ *      `shutting_down_`, call `WakeFlusher()`; the loop condition ends the
+ *      fiber with nobody left parked for the runtime's quiesce abort.
  *   1. While `flushed_until_address_ < safe_read_only_address_`:
  *      - Identify page `p = p(flushed_until_address_)` and `slot = slots_[slot(p)]`.
  *      - Let `page_base = p << m` and `target_end = min(safe_read_only_address_, page_base + P)`.
@@ -281,7 +293,9 @@
  *              - Set `slot.flushed_sector_offset = (target_end - page_base) & ~(SECTOR_SIZE - 1)`.
  *              - Keep `slot.state = READ_ONLY_DIRTY` so the remaining bytes of
  *                page `p` will be flushed once sealed!
- *          * Run `TryEvictFlushedPages()` and wake `flush_waiters_`.
+ *          * Run `TryEvictFlushedPages()` (which `Release()`s eviction
+ *            credits) and post the one-shot `Baton` of every `flush_waiters_`
+ *            node whose `target` is now covered.
  *
  * ----------------------------------------------------------------------------
  * 2.5. Algorithm 5: `TryEvictFlushedPages()` — Pin-Safe Circular Eviction
@@ -297,8 +311,8 @@
  *            (when the last `PageReadPin` releases, `UnpinPage()` wakes the
  *            flusher/evictor to complete the transition).
  *          * Reset `slot.state = FREE_UNALLOCATED`, `slot.logical_page_id = UINT64_MAX`,
- *            advance `safe_head_address_ = (h_page + 1) << m`, and unpark
- *            `eviction_waiters_`.
+ *            advance `safe_head_address_ = (h_page + 1) << m`, and
+ *            `eviction_slots_->Release()` so the next Allocate() can proceed.
  *
  * ----------------------------------------------------------------------------
  * 2.6. Algorithm 6: Sequential `Scan()` & Cold Segment `TruncateBefore()`
@@ -383,7 +397,7 @@
  * |    |                                  | is reached, preventing eviction!  |
  * +----+----------------------------------+-----------------------------------+
  * | 6  | Concurrent Fiber Page-Rotation   | After waking from                 |
- * |    | Wakeup Race in `Allocate()`:     | `eviction_waiters_`, re-check     |
+ * |    | Wakeup Race in `Allocate()`:     | `eviction_slots_->Acquire()`,     |
  * |    | Two fibers overflowing page `p`  | `if (p(tail_address_) >= p + 1)`  |
  * |    | both wake when slot `s(p+1)`     | and retry bump allocation instead |
  * |    | becomes free.                    | of double-initializing the slot.  |
@@ -422,10 +436,18 @@
  *        on the NVMe CQE — eliminating FASTER's heap-allocated `PendingContext`
  *        and manual `CompletePending()` polling loops.
  *
- *   3. Zero-Allocation Backpressure via `tinyio::FiberWaitQueue`:
- *      `eviction_waiters_`, `flush_waiters_`, `scratch_waiters_`, and
- *      `pin_drain_waiters_` park and unpark fibers via `tinyio::ParkOn()` and
- *      `io_.Unpark()` using `Fiber::wait_next` with zero heap allocations.
+ *   3. Zero-Allocation Backpressure via tinyio's fiber primitives:
+ *      - `PageFlusherFiberLoop()` sleeps on a fresh one-shot `tinyio::Baton`
+ *        published through `flusher_wake_` (full contract next to the Baton
+ *        in `tinyio/runtime/fiber_sync.hpp`): re-check the predicate before
+ *        publishing, the poster clears the pointer with `std::exchange`
+ *        BEFORE `Post()`, and nobody touches the baton after `Unpark()`.
+ *      - `WaitForFlushUntil()` links stack nodes `{target, Baton, next}` into
+ *        `flush_waiters_`; the flusher posts each node's Baton exactly once.
+ *      - Slot eviction is a `tinyio::Semaphore` credit per evictable
+ *        circular slot (`eviction_slots_`).
+ *      - Scratch buffer pool for cold reads uses `tinyio::Semaphore`
+ *        (`scratch_slots_`) for zero-allocation FIFO fair leases.
  * ============================================================================
  */
 
@@ -438,6 +460,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -445,7 +468,6 @@
 #include <crc32c/crc32c.h>
 
 #include "tinyio/check.hpp"
-#include "tinyio/detail/fiber.hpp"
 #include "tinyio/error.hpp"
 #include "tinyio/logging.hpp"
 #include "tinyio/net/fd.hpp"
@@ -689,6 +711,22 @@ using LogScanCallback = bool (*)(
     std::span<const std::byte> payload
 );
 
+/**
+ * @brief Stack-allocated wait node for `HybridLog::WaitForFlushUntil()`.
+ *
+ * One node per waiting fiber, linked into `flush_waiters_` ordered by
+ * `target`. The flusher posts `done` exactly once, when
+ * `flushed_until_address_ >= target`; the node dies with the waiter's stack
+ * frame, which is safe because a posted Baton is never touched again.
+ */
+struct FlushWaiterNode {
+    uint64_t target = 0;  // Watermark this waiter needs durable
+    tinyio::Baton done;   // One-shot; posted once by the flusher
+    FlushWaiterNode* next = nullptr;
+
+    explicit FlushWaiterNode(tinyio::IO& io) noexcept : done(io) {}
+};
+
 // ============================================================================
 // SECTION 5: `HybridLog` ENGINE SPECIFICATION (DECLARATION-ONLY INTERFACE)
 // ============================================================================
@@ -765,19 +803,32 @@ private:
     std::vector<PageSlotDescriptor>  slots_{};                 // Size C = 2^k registered page slots
     std::vector<tinyio::FixedBuffer> cold_scratch_bufs_{};     // Scratch FixedBuffers for Cold Reads
     std::vector<uint32_t>            free_scratch_indices_{};  // Free scratch buffer ordinals
-    tinyio::FiberWaitQueue           scratch_waiters_{};       // FIFO queue for cold-read scratch leases
+    std::optional<tinyio::Semaphore> scratch_slots_{};         // FIFO counting semaphore for cold-read scratch leases
     std::vector<SegmentFileEntry>    segments_{};              // Open pre-allocated O_DIRECT segments
 
     // ------------------------------------------------------------------------
-    // 4. Background Page Flusher Fiber & Zero-Allocation Wait Queues
+    // 4. Background Page Flusher Fiber & Backpressure Primitives
     // ------------------------------------------------------------------------
-    tinyio::detail::fiber::Fiber* flusher_fiber_       = nullptr;
-    tinyio::detail::fiber::Fiber* flusher_exit_waiter_ = nullptr;
-    bool                          flusher_parked_      = false;
-    bool                          shutting_down_       = false;
-    bool                          flusher_exited_      = true;
-    tinyio::FiberWaitQueue        eviction_waiters_{};  // Parked when p(Tail) - p(SafeHead) >= C
-    tinyio::FiberWaitQueue        flush_waiters_{};     // Parked in WaitForFlushUntil()
+    // The flusher sleeps on a fresh one-shot Baton published through
+    // `flusher_wake_` (contract in tinyio/runtime/fiber_sync.hpp):
+    //   - re-check the predicate BEFORE creating and publishing the baton;
+    //   - the poster clears the pointer (`std::exchange`) BEFORE `Post()`,
+    //     so it never dangles at the waiter's resumed stack frame;
+    //   - nobody touches the baton after `Unpark()` — the waiter runs only
+    //     when the poster yields.
+    // A WakeFlusher() that lands while the flusher is inside io_.WriteFixed()
+    // finds `flusher_wake_ == nullptr` and is dropped: not a lost wakeup,
+    // because the writer advanced safe_read_only_address_ (the sticky state)
+    // before waking. Shutdown() = set shutting_down_, then WakeFlusher();
+    // the loop condition ends the fiber with nobody left parked.
+    tinyio::Baton* flusher_wake_ = nullptr;  // Sleeping flusher's baton; null while busy
+    bool shutting_down_ = false;
+    // One credit per evictable circular slot: TryEvictFlushedPages()
+    // Release()s when a slot resets to FREE_UNALLOCATED, Allocate() Acquire()s
+    // before claiming the next tail page (Eq. 8 backpressure, FIFO-fair).
+    std::optional<tinyio::Semaphore> eviction_slots_{};  // Constructed in Start()
+    // WaitForFlushUntil() waiters, ordered by target (see FlushWaiterNode).
+    FlushWaiterNode* flush_waiters_ = nullptr;
 
 public:
     explicit HybridLog(tinyio::IO& io, HybridLogConfig cfg = {}) noexcept;
@@ -873,7 +924,7 @@ public:
      *
      * If the record overflows the current page `p`, seals page `p` with a
      * `PAGE_END_SENTINEL`, advances `read_only_address_` (Eq. 9), and parks
-     * on `eviction_waiters_` if circular slot `slot(p + 1)` is not yet free.
+     * on `eviction_slots_->Acquire()` if circular slot `slot(p + 1)` is not yet free.
      */
     [[nodiscard]] tinyio::Result<MutableRecordView> Allocate(
         uint32_t payload_size,
@@ -941,8 +992,10 @@ public:
     [[nodiscard]] uint64_t ShiftReadOnlyToTail() noexcept;
 
     /**
-     * @brief Park the calling fiber on `flush_waiters_` until
-     *        `flushed_until_address_ >= target_addr`.
+     * @brief Park the calling fiber until `flushed_until_address_ >= target_addr`
+     *        by linking a stack node `{target, one-shot Baton, next}` into
+     *        `flush_waiters_`; the flusher posts the node's Baton exactly
+     *        once. One wait, one baton — reuse would only add risk.
      */
     [[nodiscard]] tinyio::Result<void> WaitForFlushUntil(uint64_t target_addr) noexcept;
 
@@ -982,10 +1035,9 @@ private:
 
     void PageFlusherFiberLoop() noexcept;
     void TryEvictFlushedPages() noexcept;
-    void WakeFlusherIfNeeded() noexcept;
+    void WakeFlusher() noexcept;
 
     [[nodiscard]] tinyio::Result<const tinyio::UniqueFd*> GetOrOpenSegmentFd(uint64_t seg_id) noexcept;
-    void DrainWaitQueue(tinyio::FiberWaitQueue& q) noexcept;
 };
 
 }  // namespace storage::hybridlog
