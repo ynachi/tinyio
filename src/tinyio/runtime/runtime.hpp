@@ -96,13 +96,19 @@ struct IoOptions {
     /// Total number of fibers which can be recycle
     std::size_t max_idle_fibers = 1024;
 
-    /// The runtime's fixed buffer pool: one runtime, one pool. When set, the
-    /// runtime maps the pool and registers it with the ring at construction;
-    /// unset, the fixed-buffer API is unavailable.
+    /// The runtime's fixed buffer pools: one per size class.
+    ///
+    /// Every entry is an independent class with its own slot size. The runtime
+    /// maps each pool and registers all of them with the ring at construction;
+    /// an empty list leaves the fixed-buffer API unavailable.
+    ///
+    /// A request never falls back to another class: a slot is only ever taken
+    /// from the class whose slot size was asked for. A class with no free slot
+    /// fails (Take) or parks (Acquire) instead of borrowing from a neighbour.
     ///
     /// Registered pages are pinned: without CAP_IPC_LOCK they count against
     /// RLIMIT_MEMLOCK (`ulimit -l`), and construction throws ENOMEM past it.
-    std::optional<BufferPoolConfig> buffer_pool{};
+    std::vector<BufferPoolConfig> buffer_pools{};
 };
 
 class IO final {
@@ -114,6 +120,11 @@ class IO final {
     friend struct Semaphore;
     template <typename T>
     friend struct TaskGroup;
+    // The fiber lifecycle test checks that a large capture is built on the
+    // fiber's own stack, which needs the running fiber. Keeping the hook
+    // private means the test has to be a friend.
+    friend class FiberTest;
+
 public:
     /// Constructs an uninitialized Runtime shell; create() performs actual initialization.
     explicit IO(uint32_t id, const IoOptions& opts);
@@ -231,32 +242,40 @@ public:
 
     /// @name Fixed buffers
     ///
-    /// A fixed buffer is a slot of the runtime's pool (IoOptions::buffer_pool).
-    /// The pool is registered with the ring at construction, so a read or a
-    /// write can name the slot instead of an address and the kernel does not
-    /// have to copy through a bounce buffer.
+    /// A fixed buffer is a slot of one of the runtime's pools
+    /// (IoOptions::buffer_pools). Every pool is a size class with its own slot
+    /// size; the pools are registered with the ring at construction, so a read
+    /// or a write can name the slot instead of an address and the kernel does
+    /// not have to copy through a bounce buffer.
     ///@{
 
-    /// The runtime's pool, or nullptr when IoOptions::buffer_pool is unset.
-    [[nodiscard]] const FixedBufferPool* BufferPool() const noexcept {
-        return buffer_pool_ ? &*buffer_pool_ : nullptr;
-    }
+    /// The pool whose slots are @p slot_size bytes, or nullptr when the
+    /// runtime has no class of that size.
+    [[nodiscard]] const FixedBufferPool* BufferPool(size_t slot_size) const noexcept;
 
-    /// Take a slot without blocking.
-    ///
-    /// @return The slot, or EAGAIN when the pool is exhausted.
-    /// @note Aborts when the runtime has no pool.
-    [[nodiscard]] Result<FixedBuffer> TakeFixedBuffer() noexcept;
+    /// How many size classes the runtime has.
+    [[nodiscard]] size_t BufferPoolCount() const noexcept { return buffer_pools_.size(); }
 
-    /// Take a slot, parking the running fiber while the pool is empty.
+    /// Take a slot of @p slot_size bytes without blocking.
     ///
-    /// The fiber wakes when a released slot is handed to it. Like any sync
-    /// park, shutdown does not cancel it: a fiber still parked here once the
-    /// runtime has quiesced waits for a lease nobody will release, and the
-    /// runtime aborts (see AbortIfParkedFibers()).
-    /// @note Owner-thread only, inside a fiber. Aborts when the runtime has no
-    ///       pool.
-    [[nodiscard]] Result<FixedBuffer> AcquireFixedBuffer() noexcept;
+    /// @return The slot, or EAGAIN when that class is exhausted, or ENOENT
+    ///         when the runtime has no class of that size.
+    /// @note Aborts when the runtime has no pool at all.
+    [[nodiscard]] Result<FixedBuffer> TakeFixedBuffer(size_t slot_size) noexcept;
+
+    /// Take a slot of @p slot_size bytes, parking the running fiber while
+    /// that class is empty.
+    ///
+    /// The fiber wakes when a released slot of *that* class is handed to it. A
+    /// full class never borrows a slot from another class: the fiber waits.
+    ///
+    /// Like any sync park, shutdown does not cancel it: a fiber still parked
+    /// here once the runtime has quiesced waits for a lease nobody will
+    /// release, and the runtime aborts (see AbortIfParkedFibers()).
+    ///
+    /// @return The slot, or ENOENT when the runtime has no class of that size.
+    /// @note Owner-thread only, inside a fiber.
+    [[nodiscard]] Result<FixedBuffer> AcquireFixedBuffer(size_t slot_size) noexcept;
 
     // =====
     // IO Methods
@@ -281,13 +300,30 @@ public:
     /// @return Number of bytes written, or an error code.
     ///
     /// @code
-    /// auto buf = TRY(fio.TakeFixedBuffer());
+    /// auto buf = TRY(fio.TakeFixedBuffer(4096));
     /// std::memcpy(buf.Ptr(), data.data(), data.size());
     /// auto n = TRY(fio.WriteFixed(fd, buf, data.size(), file_offset));
     /// @endcode
+    ///
+    /// @p rw_flags are the pwritev2 flags (RWF_DSYNC and friends); they ride
+    /// in the SQE's rw_flags field.
     [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedBuffer& buf,
                                               size_t len, off_t file_offset = -1,
                                               size_t buffer_offset = 0,
+                                              std::chrono::nanoseconds timeout = {},
+                                              int rw_flags = 0) noexcept;
+
+    /// Write a registered region to @p fd.
+    ///
+    /// The region carries its own address, length and registration index, so
+    /// there is no offset/length pair to mix up.
+    ///
+    /// @code
+    /// auto buf = TRY(fio.TakeFixedBuffer(65536));
+    /// auto n = TRY(fio.WriteFixed(fd, buf.Slice(4096, 8192), file_offset, RWF_DSYNC));
+    /// @endcode
+    [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedRegion& region,
+                                              off_t file_offset = -1, int rw_flags = 0,
                                               std::chrono::nanoseconds timeout = {}) noexcept;
 
     /// Write the whole contents of @p buf to @p fd at its current position.
@@ -304,13 +340,22 @@ public:
     /// @return Number of bytes read, or an error code.
     ///
     /// @code
-    /// auto buf = TRY(fio.TakeFixedBuffer());
+    /// auto buf = TRY(fio.TakeFixedBuffer(4096));
     /// auto n = TRY(fio.ReadFixed(fd, buf, buf.Size(), 0));
     /// std::string_view content{reinterpret_cast<const char*>(buf.Ptr()),
     ///                          static_cast<size_t>(n)};
     /// @endcode
     [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedBuffer& buf, size_t len,
                                              off_t file_offset = -1, size_t buffer_offset = 0,
+                                             std::chrono::nanoseconds timeout = {}) noexcept;
+
+    /// Read into a registered region.
+    ///
+    /// The region carries its own address, length and registration index, so
+    /// there is no offset/length pair to mix up. The region is not const: the
+    /// kernel writes into it.
+    [[nodiscard]] Result<uint32_t> ReadFixed(const UniqueFd& fd, FixedRegion& region,
+                                             off_t file_offset = -1,
                                              std::chrono::nanoseconds timeout = {}) noexcept;
 
     /// Read up to buf.Size() bytes from @p fd into @p buf at its current position.
@@ -354,9 +399,11 @@ public:
     /// Pass @p offset = -1 to use the file's current position.
     ///
     /// @return Total bytes written, or an error code.
+    ///
+    /// @p rw_flags are the pwritev2 flags (RWF_DSYNC and friends).
     [[nodiscard]] Result<uint32_t> Writev(const UniqueFd& fd, std::span<const iovec> iovecs,
-                                          off_t offset = -1,
-                                          std::chrono::nanoseconds timeout = {}) noexcept;
+                                          off_t offset = -1, std::chrono::nanoseconds timeout = {},
+                                          int rw_flags = 0) noexcept;
 
     /// Read the scatter-gather vector @p iovecs from @p fd starting at @p offset.
     ///
@@ -375,10 +422,12 @@ public:
     ///                  metadata such as mtime may lag).  If false, flushes
     ///                  both data and metadata (fsync semantics).
     /// @return {} on success, or an error code.
-    [[nodiscard]] Result<void> Fsync(const UniqueFd& fd, bool datasync = false) noexcept;
+    [[nodiscard]] Result<void> Fsync(const UniqueFd& fd, bool datasync = false,
+                                     std::chrono::nanoseconds timeout = {}) noexcept;
 
     Result<struct statx> Statx(const UniqueFd& fd, unsigned int mask) noexcept;
-    Result<struct statx> Statx(const std::filesystem::path& path, unsigned int mask, int flags) noexcept;
+    Result<struct statx> Statx(const std::filesystem::path& path, unsigned int mask,
+                               int flags) noexcept;
 
     /// Open or create the file at @p path and return a file descriptor.
     ///
@@ -498,7 +547,6 @@ private:
         f->wait_kind = detail::fiber::WaitKind::none;
         PushReady(f);
     }
-
 
     /// Parks the running fiber on @p waiters until someone pops and unparks it.
     ///
@@ -654,8 +702,12 @@ private:
     std::uint32_t id_;  ///  Id of the worker in a multi-threaded context
     IoOptions opts_;
 
-    /// The fixed buffer pool, registered with the ring (IoOptions::buffer_pool).
-    std::optional<FixedBufferPool> buffer_pool_;
+    /// The fixed buffer pools, one per size class, registered with the ring
+    /// (IoOptions::buffer_pools).
+    ///
+    /// The pools are held by pointer because a pool maps pinned memory: it
+    /// cannot be moved, and a lease holds a raw pointer to its pool.
+    std::vector<std::unique_ptr<FixedBufferPool>> buffer_pools_;
 
     //
     // Fiber management
@@ -715,12 +767,27 @@ private:
     /// Initializes the io_uring instance and validates required opcodes.
     [[nodiscard]] Result<void> Initialize() noexcept;
 
-    /// Checks that @p buf is a slot of this runtime's pool (aborts if not) and
-    /// returns the transfer length for [buffer_offset, buffer_offset + len),
-    /// clamped to the slot; EINVAL for an offset outside it or a zero length.
+    /// Checks that @p buf is a slot of one of this runtime's pools (aborts if
+    /// not) and returns the transfer length for [buffer_offset, buffer_offset +
+    /// len), clamped to the slot; EINVAL for an offset outside it or a zero
+    /// length.
     [[nodiscard]] Result<unsigned int> FixedRange(const FixedBuffer& buf, size_t len,
                                                   size_t buffer_offset,
                                                   const char* op_name) const noexcept;
+
+    /// The pool whose slots are @p slot_size bytes, or nullptr when the
+    /// runtime has no class of that size.
+    [[nodiscard]] FixedBufferPool* FindPool(size_t slot_size) noexcept;
+    [[nodiscard]] const FixedBufferPool* FindPool(size_t slot_size) const noexcept;
+
+    /// Checks that @p region names a slot of one of this runtime's pools
+    /// (aborts if not) and returns the transfer length; EINVAL for an empty
+    /// region.
+    [[nodiscard]] Result<unsigned int> FixedRegionRange(const FixedRegion& region,
+                                                        const char* op_name) const noexcept;
+
+    /// True when @p pool is one of this runtime's pools.
+    [[nodiscard]] bool OwnsPool(const FixedBufferPool* pool) const noexcept;
 
     /// Cancels every in-flight request with one SQE, then drives the loop to
     /// quiescence.

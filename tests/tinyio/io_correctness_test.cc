@@ -70,7 +70,7 @@ TEST(IOCorrectnessTest, SleepForAccuracy) {
 
 TEST(IOCorrectnessTest, FixedBufferWriteRead) {
     IoOptions opts;
-    opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 1};
+    opts.buffer_pools = {BufferPoolConfig{.slot_size = 4096, .slots = 1}};
     IO io{0, opts};
 
     (void)io.Spawn([](IO& fio) noexcept {
@@ -79,7 +79,7 @@ TEST(IOCorrectnessTest, FixedBufferWriteRead) {
         ASSERT_TRUE(fd_res.has_value());
         UniqueFd fd = std::move(*fd_res);
 
-        auto buf_res = fio.TakeFixedBuffer();
+        auto buf_res = fio.TakeFixedBuffer(4096);
         ASSERT_TRUE(buf_res.has_value());
         auto& fixed_buf = *buf_res;
 
@@ -109,7 +109,7 @@ TEST(IOCorrectnessTest, FixedBufferWriteRead) {
 // would happily write past the end of the buffer it was given.
 TEST(IOCorrectnessTest, FixedBufferRangeOutsideTheSlotIsRejected) {
     IoOptions opts;
-    opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 1};
+    opts.buffer_pools = {BufferPoolConfig{.slot_size = 4096, .slots = 1}};
     IO io{0, opts};
 
     (void)io.Spawn([](IO& fio) noexcept {
@@ -118,7 +118,7 @@ TEST(IOCorrectnessTest, FixedBufferRangeOutsideTheSlotIsRejected) {
         ASSERT_TRUE(fd_res.has_value());
         UniqueFd fd = std::move(*fd_res);
 
-        auto buf_res = fio.TakeFixedBuffer();
+        auto buf_res = fio.TakeFixedBuffer(4096);
         ASSERT_TRUE(buf_res.has_value());
         auto& fixed_buf = *buf_res;
 

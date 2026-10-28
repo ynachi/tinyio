@@ -1,10 +1,12 @@
 #include "tinyio/runtime/buffer_pool.hpp"
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include <set>
 #include <system_error>
@@ -21,7 +23,14 @@ namespace {
 
 IoOptions WithPool(const size_t slot_size, const uint32_t slots) {
     IoOptions opts;
-    opts.buffer_pool = BufferPoolConfig{.slot_size = slot_size, .slots = slots};
+    opts.buffer_pools = {BufferPoolConfig{.slot_size = slot_size, .slots = slots}};
+    return opts;
+}
+
+// A runtime with one class per size: the classes never lend to each other.
+IoOptions WithPools(const std::vector<BufferPoolConfig>& pools) {
+    IoOptions opts;
+    opts.buffer_pools = pools;
     return opts;
 }
 
@@ -347,7 +356,7 @@ TEST_F(FixedBufferPoolFiberTest, FifoWakeChain) {
     std::vector<int> order;
 
     (void)io_.Spawn([](IO& rt) noexcept {
-        auto buf = rt.AcquireFixedBuffer();
+        auto buf = rt.AcquireFixedBuffer(4096);
         EXPECT_TRUE(buf.has_value());
         (void)rt.SleepForNs(std::chrono::milliseconds(10));
         buf->Release();
@@ -355,7 +364,7 @@ TEST_F(FixedBufferPoolFiberTest, FifoWakeChain) {
 
     for (int id = 1; id <= 3; ++id) {
         (void)io_.Spawn([&order, id](IO& rt) noexcept {
-            auto buf = rt.AcquireFixedBuffer();
+            auto buf = rt.AcquireFixedBuffer(4096);
             EXPECT_TRUE(buf.has_value());
             order.push_back(id);
             buf->Release();
@@ -375,17 +384,17 @@ TEST_F(FixedBufferPoolFiberTest, ReleasedSlotIsHandedToTheWaiter) {
     bool waiter_ok = false;
 
     (void)io_.Spawn([&thief_blocked](IO& rt) noexcept {
-        auto buf = rt.AcquireFixedBuffer();
+        auto buf = rt.AcquireFixedBuffer(4096);
         EXPECT_TRUE(buf.has_value());
         (void)rt.SleepForNs(std::chrono::milliseconds(10));
         buf->Release();
         // The slot went to the parked waiter, so the free list is empty.
-        auto stolen = rt.TakeFixedBuffer();
+        auto stolen = rt.TakeFixedBuffer(4096);
         thief_blocked = !stolen.has_value();
     });
 
     (void)io_.Spawn([&waiter_ok](IO& rt) noexcept {
-        auto buf = rt.AcquireFixedBuffer();
+        auto buf = rt.AcquireFixedBuffer(4096);
         waiter_ok = buf.has_value();
     });
 
@@ -484,18 +493,18 @@ TEST_F(FixedBufferPoolFiberTest, ClosedPoolHandsOutNothing) {
 
 TEST(FixedBufferPoolRuntimeTest, NoPoolUnlessConfigured) {
     IO io{0, IoOptions{}};
-    EXPECT_EQ(io.BufferPool(), nullptr);
+    EXPECT_EQ(io.BufferPool(4096), nullptr);
 }
 
 TEST(FixedBufferPoolRuntimeTest, PoolFollowsTheConfig) {
     IO io{0, WithPool(8192, 3)};
 
-    const auto* pool = io.BufferPool();
+    const auto* pool = io.BufferPool(8192);
     ASSERT_NE(pool, nullptr);
     EXPECT_EQ(pool->SlotSize(), 8192u);
     EXPECT_EQ(pool->Capacity(), 3u);
 
-    auto buf = io.TakeFixedBuffer();
+    auto buf = io.TakeFixedBuffer(8192);
     ASSERT_TRUE(buf.has_value());
     EXPECT_EQ(buf->Size(), 8192u);
     EXPECT_EQ(buf->Pool(), pool);
@@ -505,10 +514,10 @@ TEST(FixedBufferPoolRuntimeTest, PoolFollowsTheConfig) {
 TEST(FixedBufferPoolRuntimeTest, ExhaustedPoolReturnsEagain) {
     IO io{0, WithPool(4096, 1)};
 
-    auto held = io.TakeFixedBuffer();
+    auto held = io.TakeFixedBuffer(4096);
     ASSERT_TRUE(held.has_value());
 
-    auto extra = io.TakeFixedBuffer();
+    auto extra = io.TakeFixedBuffer(4096);
     ASSERT_FALSE(extra.has_value());
     EXPECT_EQ(extra.error().Value(), EAGAIN);
 }
@@ -520,9 +529,212 @@ TEST(FixedBufferPoolDeathTest, TakeWithoutAPoolTerminates) {
     EXPECT_DEATH(
         {
             RedirectStdoutToStderr();
-            (void)io.TakeFixedBuffer();
+            (void)io.TakeFixedBuffer(4096);
         },
         "no buffer pool configured");
+}
+
+// ---------------------------------------------------------------------------
+// Runtime level: several size classes
+// ---------------------------------------------------------------------------
+
+// Two classes, two slot sizes, one runtime: a 4 KiB lease and a 64 KiB lease
+// live in the same ring and never see each other.
+TEST(FixedBufferPoolRuntimeTest, SizeClassesCoexist) {
+    IO io{0, WithPools({BufferPoolConfig{.slot_size = 4096, .slots = 2},
+                        BufferPoolConfig{.slot_size = 65536, .slots = 4}})};
+
+    EXPECT_EQ(io.BufferPoolCount(), 2u);
+    ASSERT_NE(io.BufferPool(4096), nullptr);
+    ASSERT_NE(io.BufferPool(65536), nullptr);
+    EXPECT_EQ(io.BufferPool(4096)->SlotSize(), 4096u);
+    EXPECT_EQ(io.BufferPool(65536)->SlotSize(), 65536u);
+    EXPECT_EQ(io.BufferPool(4096)->Capacity(), 2u);
+    EXPECT_EQ(io.BufferPool(65536)->Capacity(), 4u);
+
+    auto small = io.TakeFixedBuffer(4096);
+    auto large = io.TakeFixedBuffer(65536);
+    ASSERT_TRUE(small.has_value());
+    ASSERT_TRUE(large.has_value());
+    EXPECT_EQ(small->Size(), 4096u);
+    EXPECT_EQ(large->Size(), 65536u);
+    EXPECT_NE(small->Pool(), large->Pool());
+    EXPECT_EQ(io.BufferPool(4096)->Available(), 1u);
+    EXPECT_EQ(io.BufferPool(65536)->Available(), 3u);
+}
+
+// No fallback: a full class fails instead of borrowing a slot of another
+// size. The neighbour class is untouched and still hands out its own slots.
+TEST(FixedBufferPoolRuntimeTest, ExhaustedClassDoesNotBorrowFromAnother) {
+    IO io{0, WithPools({BufferPoolConfig{.slot_size = 4096, .slots = 1},
+                        BufferPoolConfig{.slot_size = 65536, .slots = 1}})};
+
+    auto held = io.TakeFixedBuffer(4096);
+    ASSERT_TRUE(held.has_value());
+
+    auto extra = io.TakeFixedBuffer(4096);
+    ASSERT_FALSE(extra.has_value());
+    EXPECT_EQ(extra.error().Value(), EAGAIN);
+
+    // The 64 KiB class is untouched and still has its slot.
+    auto large = io.TakeFixedBuffer(65536);
+    ASSERT_TRUE(large.has_value());
+    EXPECT_EQ(large->Size(), 65536u);
+    EXPECT_EQ(io.BufferPool(65536)->Available(), 0u);
+}
+
+// A size no class was configured for is ENOENT, not a slot of another size.
+TEST(FixedBufferPoolRuntimeTest, UnknownSizeClassIsEnoent) {
+    IO io{0, WithPools({BufferPoolConfig{.slot_size = 4096, .slots = 1}})};
+
+    auto missing = io.TakeFixedBuffer(12345);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error().Value(), ENOENT);
+
+    EXPECT_EQ(io.BufferPool(12345), nullptr);
+}
+
+// Two classes of the same size would make "a slot of N bytes" ambiguous.
+TEST(FixedBufferPoolRuntimeTest, DuplicateSlotSizeIsRejected) {
+    EXPECT_THROW(IO(0, WithPools({BufferPoolConfig{.slot_size = 4096, .slots = 1},
+                                  BufferPoolConfig{.slot_size = 4096, .slots = 2}})),
+                 std::invalid_argument);
+}
+
+// A fiber waiting for a full class parks; it never wakes up with a slot of
+// another size.
+TEST_F(FixedBufferPoolFiberTest, AcquireOnAFullClassParksInsteadOfBorrowing) {
+    bool acquired = false;
+    size_t acquired_size = 0;
+
+    (void)io_.Spawn([](IO& rt) noexcept {
+        auto held = rt.TakeFixedBuffer(4096);
+        EXPECT_TRUE(held.has_value());
+        (void)rt.SleepForNs(std::chrono::milliseconds(20));
+    });
+
+    (void)io_.Spawn([&](IO& rt) noexcept {
+        auto buf = rt.AcquireFixedBuffer(4096);
+        acquired = buf.has_value();
+        acquired_size = buf.has_value() ? buf->Size() : 0;
+    });
+
+    io_.RunUntilDone();
+
+    EXPECT_TRUE(acquired);
+    EXPECT_EQ(acquired_size, 4096u);
+}
+
+// ---------------------------------------------------------------------------
+// FixedRegion: a sub-slice of a leased slot
+// ---------------------------------------------------------------------------
+
+TEST(FixedRegionTest, SliceStaysInsideTheSlot) {
+    IO io{0, WithPool(65536, 2)};
+
+    auto buf = io.TakeFixedBuffer(65536);
+    ASSERT_TRUE(buf.has_value());
+
+    auto region = buf->Slice(4096, 8192);
+    EXPECT_EQ(region.Size(), 8192u);
+    EXPECT_EQ(region.Ptr(), buf->Ptr() + 4096);
+    EXPECT_EQ(region.Pool(), buf->Pool());
+    // The registration index is the one of the chunk the slot lives in, so
+    // the kernel resolves the address inside the right registered region.
+    EXPECT_EQ(region.Index(), buf->Index());
+    EXPECT_EQ(region.Data().size(), 8192u);
+}
+
+TEST(FixedRegionTest, WholeSlotConvertsToARegion) {
+    IO io{0, WithPool(4096, 2)};
+
+    auto buf = io.TakeFixedBuffer(4096);
+    ASSERT_TRUE(buf.has_value());
+
+    FixedRegion region(*buf);
+    EXPECT_EQ(region.Size(), 4096u);
+    EXPECT_EQ(region.Ptr(), buf->Ptr());
+    EXPECT_EQ(region.Index(), buf->Index());
+}
+
+// An empty lease has nothing to slice: converting it aborts rather than
+// handing the kernel a region with no address.
+TEST(FixedRegionDeathTest, EmptyLeaseConversionTerminates) {
+    FixedBuffer empty;
+
+    EXPECT_DEATH(
+        {
+            RedirectStdoutToStderr();
+            const FixedRegion region(empty);
+            (void)region;
+        },
+        "empty lease");
+}
+
+TEST(FixedRegionDeathTest, SliceOutsideTheSlotTerminates) {
+    IO io{0, WithPool(4096, 2)};
+
+    auto buf = io.TakeFixedBuffer(4096);
+    ASSERT_TRUE(buf.has_value());
+
+    EXPECT_DEATH(
+        {
+            RedirectStdoutToStderr();
+            (void)buf->Slice(4096, 1);
+        },
+        "outside slot");
+}
+
+TEST(FixedRegionDeathTest, EmptySliceTerminates) {
+    IO io{0, WithPool(4096, 2)};
+
+    auto buf = io.TakeFixedBuffer(4096);
+    ASSERT_TRUE(buf.has_value());
+
+    EXPECT_DEATH(
+        {
+            RedirectStdoutToStderr();
+            (void)buf->Slice(0, 0);
+        },
+        "outside slot");
+}
+
+// A region writes and reads back through the ring, at a file offset that is
+// not the start of the slot.
+TEST(FixedRegionTest, RegionWriteAndReadBack) {
+    IoOptions opts;
+    opts.buffer_pools = {BufferPoolConfig{.slot_size = 4096, .slots = 2}};
+    IO io{0, opts};
+
+    (void)io.Spawn([](IO& fio) noexcept {
+        const auto path = std::filesystem::temp_directory_path() / "tinyio_region_test.bin";
+
+        auto fd_res = fio.Open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        ASSERT_TRUE(fd_res.has_value());
+        UniqueFd fd = std::move(*fd_res);
+
+        auto buf = fio.TakeFixedBuffer(4096);
+        ASSERT_TRUE(buf.has_value());
+        std::memset(buf->Ptr(), 'R', 4096);
+
+        // Write the first half of the slot at file offset 0.
+        auto written = fio.WriteFixed(fd, buf->Slice(0, 2048), 0);
+        ASSERT_TRUE(written.has_value());
+        EXPECT_EQ(*written, 2048u);
+
+        // Read it back into the second half of another slot.
+        auto reader = fio.TakeFixedBuffer(4096);
+        ASSERT_TRUE(reader.has_value());
+        auto region = reader->Slice(2048, 2048);
+        auto read = fio.ReadFixed(fd, region, 0);
+        ASSERT_TRUE(read.has_value());
+        EXPECT_EQ(*read, 2048u);
+        EXPECT_EQ(std::memcmp(reader->Ptr() + 2048, "RRRR", 4), 0);
+
+        (void)fio.Close(std::move(fd));
+        (void)fio.Remove(path);
+    });
+    io.RunUntilDone();
 }
 
 // ---------------------------------------------------------------------------
@@ -539,12 +751,12 @@ TEST(FixedBufferPoolDeathTest, ParkedWaiterAtQuiesceAborts) {
         std::optional<FixedBuffer> escaped;
 
         (void)io.Spawn([&escaped](IO& rt) noexcept {
-            auto buf = rt.AcquireFixedBuffer();
+            auto buf = rt.AcquireFixedBuffer(4096);
             if (buf.has_value()) {
                 escaped.emplace(std::move(*buf));
             }
         });
-        (void)io.Spawn([](IO& rt) noexcept { (void)rt.AcquireFixedBuffer(); });
+        (void)io.Spawn([](IO& rt) noexcept { (void)rt.AcquireFixedBuffer(4096); });
 
         io.RunUntilDone();
     };

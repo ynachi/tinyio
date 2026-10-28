@@ -25,9 +25,21 @@ IO::IO(const uint32_t id, const IoOptions& opts)
       opts_(opts),
       post_queue_(std::make_unique<detail::MpscQueue<std::move_only_function<void(IO&) noexcept>>>(
           opts.post_queue_capacity)) {
-    if (opts.buffer_pool) {
-        buffer_pool_.emplace(opts.buffer_pool->slot_size, opts.buffer_pool->slots);
-        buffer_pool_->SetOwner(this);
+    if (!opts.buffer_pools.empty()) {
+        buffer_pools_.reserve(opts.buffer_pools.size());
+        for (const auto& cfg : opts.buffer_pools) {
+            // Two classes of the same size would make "take a slot of N bytes"
+            // ambiguous, so they are rejected here rather than silently
+            // shadowing each other.
+            for (const auto& pool : buffer_pools_) {
+                if (pool->SlotSize() == cfg.slot_size) {
+                    throw std::invalid_argument(
+                        "two buffer pools with the same slot size are ambiguous");
+                }
+            }
+            buffer_pools_.push_back(std::make_unique<FixedBufferPool>(cfg.slot_size, cfg.slots));
+            buffer_pools_.back()->SetOwner(this);
+        }
     }
 
     if (auto res = Initialize(); !res) {
@@ -104,11 +116,11 @@ IO::~IO() noexcept {
         wake_fd_ = -1;
     }
 
-    // Detach the pool before the fibers go away: a fiber parked on a slot
+    // Detach the pools before the fibers go away: a fiber parked on a slot
     // points at memory that is about to be freed, so the pool must not try to
     // unpark it afterwards.
-    if (buffer_pool_) {
-        buffer_pool_->Detach();
+    for (auto& pool : buffer_pools_) {
+        pool->Detach();
     }
 
     // Release all fiber stacks and Fiber objects (both live and idle).
@@ -154,21 +166,28 @@ Result<void> IO::Initialize() noexcept {
     // buffer table is far smaller than the number of slots a pool holds. The
     // kernel pins the pages, which counts against RLIMIT_MEMLOCK unless the
     // process has CAP_IPC_LOCK.
-    if (buffer_pool_) {
+    //
+    // Every pool contributes its chunks to the one table of the ring, and
+    // each pool keeps the index its own chunks start at.
+    if (!buffer_pools_.empty()) {
         std::vector<iovec> table;
-        buffer_pool_->AppendRegions(table);
+        size_t pinned_bytes = 0;
+        for (auto& pool : buffer_pools_) {
+            pool->AppendRegions(table);
+            pinned_bytes += pool->AllocatedBytes();
+            ELOGFMT(INFO, "registered a buffer pool of {} x {} bytes", pool->Capacity(),
+                    pool->SlotSize());
+        }
         if (const int ret = io_uring_register_buffers(&ring_, table.data(),
                                                       static_cast<unsigned int>(table.size()));
             ret < 0) {
             ELOGFMT(ERROR, "io_uring_register_buffers failed: {} ({} regions, {} bytes pinned){}",
-                    std::strerror(-ret), table.size(), buffer_pool_->AllocatedBytes(),
+                    std::strerror(-ret), table.size(), pinned_bytes,
                     ret == -ENOMEM ? "; check `ulimit -l` (RLIMIT_MEMLOCK) or LimitMEMLOCK= "
                                      "in the unit file"
                                    : "");
             return Error::FailErrno(-ret, "io_uring_register_buffers");
         }
-        ELOGFMT(INFO, "registered a buffer pool of {} x {} bytes", buffer_pool_->Capacity(),
-                buffer_pool_->SlotSize());
     }
 
     ELOGFMT(INFO, "Initialized IO context with {} submission entries (SQPOLL: {})",

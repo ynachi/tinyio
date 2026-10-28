@@ -4,26 +4,68 @@
 #include "tinyio/runtime/runtime.hpp"
 
 namespace tinyio {
-Result<FixedBuffer> IO::TakeFixedBuffer() noexcept {
-    CHECK(buffer_pool_.has_value())
-        << "take_fixed_buffer: no buffer pool configured (IoOptions::buffer_pool)";
-    return buffer_pool_->Take();
+const FixedBufferPool* IO::BufferPool(const size_t slot_size) const noexcept {
+    return FindPool(slot_size);
 }
 
-Result<FixedBuffer> IO::AcquireFixedBuffer() noexcept {
-    CHECK(buffer_pool_.has_value())
-        << "acquire_fixed_buffer: no buffer pool configured (IoOptions::buffer_pool)";
-    return buffer_pool_->Acquire(*this);
+FixedBufferPool* IO::FindPool(const size_t slot_size) noexcept {
+    for (auto& pool : buffer_pools_) {
+        if (pool->SlotSize() == slot_size) {
+            return pool.get();
+        }
+    }
+    return nullptr;
+}
+
+const FixedBufferPool* IO::FindPool(const size_t slot_size) const noexcept {
+    for (const auto& pool : buffer_pools_) {
+        if (pool->SlotSize() == slot_size) {
+            return pool.get();
+        }
+    }
+    return nullptr;
+}
+
+bool IO::OwnsPool(const FixedBufferPool* pool) const noexcept {
+    for (const auto& owned : buffer_pools_) {
+        if (owned.get() == pool) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Result<FixedBuffer> IO::TakeFixedBuffer(const size_t slot_size) noexcept {
+    CHECK(!buffer_pools_.empty())
+        << "take_fixed_buffer: no buffer pool configured (IoOptions::buffer_pools)";
+    // No fallback: a slot comes from the class of that exact size, or not at
+    // all. A full class never borrows from another one.
+    FixedBufferPool* pool = FindPool(slot_size);
+    if (pool == nullptr) {
+        return Error::FailErrno(ENOENT, "take_fixed_buffer: no buffer class of that size");
+    }
+    return pool->Take();
+}
+
+Result<FixedBuffer> IO::AcquireFixedBuffer(const size_t slot_size) noexcept {
+    CHECK(!buffer_pools_.empty())
+        << "acquire_fixed_buffer: no buffer pool configured (IoOptions::buffer_pools)";
+    // No fallback: the fiber waits for a slot of that exact size. A full
+    // class never borrows from another one.
+    FixedBufferPool* pool = FindPool(slot_size);
+    if (pool == nullptr) {
+        return Error::FailErrno(ENOENT, "acquire_fixed_buffer: no buffer class of that size");
+    }
+    return pool->Acquire(*this);
 }
 
 Result<unsigned int> IO::FixedRange(const FixedBuffer& buf, const size_t len,
                                     const size_t buffer_offset,
                                     const char* op_name) const noexcept {
-    // The slot has to come from this runtime's pool: the kernel resolves the
-    // buf_index against the table registered with this ring, and a foreign
-    // index would name the wrong buffer.
-    CHECK(buffer_pool_.has_value() && buf.Pool() == &*buffer_pool_)
-        << op_name << ": the buffer is not registered with this runtime";
+    // The slot has to come from one of this runtime's pools: the kernel
+    // resolves the buf_index against the table registered with this ring, and
+    // a foreign index would name the wrong buffer.
+    CHECK(OwnsPool(buf.Pool())) << op_name << ": the buffer is not registered with this runtime";
     // The buffer offset has to land inside the slot, and the length must not
     // be zero: either is an EINVAL. A length that runs past the slot is
     // clamped to what is left of it, so the kernel never touches the next
@@ -32,6 +74,17 @@ Result<unsigned int> IO::FixedRange(const FixedBuffer& buf, const size_t len,
         return Error::FailErrno(EINVAL, op_name);
     }
     return static_cast<unsigned int>(std::min({len, buf.Size() - buffer_offset, MAX_RW_LEN}));
+}
+
+Result<unsigned int> IO::FixedRegionRange(const FixedRegion& region,
+                                          const char* op_name) const noexcept {
+    // Same ownership rule as FixedRange(): the region names a pool, and only
+    // a pool of this runtime is registered with this ring.
+    CHECK(OwnsPool(region.Pool())) << op_name << ": the buffer is not registered with this runtime";
+    if (region.Size() == 0) {
+        return Error::FailErrno(EINVAL, op_name);
+    }
+    return static_cast<unsigned int>(std::min(region.Size(), MAX_RW_LEN));
 }
 
 Result<void> IO::Close(const int fd) noexcept {
@@ -136,13 +189,30 @@ Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf, const size_
         timeout);
 }
 
+Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedRegion& region, const off_t file_offset,
+                               const std::chrono::nanoseconds timeout) noexcept {
+    if (file_offset < -1) {
+        return Error::FailErrno(EINVAL, "read_fixed");
+    }
+    TRY(const safe_len, FixedRegionRange(region, "read_fixed"));
+    return Syscall(
+        "read_fixed",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_read_fixed(sqe, fd.Get(), region.Ptr(), safe_len,
+                                     static_cast<std::uint64_t>(file_offset),
+                                     static_cast<int>(region.Index()));
+        },
+        timeout);
+}
+
 Result<uint32_t> IO::ReadFixed(const UniqueFd& fd, FixedBuffer& buf) noexcept {
     return ReadFixed(fd, buf, buf.Size(), -1, 0);
 }
 
 Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf, const size_t len,
                                 const off_t file_offset, const size_t buffer_offset,
-                                const std::chrono::nanoseconds timeout) noexcept {
+                                const std::chrono::nanoseconds timeout,
+                                const int rw_flags) noexcept {
     if (file_offset < -1) {
         return Error::FailErrno(EINVAL, "write_fixed");
     }
@@ -154,6 +224,25 @@ Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedBuffer& buf, cons
             io_uring_prep_write_fixed(sqe, fd.Get(), start_addr, safe_len,
                                       static_cast<std::uint64_t>(file_offset),
                                       static_cast<int>(buf.Index()));
+            sqe->rw_flags = static_cast<__kernel_rwf_t>(rw_flags);
+        },
+        timeout);
+}
+
+Result<uint32_t> IO::WriteFixed(const UniqueFd& fd, const FixedRegion& region,
+                                const off_t file_offset, const int rw_flags,
+                                const std::chrono::nanoseconds timeout) noexcept {
+    if (file_offset < -1) {
+        return Error::FailErrno(EINVAL, "write_fixed");
+    }
+    TRY(const safe_len, FixedRegionRange(region, "write_fixed"));
+    return Syscall(
+        "write_fixed",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_write_fixed(sqe, fd.Get(), region.Ptr(), safe_len,
+                                      static_cast<std::uint64_t>(file_offset),
+                                      static_cast<int>(region.Index()));
+            sqe->rw_flags = static_cast<__kernel_rwf_t>(rw_flags);
         },
         timeout);
 }
@@ -178,24 +267,28 @@ Result<uint32_t> IO::Readv(const UniqueFd& fd, std::span<const iovec> iovecs, co
 }
 
 Result<uint32_t> IO::Writev(const UniqueFd& fd, std::span<const iovec> iovecs, const off_t offset,
-                            const std::chrono::nanoseconds timeout) noexcept {
+                            const std::chrono::nanoseconds timeout, const int rw_flags) noexcept {
     if (offset < -1) {
         return Error::FailErrno(EINVAL, "writev");
     }
     return Syscall(
         "writev",
         [&](io_uring_sqe* sqe) {
-            io_uring_prep_writev(sqe, fd.Get(), iovecs.data(),
-                                 static_cast<unsigned int>(iovecs.size()),
-                                 static_cast<std::uint64_t>(offset));
+            io_uring_prep_writev2(sqe, fd.Get(), iovecs.data(),
+                                  static_cast<unsigned int>(iovecs.size()),
+                                  static_cast<std::uint64_t>(offset), rw_flags);
         },
         timeout);
 }
 
-Result<void> IO::Fsync(const UniqueFd& fd, const bool datasync) noexcept {
-    return Syscall<void>("fsync", [&](io_uring_sqe* sqe) {
-        io_uring_prep_fsync(sqe, fd.Get(), datasync ? IORING_FSYNC_DATASYNC : 0);
-    });
+Result<void> IO::Fsync(const UniqueFd& fd, const bool datasync,
+                       const std::chrono::nanoseconds timeout) noexcept {
+    return Syscall<void>(
+        "fsync",
+        [&](io_uring_sqe* sqe) {
+            io_uring_prep_fsync(sqe, fd.Get(), datasync ? IORING_FSYNC_DATASYNC : 0);
+        },
+        timeout);
 }
 
 Result<UniqueFd> IO::Open(const std::filesystem::path& path, const int flags,

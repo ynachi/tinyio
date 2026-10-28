@@ -9,13 +9,33 @@
 
 using namespace tinyio;
 
-namespace {
+namespace tinyio {
+// In namespace tinyio so that IO's `friend class FiberTest;` names this
+// fixture: the test needs the running fiber to check that a large capture
+// lives on the fiber's stack, and the runtime keeps that hook private.
 class FiberTest : public ::testing::Test {
 protected:
     IoOptions opts_;
     IO io_{0, opts_};
+
+    /// True when @p addr points into the stack of the fiber running on the
+    /// calling thread.
+    ///
+    /// The runtime keeps its fiber hook private, and friendship is not
+    /// inherited by the class GoogleTest derives from this fixture, so the
+    /// check has to live in a member of the fixture itself.
+    static bool OnFiberStack(IO& rt, const void* addr) {
+        const auto* self = rt.RunningFiber();
+        if (self == nullptr) {
+            return false;
+        }
+        const auto value = reinterpret_cast<std::uintptr_t>(addr);
+        const auto low = reinterpret_cast<std::uintptr_t>(self->stack.low);
+        const auto high = reinterpret_cast<std::uintptr_t>(self->stack.high);
+        return value >= low && value < high;
+    }
 };
-}  // namespace
+}  // namespace tinyio
 
 TEST_F(FiberTest, SpawnAndComplete) {
     bool done = false;
@@ -108,12 +128,7 @@ TEST_F(FiberTest, LargeCaptureLivesOnFiberStackAndDestroysCleanly) {
     auto res = io_.Spawn(
         [payload, tracker = DropCounter(&drops), &observed_sum, &on_fiber_stack](IO& rt) noexcept {
             (void)tracker;
-            const auto* self = rt.RunningFiber();
-            ASSERT_NE(self, nullptr);
-            const auto addr = reinterpret_cast<std::uintptr_t>(&payload);
-            const auto low = reinterpret_cast<std::uintptr_t>(self->stack.low);
-            const auto high = reinterpret_cast<std::uintptr_t>(self->stack.high);
-            on_fiber_stack = (addr >= low && addr < high);
+            on_fiber_stack = FiberTest::OnFiberStack(rt, &payload);
             for (const auto v : payload) {
                 observed_sum += v;
             }

@@ -299,17 +299,17 @@ TEST(ShutdownCancellationTest, AbortNamesEveryStuckPrimitive) {
         {
             (void)::dup2(STDERR_FILENO, STDOUT_FILENO);
             IoOptions opts;
-            opts.buffer_pool = OneSlotPool();
+            opts.buffer_pools = {OneSlotPool()};
             IO io(0, opts);
             Latch never(io, 1);
             // Holds the only slot, then parks on the latch forever.
             (void)io.Spawn([&](IO& rt) noexcept {
-                auto buf = rt.TakeFixedBuffer();
+                auto buf = rt.TakeFixedBuffer(4096);
                 ASSERT_TRUE(buf.has_value());
                 (void)never.Wait();
             });
             // Parks on the pool: the slot is never released.
-            (void)io.Spawn([&](IO& rt) noexcept { (void)rt.AcquireFixedBuffer(); });
+            (void)io.Spawn([&](IO& rt) noexcept { (void)rt.AcquireFixedBuffer(4096); });
             RunAndStopAfter50ms(io);
         },
         DiedWithoutHanging,
