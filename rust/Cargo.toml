@@ -1,0 +1,48 @@
+[package]
+name = "tinyio-rs"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+description = "Stackful-fiber io_uring runtime: tinyio, rebuilt in Rust around its invariants"
+license = "MIT"
+publish = false
+
+[lib]
+name = "tinyio"
+
+[dependencies]
+libc = "0.2"
+io-uring = "0.7"
+crossbeam-queue = "0.3"
+tracing = { version = "0.1", optional = true, default-features = false }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
+[[bench]]
+name = "context_switch"
+harness = false
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+
+# Rule 0: the public API is safe, and every unsafe block says why.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "allow"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+# Rule 8: panics abort through `check::fatal`, never through panic!/unwrap.
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+unimplemented = "deny"

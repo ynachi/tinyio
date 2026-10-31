@@ -1,0 +1,29 @@
+name: rust
+on:
+  push:
+    paths: ['rust/**', '.github/workflows/rust.yml']
+  pull_request:
+    paths: ['rust/**', '.github/workflows/rust.yml']
+
+jobs:
+  x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchains
+        run: rustup toolchain install stable nightly --profile minimal -c clippy,rustfmt,miri,rust-src
+      - name: Format, clippy, gate, tests
+        run: make -C rust fmt-check dev
+      - name: Miri (queue and double-push guard)
+        run: make -C rust miri
+
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal -c clippy,rustfmt
+      - name: Clippy, gate, tests (the context switch runs on real arm here)
+        run: make -C rust dev
