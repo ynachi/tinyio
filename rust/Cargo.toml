@@ -32,6 +32,10 @@ harness = false
 name = "sync"
 harness = false
 
+[[bench]]
+name = "post"
+harness = false
+
 [profile.release]
 debug = 1
 lto = "thin"

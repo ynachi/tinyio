@@ -391,4 +391,59 @@ mod tests {
             &["before its completion arrived"],
         );
     }
+
+    // Prediction: with the producer posting one task and waiting for it to be
+    // consumed before the next, every post lands as the owner is about to sleep,
+    // and none is ever left unseen: the owner follows the sleep protocol (pop;
+    // announce; re-check; block in poll on the real eventfd). A lost wakeup
+    // would leave the owner polling while the producer waits for it, and show up
+    // as a 5 s timeout. (Continuous posting would hide it: the next post rescues.)
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn no_post_is_lost_between_the_check_and_the_sleep() {
+        use crate::remote::Shared;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const N: usize = 100_000;
+        let s = Arc::new(Shared::new(new_eventfd().unwrap(), 4));
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let producer = {
+            let (s, consumed) = (s.clone(), consumed.clone());
+            std::thread::spawn(move || {
+                for i in 0..N {
+                    s.post(Box::new(|_| {})).unwrap();
+                    while consumed.load(Ordering::Acquire) <= i {
+                        std::hint::spin_loop();
+                    }
+                }
+            })
+        };
+        let mut got = 0;
+        while got < N {
+            if s.pop().is_some() {
+                got += 1;
+                consumed.store(got, Ordering::Release);
+                continue;
+            }
+            if !s.announce_sleep() {
+                let mut fds = libc::pollfd {
+                    fd: s.eventfd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd that outlives the call.
+                let ready = unsafe { libc::poll(&raw mut fds, 1, 5000) };
+                assert!(
+                    ready > 0,
+                    "lost wakeup: slept 5 s with work queued ({got}/{N})"
+                );
+                let mut counter = [0u8; 8];
+                // SAFETY: the buffer is 8 bytes, as an eventfd read requires.
+                unsafe { libc::read(s.eventfd(), counter.as_mut_ptr().cast(), 8) };
+            }
+            s.clear_sleep();
+        }
+        producer.join().unwrap();
+    }
 }

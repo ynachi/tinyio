@@ -559,10 +559,18 @@ impl Sched {
             self.reap();
         };
         if runnable {
+            return self.ring.submit(true, reap);
+        }
+        // Posts only write the eventfd while this flag is up, so announce the
+        // sleep and re-check before blocking (see `Shared::announce_sleep`).
+        let shared = self.shared();
+        let result = if shared.announce_sleep() {
             self.ring.submit(true, reap)
         } else {
             self.ring.wait(None, reap)
-        }
+        };
+        shared.clear_sleep();
+        result
     }
 
     /// Cancel everything in flight with ONE SQE and submit it now (invariant

@@ -26,7 +26,7 @@ unsafe budget (section 5) and the build stages (section 9). The C++ runtime in
 make dev        # clippy + gate + tests: what a stage must pass before review
 make miri       # nightly: queue / double-push tests under Miri
 make bench      # context-switch bench (release)
-scripts/ab.sh pingpong   # paired A/B against the C++ build (also: context_switch, sync); see the script header
+scripts/ab.sh pingpong   # paired A/B against the C++ build (also: context_switch, sync, post); see the script header
 make docker-test
 ```
 

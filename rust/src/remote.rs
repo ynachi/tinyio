@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -48,6 +48,10 @@ pub(crate) struct Shared {
     /// lost the race to a full queue subtracts its own +1 later.
     post_state: AtomicU64,
     stop: AtomicBool,
+    /// The owner is about to block (or is blocked) in the kernel, so a post
+    /// must write the eventfd. Not set while the loop is running: then the
+    /// next tick finds the post without a syscall.
+    sleeping: AtomicBool,
     wake: File,
     /// Where the kernel writes the eventfd counter (Rule 12: it must not move,
     /// so it lives here and not in `Io`).
@@ -60,6 +64,7 @@ impl Shared {
             queue: ArrayQueue::new(capacity),
             post_state: AtomicU64::new(0),
             stop: AtomicBool::new(false),
+            sleeping: AtomicBool::new(false),
             wake: File::from(eventfd),
             wake_slot: AtomicU64::new(0),
         }
@@ -85,8 +90,26 @@ impl Shared {
             self.post_state.fetch_sub(1, Ordering::AcqRel);
             return Err(PostError::Full);
         }
-        self.wake();
+        // Pairs with the fence in `announce_sleep`: either this sees the flag
+        // and wakes the owner, or the owner's re-check sees our count.
+        fence(Ordering::SeqCst);
+        if self.sleeping.load(Ordering::Relaxed) {
+            self.wake();
+        }
         Ok(())
+    }
+
+    /// Owner side, just before blocking: publish the sleep, then re-check.
+    /// `true` means do not block: a post or a stop is already visible. Either
+    /// way call `clear_sleep` afterwards.
+    pub(crate) fn announce_sleep(&self) -> bool {
+        self.sleeping.store(true, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        self.pending() > 0 || self.stop_requested()
+    }
+
+    pub(crate) fn clear_sleep(&self) {
+        self.sleeping.store(false, Ordering::Relaxed);
     }
 
     /// Owner side. A producer between its count and its push shows as

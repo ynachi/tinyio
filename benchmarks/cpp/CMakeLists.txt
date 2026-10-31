@@ -19,6 +19,9 @@ target_link_libraries(context_switch_bench PRIVATE tinyio::tinyio)
 add_executable(pingpong_bench pingpong_bench.cpp)
 target_link_libraries(pingpong_bench PRIVATE tinyio::tinyio)
 
+add_executable(post_bench post_bench.cpp)
+target_link_libraries(post_bench PRIVATE tinyio::tinyio)
+
 add_executable(sync_bench sync_bench.cpp)
 target_link_libraries(sync_bench PRIVATE tinyio::tinyio)
 

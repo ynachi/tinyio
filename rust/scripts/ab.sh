@@ -6,6 +6,7 @@
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh context_switch
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh pingpong
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh sync
+#   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 scripts/ab.sh post   # multi-threaded: do not pin
 #
 # CPP_DIR is where the C++ release preset put its benchmark binaries
 # (context_switch_bench, pingpong_bench). ITERS scales the Rust arm only; the
@@ -15,13 +16,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BENCH=${1:?usage: ab.sh context_switch|pingpong|sync}
+BENCH=${1:?usage: ab.sh context_switch|pingpong|sync|post}
 CPP_DIR=${CPP_DIR:?set CPP_DIR to the C++ release benchmark directory}
 ROUNDS=${ROUNDS:-15}
 case "$BENCH" in
   context_switch) ITERS=${ITERS:-10000000}; CPP_ARGS=() ;;
   pingpong)       ITERS=${ITERS:-200000};   CPP_ARGS=("$ITERS") ;;
-  sync)           ITERS=1;                  CPP_ARGS=() ;;
+  sync|post)      ITERS=1;                  CPP_ARGS=() ;;
   *) echo "unknown bench: $BENCH" >&2; exit 2 ;;
 esac
 PIN=()
@@ -34,13 +35,13 @@ RUST_BENCH=$(ls -t target/release/deps/"$BENCH"-* | grep -v '\.d$' | head -1)
 labels() { sed -nE 's/^(.*): ([0-9.e+-]+) ns\/op$/\1\t\2/p'; }
 cpp_once() {
   case "$BENCH" in
-    sync) "${PIN[@]}" "$CPP_DIR/sync_bench" 2>/dev/null | labels ;;
+    sync|post) "${PIN[@]}" "$CPP_DIR/${BENCH}_bench" 2>/dev/null | labels ;;
     *)    "${PIN[@]}" "$CPP_DIR/${BENCH}_bench" "${CPP_ARGS[@]}" 2>/dev/null | awk '/^ns\// {print "ns/op\t"$2}' ;;
   esac
 }
 rust_once() {
   case "$BENCH" in
-    sync) "${PIN[@]}" "$RUST_BENCH" | labels ;;
+    sync|post) "${PIN[@]}" "$RUST_BENCH" | labels ;;
     *)    "${PIN[@]}" "$RUST_BENCH" --iters "$ITERS" --rounds 1 | awk -F= '/ns_per_op/ {print "ns/op\t"$2}' ;;
   esac
 }

@@ -86,6 +86,10 @@ strict mode rejects by definition.
 
 **20. Dispatch (open decision 4), measured with throwaway code outside the repo:** post to run, medians of 7 interleaved runs: 1 producer 797 ns vs C++ 762; 4 producers 531 ns vs C++ 3061; a zero-capture closure (no `Box` allocation) costs 765 ns, so the allocation is about 30 ns per post and small-buffer storage is not worth adding yet.
 
+**21. `post` writes the eventfd only while the owner is asleep.** The owner raises a `sleeping` flag, fences, and re-checks for pending posts and stop before it blocks; a producer fences after its push and writes only if the flag is up (`stop` always writes). One-producer cost per post fell from 843 to 464 ns (C++ 701, paired ratio 0.70, faster in 14/15 rounds), and the blocking-tick fence made no detectable difference to ping-pong (stage 4 build vs now, 62 rounds: +4.3% and -2.5%).
+
+**22. The producer-side fence cannot be exercised on x86**, because the locked compare-exchange and queue push before it already order the accesses; only the arm64 CI job covers it. The lock-step test in `ring.rs` fails on all three owner-side mutations I tried (no flag, no fence/re-check, re-check ignoring posts); the end-to-end race test in `tests/remote.rs` catches only a flag that is never raised.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

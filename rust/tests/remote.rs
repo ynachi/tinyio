@@ -410,3 +410,26 @@ fn scope_parent_wakes_after_cancelled_children() {
     assert_eq!(log.len(), 3, "{log:?}");
     assert_eq!(log[2], "parent");
 }
+
+// Prediction: end to end, a post that races the owner's descent into the kernel
+// is never lost: across 400 runs with the producer delayed by 0..2000 spins,
+// `run` always returns (a lost wakeup would hang and the watchdog would abort).
+// This catches a flag that is never raised; the fine-grained ordering of the
+// sleep protocol is tested in `ring.rs::no_post_is_lost_between_the_check_and_the_sleep`.
+#[test]
+fn post_racing_the_owner_going_to_sleep_never_hangs() {
+    for i in 0..400 {
+        let mut io = io();
+        let remote = io.remote();
+        let spins = (i % 40) * 50;
+        let t = thread::spawn(move || {
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+            let stopper = remote.clone();
+            remote.post(move |_| stopper.stop()).unwrap();
+        });
+        io.run();
+        t.join().unwrap();
+    }
+}
