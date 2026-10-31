@@ -66,18 +66,26 @@ The kernel floor is set by the io_uring features the runtime actually uses, not 
 #include "tinyio/tinyio.hpp"
 using namespace tinyio;
 
+static Result<void> hello_fiber(IO& fio) noexcept {
+    TRY_LOG_ERR(fd, fio.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644),
+                "open failed");
+
+    const std::string_view msg = "hello from a fiber\n";
+    const std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
+    TRY_LOG_ERR_VOID(fio.Write(fd, buf), "write failed");
+
+    TRY_VOID(fio.Close(std::move(fd)));
+    return {};
+}
+
 int main() {
     IO io(0, IoOptions{});
 
     (void)io.Spawn([](IO& fio) noexcept {
-        TRY_LOG_ERR(fd, fio.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644),
-                    "open failed");
-
-        const std::string_view msg = "hello from a fiber\n";
-        const std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        TRY_LOG_ERR_VOID(fio.Write(fd, buf), "write failed");
-
-        TRY_VOID(fio.Close(std::move(fd)));
+        if (auto res = hello_fiber(fio); !res) {
+            ELOGFMT(ERROR, "hello failed: [{}] {}", res.error().Context(),
+                    res.error().Message());
+        }
     });
 
     io.RunUntilDone();
@@ -284,8 +292,9 @@ if (!res) {
 }
 
 // Rust ?-style propagation: bind the value, propagate the error on failure.
-TRY(n, io.Read(fd, buf));           // n is the unwrapped value; returns the error on failure
-TRY_VOID(io.Fsync(fd));           // Result<void>: just propagate
+TRY(n, io.Read(fd, buf));  // n is the unwrapped value; the error returns to the caller
+ELOGFMT(INFO, "read {} bytes", n);
+TRY_VOID(io.Fsync(fd));    // Result<void>: just propagate
 ```
 
 ### Fixed buffer pools
@@ -304,8 +313,8 @@ IO io(0, opts);
 
 // Inside a fiber
 TRY(buf, io.TakeFixedBuffer(4096));        // non-blocking; EAGAIN when that class is empty
-TRY(waited, io.AcquireFixedBuffer(4096));  // parks the fiber instead
-TRY(n, io.ReadFixed(fd, buf, buf.Size()));
+TRY_VOID(io.AcquireFixedBuffer(4096));     // parks the fiber instead
+TRY_VOID(io.ReadFixed(fd, buf, buf.Size()));  // count discarded here
 // buf returns to its pool automatically on destruction
 ```
 
@@ -321,14 +330,14 @@ destructor asserts that no tasks are still active, so children cannot outlive th
 ```cpp
 // 1. Fire-and-forget (TaskGroup<void> deduced)
 tinyio::TaskGroup group(io);
-(void)group.Spawn([](IO& io) noexcept { /* Task 1 */ });
-(void)group.Spawn([](IO& io) noexcept { /* Task 2 */ });
+(void)group.Spawn([](IO& fio) noexcept { (void)fio; /* Task 1 */ });
+(void)group.Spawn([](IO& fio) noexcept { (void)fio; /* Task 2 */ });
 TRY_VOID(group.Wait());   // suspends until all tasks finish
 
 // 2. Collecting results — capacity is fixed at construction
 tinyio::TaskGroup<int> results(io, 2);
-(void)results.Spawn([](IO& io) noexcept -> Result<int> { return 42; });
-(void)results.Spawn([](IO& io) noexcept -> Result<int> { return 100; });
+(void)results.Spawn([](IO& fio) noexcept -> Result<int> { (void)fio; return 42; });
+(void)results.Spawn([](IO& fio) noexcept -> Result<int> { (void)fio; return 100; });
 TRY_VOID(results.Wait());
 // results.Results() -> std::vector<std::optional<Result<int>>>
 //   nullopt = slot never spawned
@@ -342,8 +351,8 @@ TRY_VOID(results.Wait());
 // From any thread — enqueues a task into a lock-free MPMC queue (the moodycamel
 // ConcurrentQueue YLT ships, wrapped in src/tinyio/detail/mpsc_queue.hpp)
 // and wakes the owner thread via eventfd.
-bool ok = io.Post([](IO& io) noexcept {
-    (void)io.Spawn(some_task);
+bool ok = io.Post([&](IO& fio) noexcept {
+    (void)fio.Spawn(some_task);
 });
 // ok == false if the queue is full
 ```
