@@ -69,15 +69,15 @@ using namespace tinyio;
 int main() {
     IO io(0, IoOptions{});
 
-    (void)io.Spawn([](IO& io) noexcept {
-        auto fd = TRY(io.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644));
+    (void)io.Spawn([](IO& fio) noexcept {
+        TRY_LOG_ERR(fd, fio.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644),
+                    "open failed");
 
-        std::string_view msg = "hello from a fiber\n";
-        std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        auto n = TRY(io.Write(fd, buf));   // n = bytes written
-        (void)n;
+        const std::string_view msg = "hello from a fiber\n";
+        const std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
+        TRY_LOG_ERR_VOID(fio.Write(fd, buf), "write failed");
 
-        TRY_VOID(io.Close(std::move(fd)));
+        TRY_VOID(fio.Close(std::move(fd)));
     });
 
     io.RunUntilDone();
@@ -92,48 +92,87 @@ Each thread owns one `IO` instance. All threads bind to the same port via `SO_RE
 #include "tinyio/tinyio.hpp"
 using namespace tinyio;
 
-static Result<void> handle_client(IO& io, UniqueFd client) noexcept {
-    std::byte buf[4096];
-    while (true) {
-        auto n = TRY(io.Read(client, std::span{buf}));
-        if (n == 0) break;
-        // write response ...
-        auto w = TRY(io.Write(client, response));
-        (void)w;
+// A static, valid HTTP/1.1 response with keep-alive
+constexpr std::string_view kResponse =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 16\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"
+    "Hello, io_uring!";
+
+static Result<void> write_all(IO& fio, const UniqueFd& fd, std::span<const std::byte> data) {
+    while (!data.empty()) {
+        TRY(written, fio.Write(fd, data));
+        if (written == 0) {
+            return Error::FailErrno(EIO, "write");
+        }
+        data = data.subspan(written);
     }
     return {};
 }
 
-static Result<void> accept_loop(IO& io, uint16_t port, std::stop_token st) noexcept {
-    auto server = TRY(TcpListener::Bind(port, "0.0.0.0"));
+// Handle a single client connection
+static Result<void> handle_client(IO& fio, UniqueFd client_fd) noexcept {
+    std::byte buf[1024];
 
-    while (!st.stop_requested()) {
-        auto client = TRY(io.Accept(server));
-        (void)io.Spawn([c = std::move(client)](IO& io) mutable noexcept {
-            (void)handle_client(io, std::move(c));
-        });
+    while (true) {
+        TRY(r_n, fio.Read(client_fd, std::span{buf}));
+        if (r_n == 0) {
+            break;  // peer closed
+        }
+
+        const std::span response(reinterpret_cast<const std::byte*>(kResponse.data()),
+                                 kResponse.size());
+        if (auto res = write_all(fio, client_fd, response); !res) {
+            return res;
+        }
     }
     return {};
+}
+
+// Accept until the runtime stops (Accept then fails with ECANCELED); each
+// client gets its own fiber.
+static Result<void> accept_loop(IO& fio, uint16_t port) {
+    TRY(server_fd, TcpListener::Bind(port, "0.0.0.0"));
+
+    while (true) {
+        auto client_res = fio.Accept(server_fd);
+        if (!client_res) {
+            if (fio.Stopping()) {
+                return {};
+            }
+            return std::unexpected(client_res.error());
+        }
+
+        (void)fio.Spawn([client_fd = std::move(*client_res)](IO& cfio) mutable noexcept {
+            if (auto res = handle_client(cfio, std::move(client_fd)); !res) {
+                ELOGFMT(ERROR, "client handler failed: [{}] {}", res.error().Context(),
+                        res.error().Message());
+            }
+        });
+    }
 }
 
 int main() {
-    const size_t n_threads = 4;
+    constexpr size_t num_threads = 4;
     std::vector<std::jthread> threads;
-    std::vector<std::stop_source> stops;
+    std::vector<std::stop_source> stop_sources;
 
-    for (size_t i = 0; i < n_threads; ++i) {
-        stops.emplace_back();
-        auto st = stops.back().get_token();
+    // Parallel accept on all workers (SO_REUSEPORT lets every thread bind the
+    // same port).
+    for (std::uint32_t i = 0; i < num_threads; ++i) {
+        stop_sources.emplace_back();
+        auto st = stop_sources.back().get_token();
+
         threads.emplace_back([i, st] {
-            IO io(i, IoOptions{});
-            (void)io.Spawn([st](IO& io) noexcept {
-                (void)accept_loop(io, 8080, st);
-            });
-            io.Run(st);
+            IO worker(i, IoOptions{});
+            (void)worker.Spawn([st](IO& fio) noexcept { (void)accept_loop(fio, 8080); });
+            worker.Run(st);
         });
     }
 
-    // ... wait for signal, then call stops[i].request_stop() for each
+    // ... wait for SIGINT, then stop_sources[i].request_stop() for each
 }
 ```
 
@@ -245,7 +284,7 @@ if (!res) {
 }
 
 // Rust ?-style propagation: bind the value, propagate the error on failure.
-auto n = TRY(io.Read(fd, buf));   // returns the error to the caller on failure
+TRY(n, io.Read(fd, buf));           // n is the unwrapped value; returns the error on failure
 TRY_VOID(io.Fsync(fd));           // Result<void>: just propagate
 ```
 
@@ -264,9 +303,9 @@ opts.buffer_pools = {
 IO io(0, opts);
 
 // Inside a fiber
-auto buf = TRY(io.TakeFixedBuffer(4096));   // non-blocking; EAGAIN when that class is empty
-auto wait = io.AcquireFixedBuffer(4096);    // parks the fiber instead
-auto n    = TRY(io.ReadFixed(fd, buf, buf.Size()));
+TRY(buf, io.TakeFixedBuffer(4096));        // non-blocking; EAGAIN when that class is empty
+TRY(waited, io.AcquireFixedBuffer(4096));  // parks the fiber instead
+TRY(n, io.ReadFixed(fd, buf, buf.Size()));
 // buf returns to its pool automatically on destruction
 ```
 

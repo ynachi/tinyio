@@ -300,9 +300,9 @@ public:
     /// @return Number of bytes written, or an error code.
     ///
     /// @code
-    /// auto buf = TRY(fio.TakeFixedBuffer(4096));
+    /// TRY(buf, fio.TakeFixedBuffer(4096));
     /// std::memcpy(buf.Ptr(), data.data(), data.size());
-    /// auto n = TRY(fio.WriteFixed(fd, buf, data.size(), file_offset));
+    /// TRY(n, fio.WriteFixed(fd, buf, data.size(), file_offset));
     /// @endcode
     ///
     /// @p rw_flags are the pwritev2 flags (RWF_DSYNC and friends); they ride
@@ -319,8 +319,8 @@ public:
     /// there is no offset/length pair to mix up.
     ///
     /// @code
-    /// auto buf = TRY(fio.TakeFixedBuffer(65536));
-    /// auto n = TRY(fio.WriteFixed(fd, buf.Slice(4096, 8192), file_offset, RWF_DSYNC));
+    /// TRY(buf, fio.TakeFixedBuffer(65536));
+    /// TRY(n, fio.WriteFixed(fd, buf.Slice(4096, 8192), file_offset, RWF_DSYNC));
     /// @endcode
     [[nodiscard]] Result<uint32_t> WriteFixed(const UniqueFd& fd, const FixedRegion& region,
                                               off_t file_offset = -1, int rw_flags = 0,
@@ -340,8 +340,8 @@ public:
     /// @return Number of bytes read, or an error code.
     ///
     /// @code
-    /// auto buf = TRY(fio.TakeFixedBuffer(4096));
-    /// auto n = TRY(fio.ReadFixed(fd, buf, buf.Size(), 0));
+    /// TRY(buf, fio.TakeFixedBuffer(4096));
+    /// TRY(n, fio.ReadFixed(fd, buf, buf.Size(), 0));
     /// std::string_view content{reinterpret_cast<const char*>(buf.Ptr()),
     ///                          static_cast<size_t>(n)};
     /// @endcode

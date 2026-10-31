@@ -217,9 +217,9 @@ opts.buffer_pools = {{.slot_size = 4096, .slots = 256}};
 IO io(0, opts);
 
 // Inside a fiber
-auto buf = TRY(io.TakeFixedBuffer(4096));  // non-blocking, EAGAIN when that class is empty
-auto wait = io.AcquireFixedBuffer(4096);   // parks the fiber instead
-auto n    = TRY(io.ReadFixed(fd, buf, buf.Size()));
+TRY(buf, io.TakeFixedBuffer(4096));  // non-blocking, EAGAIN when that class is empty
+TRY(waited, io.AcquireFixedBuffer(4096));   // parks the fiber instead
+TRY(n, io.ReadFixed(fd, buf, buf.Size()));
 // the slot goes back to its pool when the lease is destroyed
 ```
 
