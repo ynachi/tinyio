@@ -76,6 +76,16 @@ strict mode rejects by definition.
 
 **16. Two uncontended operations are slower than C++.** Mutex lock/unlock 0.98 ns vs 0.53 (paired ratio 1.83, 0/11 rounds faster) and latch create + count down 2.86 ns vs 1.09 (ratio 2.62, 0/11); the causes are the cross-`Io` pointer check (Rule 13) and the `Rc<Sched>` increment/decrement (open decision 1), both kept on purpose. The other rows are ahead: semaphore 0.97 vs 2.54 ns, `scope` spawn + join 76.9 vs 100.6 ns (`TaskGroup`), contended mutex 30.9 vs 57.1 ns.
 
+## Stage 4
+
+**17. `Io::drop` cancels the eventfd read and waits for its CQE before closing the ring.** The read target lives in `Arc<Shared>`, and io_uring tears a ring down asynchronously, so the kernel could otherwise write into freed memory; `Ring` tracks the armed wake read (`wake_inflight`) and `close` aborts if it is still armed.
+
+**18. `post_state` is never reset.** The shutdown subtracts exactly what it pops instead of storing `CLOSED`, so a producer that loses the push race and subtracts its own +1 later cannot underflow into the closed bit.
+
+**19. `Options::post_queue_capacity` (default 4096)** mirrors the C++ option; `Remote::post` returns `Full` beyond it. `Io::new` creates the eventfd and `Shared` with the ring.
+
+**20. Dispatch (open decision 4), measured with throwaway code outside the repo:** post to run, medians of 7 interleaved runs: 1 producer 797 ns vs C++ 762; 4 producers 531 ns vs C++ 3061; a zero-capture closure (no `Box` allocation) costs 765 ns, so the allocation is about 30 ns per post and small-buffer storage is not worth adding yet.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

@@ -15,15 +15,16 @@
 //!          +-------------- push_ready (one way in) <---+
 //! ```
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::ffi::c_void;
 use std::io;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use io_uring::opcode;
 use io_uring::squeue::Entry;
-use io_uring::types::CancelBuilder;
+use io_uring::types::{CancelBuilder, Fd};
 
 use crate::check::{check, dcheck, fatal};
 use crate::cx::Cx;
@@ -31,6 +32,7 @@ use crate::detail::context::{self, Context};
 use crate::detail::fiber::{FiberHeader, FiberId, FiberState, TaskOps, WaitKind};
 use crate::detail::stack::Stack;
 use crate::options::Validated;
+use crate::remote::Shared;
 use crate::ring::{Ring, UserData};
 
 /// Closures needing more alignment than the header are refused.
@@ -110,6 +112,11 @@ pub struct Sched {
     /// `ECANCELED` before touching anything, so a drain only ever shrinks
     /// `inflight`. Sticky: a stopped runtime does not restart.
     stopping: Cell<bool>,
+    /// What other threads post into; set when the ring opens.
+    shared: OnceCell<Arc<Shared>>,
+    /// The eventfd read must be (re)queued. While set the loop never blocks:
+    /// sleeping with the read unarmed could miss a wake.
+    rearm_pending: Cell<bool>,
     opts: Validated,
 }
 
@@ -126,13 +133,93 @@ impl Sched {
             next_id: Cell::new(1),
             ring: Ring::closed(),
             stopping: Cell::new(false),
+            shared: OnceCell::new(),
+            rearm_pending: Cell::new(false),
             opts,
         })
     }
 
     /// Create the ring. Called by `Io::new` on the thread that will run the loop.
     pub(crate) fn open_ring(&self) -> io::Result<()> {
-        self.ring.open(self.opts.sq_entries)
+        self.ring.open(self.opts.sq_entries)?;
+        let eventfd = crate::ring::new_eventfd()?;
+        let shared = Arc::new(Shared::new(eventfd, self.opts.post_queue_capacity));
+        check!(self.shared.set(shared).is_ok(), "ring opened twice");
+        self.rearm_pending.set(true);
+        Ok(())
+    }
+
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        match self.shared.get() {
+            Some(s) => s,
+            None => fatal(format_args!("the ring is not open")),
+        }
+    }
+
+    fn posts_pending(&self) -> bool {
+        self.shared.get().is_some_and(|s| s.pending() > 0)
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.shared.get().is_some_and(|s| s.stop_requested())
+    }
+
+    /// Shutdown step 2: after this no `post` succeeds (invariant 13).
+    pub(crate) fn close_posts(&self) {
+        if let Some(s) = self.shared.get() {
+            s.close();
+        }
+    }
+
+    /// Shutdown step 5: drop closures that were posted but never became fibers.
+    pub(crate) fn discard_posts(&self) {
+        if let Some(s) = self.shared.get() {
+            s.discard();
+        }
+    }
+
+    /// Phase 1a of the tick: turn posted closures into fibers, at most
+    /// `batch_max_size` so a flood cannot starve I/O. While stopping, `spawn`
+    /// refuses and the closure is dropped unrun.
+    pub(crate) fn drain_remote(&self) {
+        let Some(shared) = self.shared.get() else {
+            return;
+        };
+        for _ in 0..self.opts.batch_max_size {
+            let Some(task) = shared.pop() else { break };
+            if let Err(e) = self.spawn(move |cx| task(cx))
+                && !self.stopping.get()
+            {
+                crate::check::error(format_args!("posted task not spawned: {e}"));
+            }
+        }
+    }
+
+    /// Arm the eventfd read the first time the loop runs.
+    pub(crate) fn activate(&self) {
+        self.arm_wake();
+    }
+
+    /// Queue the eventfd read if it is owed. It is uncounted (it is always
+    /// armed), and never re-queued once stopping.
+    pub(crate) fn arm_wake(&self) {
+        if !self.rearm_pending.get() {
+            return;
+        }
+        if self.stopping.get() {
+            self.rearm_pending.set(false);
+            return;
+        }
+        let shared = self.shared();
+        let entry =
+            opcode::Read::new(Fd(shared.eventfd()), shared.wake_slot().cast::<u8>(), 8).build();
+        // SAFETY: the target is in the `Arc<Shared>` this scheduler owns, and
+        // `retire_wake` makes the read terminal before the ring closes
+        // (invariant 2); the kernel writes only while the read is armed.
+        match unsafe { self.push_sqe(&entry, UserData::Wake) } {
+            Ok(()) => self.rearm_pending.set(false),
+            Err(e) => crate::check::error(format_args!("eventfd read not queued: {e}")),
+        }
     }
 
     pub(crate) fn opts(&self) -> &Validated {
@@ -144,7 +231,7 @@ impl Sched {
     /// primitive waits for no completion either. The one function the tick and
     /// the drain both use.
     pub(crate) fn quiesced(&self) -> bool {
-        self.ready.is_empty() && self.ring.inflight() == 0
+        self.ready.is_empty() && self.ring.inflight() == 0 && !self.posts_pending()
     }
 
     pub(crate) fn inflight(&self) -> usize {
@@ -156,7 +243,6 @@ impl Sched {
     }
 
     /// Start shutting down (invariant 11). Never undone.
-    #[cfg_attr(not(test), allow(dead_code))] // `Io::run` calls it from stage 4
     pub(crate) fn begin_stop(&self) {
         self.stopping.set(true);
     }
@@ -428,8 +514,11 @@ impl Sched {
 
     /// Reap completions: each one wakes the fiber that owns it. Reaping only
     /// marks fibers ready, so it is safe from inside a fiber too.
-    pub(crate) fn reap(&self) -> usize {
-        self.ring.reap(|hdr| self.wake_io(hdr))
+    pub(crate) fn reap(&self) {
+        if self.ring.reap(|hdr| self.wake_io(hdr)) {
+            // Re-queued by `arm_wake` after the reap, never while iterating.
+            self.rearm_pending.set(true);
+        }
     }
 
     /// A CQE ends an I/O wait, and only a CQE does (Rule 3). The fiber must be
@@ -462,7 +551,10 @@ impl Sched {
     /// is runnable (invariant 8). A runnable tick still enters the kernel with
     /// `GETEVENTS` so deferred completion work runs (see `Ring::submit`).
     pub(crate) fn submit_or_wait(&self) -> io::Result<()> {
-        let runnable = self.ring.cq_ready() || !self.ready.is_empty();
+        let runnable = self.ring.cq_ready()
+            || !self.ready.is_empty()
+            || self.posts_pending()
+            || self.rearm_pending.get();
         let reap = || {
             self.reap();
         };
@@ -479,7 +571,6 @@ impl Sched {
     /// already cancels every match, which the plan relies on; ALL is kept so the
     /// intent does not depend on that.) `false` if the SQE could not be queued;
     /// the caller retries.
-    #[cfg_attr(not(test), allow(dead_code))] // `Io::run` calls it from stage 4
     pub(crate) fn try_cancel_all(&self) -> bool {
         let entry = opcode::AsyncCancel2::new(CancelBuilder::any().all()).build();
         // SAFETY: the cancel entry carries no pointers.
@@ -596,6 +687,35 @@ impl Sched {
         ));
     }
 
+    /// Make the eventfd read terminal before the ring closes: the kernel could
+    /// otherwise still write into `Shared` after it is freed. Cancels it and
+    /// waits for its CQE.
+    fn retire_wake(&self) {
+        if !self.ring.wake_inflight() {
+            return;
+        }
+        self.begin_stop();
+        let mut errors = 0;
+        while !self.try_cancel_all() {
+            errors += 1;
+            check!(
+                errors < 3,
+                "cannot queue the cancel that retires the eventfd read"
+            );
+        }
+        errors = 0;
+        while self.ring.wake_inflight() || self.ring.inflight() > 0 {
+            if let Err(e) = self.ring.wait(None, || self.reap()) {
+                errors += 1;
+                check!(
+                    errors < 3,
+                    "waiting for the eventfd read to retire failed: {e}"
+                );
+            }
+            self.reap();
+        }
+    }
+
     /// `Io::drop`: free everything. Never runs fibers; aborts if a started
     /// one is unfinished (the seatbelt, section 6 "Shutdown"). Closures of
     /// never-started fibers are dropped without running.
@@ -607,6 +727,9 @@ impl Sched {
             self.ring.inflight()
         );
         self.abort_if_started_live("Io dropped");
+        self.close_posts();
+        self.discard_posts();
+        self.retire_wake();
         // Ring first: after this the kernel holds nothing of ours.
         self.ring.close();
         self.ready.forget_all();

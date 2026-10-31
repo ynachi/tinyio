@@ -22,6 +22,8 @@ pub struct Options {
     /// io_uring submission queue entries (the kernel rounds up to a power of
     /// two). The completion queue is twice this.
     pub sq_entries: u32,
+    /// Capacity of the queue `Remote::post` feeds; `post` returns `Full` beyond it.
+    pub post_queue_capacity: usize,
 }
 
 impl Default for Options {
@@ -32,6 +34,7 @@ impl Default for Options {
             max_idle_fibers: 1024,
             batch_max_size: 128,
             sq_entries: 4096,
+            post_queue_capacity: 4096,
         }
     }
 }
@@ -44,6 +47,7 @@ pub(crate) struct Validated {
     pub max_idle_fibers: usize,
     pub batch_max_size: usize,
     pub sq_entries: u32,
+    pub post_queue_capacity: usize,
 }
 
 use crate::detail::stack::page_size;
@@ -56,6 +60,9 @@ impl Options {
         }
         if self.batch_max_size == 0 {
             return Err(invalid("batch_max_size must be at least 1"));
+        }
+        if self.post_queue_capacity == 0 {
+            return Err(invalid("post_queue_capacity must be at least 1"));
         }
         if self.sq_entries < 2 {
             return Err(invalid("sq_entries must be at least 2"));
@@ -76,6 +83,7 @@ impl Options {
             max_idle_fibers: self.max_idle_fibers,
             batch_max_size: self.batch_max_size,
             sq_entries: self.sq_entries,
+            post_queue_capacity: self.post_queue_capacity,
         })
     }
 }

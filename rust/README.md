@@ -16,8 +16,9 @@ unsafe budget (section 5) and the build stages (section 9). The C++ runtime in
 | 1. Fibers (context switch, stacks, scheduler, ring-less `Io`) | done |
 | 2. I/O core (ring, `syscall`, tick, drain, sleep) | done |
 | 3. Sync primitives (`Mutex<T>`, `Semaphore`, `Latch`, `Baton`), `scope` | done |
-| 4. `Remote`, `post`, `stop`, `run`, full shutdown | next |
-| 5-8 | see the plan |
+| 4. `Remote`, `post`, `stop`, `run`, full shutdown | done |
+| 5. Timeouts (`Cx::timeout`, timer wheel) | next |
+| 6-8 | see the plan |
 
 ## Commands
 

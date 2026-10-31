@@ -10,6 +10,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::ptr::{self, NonNull};
 use std::time::Duration;
 
@@ -101,6 +102,20 @@ pub(crate) struct Ring {
     /// Invariant 3: submissions that still owe a terminal CQE. +1 in `push`
     /// (the one place), -1 in `reap`. The wake read is never counted.
     inflight: Cell<usize>,
+    /// The wake read is armed in the kernel (queued, or submitted and not yet
+    /// completed). It owes a CQE but is not in `inflight`.
+    wake_inflight: Cell<bool>,
+}
+
+/// A non-blocking, close-on-exec eventfd for `Remote` to wake the loop with.
+pub(crate) fn new_eventfd() -> io::Result<OwnedFd> {
+    // SAFETY: eventfd takes no pointers; the result is checked.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: eventfd returned a fresh descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 impl Ring {
@@ -108,6 +123,7 @@ impl Ring {
         Ring {
             ring: UnsafeCell::new(None),
             inflight: Cell::new(0),
+            wake_inflight: Cell::new(false),
         }
     }
 
@@ -149,6 +165,10 @@ impl Ring {
         self.inflight.get()
     }
 
+    pub(crate) fn wake_inflight(&self) -> bool {
+        self.wake_inflight.get()
+    }
+
     /// Are completions already in the CQ?
     pub(crate) fn cq_ready(&self) -> bool {
         self.with(|r| !r.completion().is_empty())
@@ -168,7 +188,9 @@ impl Ring {
         entry.set_user_data(ud.encode());
         // SAFETY: forwarded from this fn's contract.
         self.with(|r| unsafe { r.submission().push(&entry) })?;
-        if !matches!(ud, UserData::Wake) {
+        if matches!(ud, UserData::Wake) {
+            self.wake_inflight.set(true);
+        } else {
             self.inflight.set(self.inflight.get() + 1);
         }
         Ok(())
@@ -247,13 +269,13 @@ impl Ring {
     }
 
     /// Drain the CQ. `on_fiber` gets the fiber each op belonged to, after its
-    /// `Completion` has been written. Returns the number of CQEs.
+    /// `Completion` has been written. Returns whether the wake read completed.
     ///
     /// CQEs are copied out in batches and handled after the `&mut IoUring`
     /// borrow has ended, so `on_fiber` may do anything but reap re-entrantly.
-    pub(crate) fn reap(&self, mut on_fiber: impl FnMut(NonNull<FiberHeader>)) -> usize {
+    pub(crate) fn reap(&self, mut on_fiber: impl FnMut(NonNull<FiberHeader>)) -> bool {
         const BATCH: usize = 64;
-        let mut total = 0;
+        let mut woke = false;
         loop {
             let mut batch = [(0u64, 0i32); BATCH];
             let n = self.with(|ring| {
@@ -268,7 +290,10 @@ impl Ring {
             });
             for &(raw, res) in &batch[..n] {
                 match UserData::decode(raw) {
-                    UserData::Wake => {} // stage 4: re-arm the eventfd read
+                    UserData::Wake => {
+                        self.wake_inflight.set(false);
+                        woke = true;
+                    }
                     UserData::Cancel => self.dec_inflight(),
                     UserData::Fiber(completion) => {
                         self.dec_inflight();
@@ -281,9 +306,8 @@ impl Ring {
                     }
                 }
             }
-            total += n;
             if n < BATCH {
-                return total;
+                return woke;
             }
         }
     }
@@ -298,9 +322,10 @@ impl Ring {
     /// be left holding pointers into memory that is about to be freed.
     pub(crate) fn close(&self) {
         check!(
-            self.inflight.get() == 0,
-            "{} operation(s) still in flight at ring teardown (invariant 2)",
-            self.inflight.get()
+            self.inflight.get() == 0 && !self.wake_inflight.get(),
+            "{} operation(s) (wake read armed: {}) still in flight at ring teardown (invariant 2)",
+            self.inflight.get(),
+            self.wake_inflight.get()
         );
         // SAFETY: single thread, and no `with` borrow is active.
         let slot = unsafe { &mut *self.ring.get() };

@@ -10,11 +10,13 @@
 use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::check::{error, fatal};
 use crate::cx::{Cx, NotSend};
 use crate::detail::fiber::FiberId;
 use crate::options::Options;
+use crate::remote::Remote;
 use crate::sched::Sched;
 
 /// A drain gives up (by aborting) after this many consecutive failed ticks.
@@ -52,12 +54,19 @@ impl Io {
         self.sched.spawn(f)
     }
 
+    /// A `Send` handle other threads use to post work and stop the loop.
+    pub fn remote(&self) -> Remote {
+        Remote::new(Arc::clone(self.sched.shared()))
+    }
+
     /// One turn of the loop. `draining` makes it return instead of sleeping
     /// once quiesced (invariant 8): a drain decides when to stop, so a tick
     /// must not wait for a completion that can never arrive.
     fn tick(&self, draining: bool) -> io::Result<()> {
-        // Phase 1: resume. Resuming is what queues SQEs, so doing it first
-        // means the submit below carries them into the kernel this tick.
+        // Phase 1: posted closures become fibers, then resume. Resuming is
+        // what queues SQEs, so doing it first means the submit below carries
+        // them into the kernel this tick.
+        self.sched.drain_remote();
         self.sched.resume_ready(self.sched.opts().batch_max_size);
 
         // Quiesce check, BEFORE the blocking wait: phase 1 may just have
@@ -72,49 +81,91 @@ impl Io {
 
         // Phase 3: reap, even if the submit failed: completions already in the
         // CQ still have to wake their fibers. They only mark fibers ready; the
-        // next tick's phase 1 resumes them.
+        // next tick's phase 1 resumes them. Then re-queue the eventfd read.
         self.sched.reap();
+        self.sched.arm_wake();
         submitted
     }
 
-    /// Tick until quiesced (nothing ready, nothing in flight). Never gives up
-    /// on a tick error: it retries, and aborts only after `MAX_TICK_ERRORS`
-    /// consecutive failures.
-    fn drive_to_quiescence(&self, who: &str) {
-        let mut errors = 0;
-        while !self.sched.quiesced() {
-            match self.tick(true) {
-                Ok(()) => errors = 0,
-                Err(e) => {
-                    error(format_args!("{who}: tick failed: {e}"));
-                    errors += 1;
-                    if errors >= MAX_TICK_ERRORS {
-                        fatal(format_args!(
-                            "{who}: {} operation(s) still in flight after {errors} failed ticks; \
-                             tearing the ring down now would be a kernel use-after-free",
-                            self.sched.inflight()
-                        ));
-                    }
+    /// Tick during a drain. A drain never gives up on a tick error: returning
+    /// would leave operations in flight and the ring teardown would free memory
+    /// the kernel still points at, so it retries and aborts only after
+    /// `MAX_TICK_ERRORS` consecutive failures.
+    fn drain_tick(&self, who: &str, errors: &mut u32) {
+        match self.tick(true) {
+            Ok(()) => *errors = 0,
+            Err(e) => {
+                error(format_args!("{who}: tick failed: {e}"));
+                *errors += 1;
+                if *errors >= MAX_TICK_ERRORS {
+                    fatal(format_args!(
+                        "{who}: {} operation(s) still in flight after {errors} failed ticks; \
+                         tearing the ring down now would be a kernel use-after-free",
+                        self.sched.inflight()
+                    ));
                 }
             }
         }
     }
 
-    /// Run fibers until nothing is ready and nothing is in flight (invariant
-    /// 9). A fiber still live then can never be woken, which is a bug: it
-    /// aborts, naming the primitive (invariant 10).
+    /// Run fibers until nothing is ready, in flight or posted (invariant 9). A
+    /// fiber still live then can never be woken, which is a bug: it aborts,
+    /// naming the primitive (invariant 10). `Remote::stop` makes it cancel and
+    /// drain instead, then return.
     pub fn run_until_done(&mut self) {
-        self.drive_to_quiescence("run_until_done");
+        self.sched.activate();
+        let mut errors = 0;
+        while !self.sched.quiesced() {
+            if self.sched.stop_requested() {
+                self.cancel_and_drain();
+                return;
+            }
+            self.drain_tick("run_until_done", &mut errors);
+        }
+        if self.sched.stop_requested() {
+            self.cancel_and_drain();
+            return;
+        }
         self.sched.abort_if_started_live("quiesced");
     }
 
-    /// Shut down: stop accepting work, cancel every request in flight, and
-    /// tick until nothing is ready or in flight. Fibers parked in I/O wake with
-    /// `ECANCELED`; fibers parked on a sync primitive are never woken by the
-    /// runtime (invariant 10), so one still live afterwards aborts. `run` calls
-    /// this in stage 4; tests use it as a hook.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn cancel_and_drain(&self) {
+    /// Run until `Remote::stop`, sleeping in the kernel whenever nothing is
+    /// runnable, then cancel what is in flight and drain. A stopped `Io` stays
+    /// stopped: `run` and `run_until_done` return at once and `spawn` fails
+    /// with `ECANCELED`. A loop that keeps failing (three ticks in a row) also
+    /// ends in the drain.
+    pub fn run(&mut self) {
+        if self.sched.stopping() {
+            return;
+        }
+        self.sched.activate();
+        let mut errors = 0;
+        while !self.sched.stop_requested() {
+            match self.tick(false) {
+                Ok(()) => errors = 0,
+                Err(e) => {
+                    error(format_args!("run: tick failed: {e}"));
+                    errors += 1;
+                    if errors >= MAX_TICK_ERRORS {
+                        error(format_args!(
+                            "run: {errors} failed ticks in a row; draining"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        self.cancel_and_drain();
+    }
+
+    /// The shutdown sequence (section 6): close the post queue, stop accepting
+    /// work, cancel every request in flight, and tick until nothing is ready,
+    /// in flight or posted. Fibers parked in I/O wake with `ECANCELED`; fibers
+    /// parked on a sync primitive are never woken by the runtime (invariant
+    /// 10), so one still live afterwards aborts. Finally drop any closure that
+    /// was posted but never became a fiber.
+    fn cancel_and_drain(&self) {
+        self.sched.close_posts();
         self.sched.begin_stop();
         let mut cancel_sent = self.sched.inflight() == 0;
         let mut errors = 0;
@@ -122,24 +173,11 @@ impl Io {
             if !cancel_sent {
                 cancel_sent = self.sched.try_cancel_all();
             }
-            match self.tick(true) {
-                Ok(()) => errors = 0,
-                Err(e) => {
-                    error(format_args!("cancel_and_drain: tick failed: {e}"));
-                    errors += 1;
-                    if errors >= MAX_TICK_ERRORS {
-                        fatal(format_args!(
-                            "cancel_and_drain: {} operation(s) still in flight after {errors} \
-                             failed ticks; tearing the ring down now would be a kernel \
-                             use-after-free",
-                            self.sched.inflight()
-                        ));
-                    }
-                }
-            }
+            self.drain_tick("cancel_and_drain", &mut errors);
         }
         self.sched
             .abort_if_started_live("cancel_and_drain: quiesced");
+        self.sched.discard_posts();
     }
 }
 
