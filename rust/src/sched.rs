@@ -36,33 +36,31 @@ use crate::ring::{Ring, UserData};
 /// Closures needing more alignment than the header are refused.
 const MAX_TASK_ALIGN: usize = 64;
 
-type Hdr = NonNull<FiberHeader>;
+pub(crate) type Hdr = NonNull<FiberHeader>;
 
-/// An intrusive FIFO of fibers through `FiberHeader::next`.
-///
-/// Invariant 5 is what makes one link per header enough: a fiber is in the
-/// queue at most once, and only `Sched` pushes (through `push_ready`, `spawn`
-/// and `yield_current`).
-struct ReadyQueue {
+/// An intrusive FIFO of fibers through `FiberHeader::next`. One link per
+/// header is enough because a fiber is in at most one queue: the ready queue
+/// (state `Ready`) or a wait list (state `Waiting`), never both (invariant 5).
+pub(crate) struct FiberQueue {
     head: Cell<Option<Hdr>>,
     tail: Cell<Option<Hdr>>,
 }
 
-impl ReadyQueue {
-    const fn new() -> ReadyQueue {
-        ReadyQueue {
+impl FiberQueue {
+    pub(crate) const fn new() -> FiberQueue {
+        FiberQueue {
             head: Cell::new(None),
             tail: Cell::new(None),
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.head.get().is_none()
     }
 
     /// # Safety
     /// `h` is a live header that is in no queue.
-    unsafe fn push(&self, h: Hdr) {
+    pub(crate) unsafe fn push(&self, h: Hdr) {
         // SAFETY: fn contract: `h` is live.
         let hr = unsafe { h.as_ref() };
         dcheck!(hr.next.get().is_none(), "fiber pushed while still linked");
@@ -75,7 +73,7 @@ impl ReadyQueue {
         self.tail.set(Some(h));
     }
 
-    fn pop(&self) -> Option<Hdr> {
+    pub(crate) fn pop(&self) -> Option<Hdr> {
         let h = self.head.get()?;
         // SAFETY: queued headers are live (see `push`).
         let next = unsafe { h.as_ref() }.next.take();
@@ -94,11 +92,11 @@ impl ReadyQueue {
     }
 }
 
-pub(crate) struct Sched {
+pub struct Sched {
     /// The scheduler's own context: where every fiber switches back to.
     sched_ctx: Context,
     current: Cell<Option<Hdr>>,
-    ready: ReadyQueue,
+    ready: FiberQueue,
     /// LIFO stack of finished fibers kept for reuse, linked through `next`.
     idle_head: Cell<Option<Hdr>>,
     idle_len: Cell<usize>,
@@ -120,7 +118,7 @@ impl Sched {
         Rc::new(Sched {
             sched_ctx: Context::empty(),
             current: Cell::new(None),
-            ready: ReadyQueue::new(),
+            ready: FiberQueue::new(),
             idle_head: Cell::new(None),
             idle_len: Cell::new(0),
             registry: Cell::new(Vec::new()),
@@ -168,6 +166,20 @@ impl Sched {
     pub(crate) fn spawn<F>(&self, f: F) -> io::Result<FiberId>
     where
         F: FnOnce(&Cx) + 'static,
+    {
+        // SAFETY: a `'static` closure borrows nothing that can die first.
+        unsafe { self.spawn_raw(f) }
+    }
+
+    /// `spawn` without the `'static` bound, for `scope`.
+    ///
+    /// # Safety
+    /// Whatever `f` borrows must outlive the fiber's whole run, and the
+    /// caller must not return from the borrowed frames before the fiber is
+    /// `Done`. `scope` guarantees both by joining every child.
+    pub(crate) unsafe fn spawn_raw<F>(&self, f: F) -> io::Result<FiberId>
+    where
+        F: FnOnce(&Cx),
     {
         if self.stopping.get() {
             return Err(io::Error::from_raw_os_error(libc::ECANCELED));
@@ -386,6 +398,11 @@ impl Sched {
         // fiber gets a fresh frame from `make`.
         unsafe { context::switch(&h.context, &self.sched_ctx) };
         fatal(format_args!("finished fiber {} was resumed", h.id.get()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop_ready_for_test(&self) -> Option<Hdr> {
+        self.ready.pop()
     }
 
     // ------------------------------------------------------------------ I/O

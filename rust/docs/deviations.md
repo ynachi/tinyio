@@ -58,6 +58,20 @@ otherwise the kernel owns the close and the fd is forgotten.
 `expose_provenance` / `with_exposed_provenance` for `user_data`, which Miri's
 strict mode rejects by definition.
 
+## Stage 3
+
+**9. `sync/mutex.rs` joins the unsafe budget.** `MutexGuard`'s `Deref`/`DerefMut` read an `UnsafeCell`, and the plan's table lists only `waiters.rs` and `scope.rs` under `sync/`; the gate script now allows it.
+
+**10. Wait lists link through `FiberHeader::next`, not through nodes on parked stacks.** A `Waiting` fiber is in no other queue, so the link is free; this needs no per-wait node and no allocation. The ready queue and the wait lists share one type, `FiberQueue`.
+
+**11. `Sched` is `pub` inside its private module** so the sealed `Attach` trait can name it without a private-in-public warning; it is not reachable from the crate root.
+
+**12. `Sched::spawn_raw` (unsafe) backs `Scope::spawn`.** It is `spawn` without the `'static` bound, so no lifetime transmute is needed; `scope`'s join and its abort-on-unwind guard are what make it sound.
+
+**13. `Semaphore::acquire`, `Latch::wait`, `Baton::wait` and `Mutex::lock` return `()`/a guard, not a `Result`,** because nothing can cancel a park (Rule 3). `Latch::count_down` past zero and a second concurrent `Baton::wait` abort.
+
+**14. The `compile_fail` doctest for a child borrowing a local fails with E0373, not E0597.** Making `Scope`'s marker types covariant makes that doctest compile, so the invariant markers are what stop it.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

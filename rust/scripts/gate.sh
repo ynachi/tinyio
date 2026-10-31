@@ -14,7 +14,7 @@ fail=0
 report() { echo "gate: $1" >&2; fail=1; }
 
 # The unsafe budget: the only files allowed to contain the word `unsafe` in code.
-allowed='^src/(detail/(context|stack|fiber)|sched|ring|cx|sync/(waiters|scope))\.rs$'
+allowed='^src/(detail/(context|stack|fiber)|sched|ring|cx|sync/(waiters|mutex|scope))\.rs$'
 
 # Strip everything from the first #[cfg(test)] to the end of the file: tests
 # live at the bottom of their module and may use test-only constructs.

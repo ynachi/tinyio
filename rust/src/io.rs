@@ -38,7 +38,6 @@ impl Io {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn sched(&self) -> &Rc<Sched> {
         &self.sched
     }

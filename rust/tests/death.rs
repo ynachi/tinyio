@@ -6,7 +6,7 @@
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
-use tinyio::{Io, Options};
+use tinyio::{Baton, Io, Latch, Mutex, Options};
 
 const SIGABRT: i32 = 6;
 const SIGSEGV: i32 = 11;
@@ -94,5 +94,124 @@ fn fiber_stack_overflow_is_sigsegv() {
         },
         SIGSEGV,
         &[],
+    );
+}
+
+fn run_fibers(setup: impl FnOnce(&Io)) {
+    let mut io = Io::new(Options::default()).unwrap();
+    setup(&io);
+    io.run_until_done();
+}
+
+// Prediction (invariant 10): a fiber parked on a Mutex nobody will release
+// aborts the quiesce, naming Mutex and the fiber (fiber 1 leaks the guard).
+#[test]
+fn quiesce_with_a_fiber_parked_on_a_mutex() {
+    death_test(
+        "quiesce_with_a_fiber_parked_on_a_mutex",
+        || {
+            run_fibers(|io| {
+                let m = std::rc::Rc::new(Mutex::new(io, ()));
+                let m1 = m.clone();
+                io.spawn(move |cx| std::mem::forget(m1.lock(cx))).unwrap();
+                io.spawn(move |cx| drop(m.lock(cx))).unwrap();
+            });
+        },
+        &["1 on Mutex (fiber 2)"],
+    );
+}
+
+// Prediction: two stuck primitives are both named.
+#[test]
+fn quiesce_names_every_stuck_primitive() {
+    death_test(
+        "quiesce_names_every_stuck_primitive",
+        || {
+            run_fibers(|io| {
+                let m = std::rc::Rc::new(Mutex::new(io, ()));
+                let latch = std::rc::Rc::new(Latch::new(io, 1));
+                let m1 = m.clone();
+                io.spawn(move |cx| std::mem::forget(m1.lock(cx))).unwrap();
+                io.spawn(move |cx| drop(m.lock(cx))).unwrap();
+                io.spawn(move |cx| latch.wait(cx)).unwrap();
+            });
+        },
+        &["1 on Mutex (fiber 2)", "1 on Latch (fiber 3)"],
+    );
+}
+
+// Prediction (Rule 13): a primitive made on one Io, used from a fiber of another, aborts.
+#[test]
+fn primitive_used_from_another_io() {
+    death_test(
+        "primitive_used_from_another_io",
+        || {
+            let io1 = Io::new(Options::default()).unwrap();
+            let m = std::rc::Rc::new(Mutex::new(&io1, ()));
+            let mut io2 = Io::new(Options::default()).unwrap();
+            io2.spawn(move |cx| drop(m.lock(cx))).unwrap();
+            io2.run_until_done();
+        },
+        &["Mutex used from a different Io"],
+    );
+}
+
+// Prediction: a second concurrent waiter on a one-shot Baton aborts.
+#[test]
+fn baton_second_waiter() {
+    death_test(
+        "baton_second_waiter",
+        || {
+            run_fibers(|io| {
+                let b = std::rc::Rc::new(Baton::new(io));
+                let b2 = b.clone();
+                io.spawn(move |cx| b.wait(cx)).unwrap();
+                io.spawn(move |cx| b2.wait(cx)).unwrap();
+            });
+        },
+        &["Baton: second concurrent wait"],
+    );
+}
+
+// Prediction: counting a latch below zero aborts.
+#[test]
+fn latch_counted_below_zero() {
+    death_test(
+        "latch_counted_below_zero",
+        || {
+            run_fibers(|io| {
+                let l = Latch::new(io, 1);
+                io.spawn(move |_| {
+                    l.count_down();
+                    l.count_down();
+                })
+                .unwrap();
+            });
+        },
+        &["more times than its count"],
+    );
+}
+
+// Prediction: a panic caught outside `scope` while a child still runs would
+// unwind the frames the child borrows, so it aborts instead.
+#[test]
+fn panic_through_scope_with_a_live_child() {
+    death_test(
+        "panic_through_scope_with_a_live_child",
+        || {
+            run_fibers(|io| {
+                io.spawn(|cx| {
+                    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tinyio::scope(cx, |s| {
+                            s.spawn(|_| {}).unwrap();
+                            std::panic::resume_unwind(Box::new("boom"));
+                        });
+                    }));
+                    drop(caught);
+                })
+                .unwrap();
+            });
+        },
+        &["tinyio::scope left with 1 child fiber(s) still running"],
     );
 }

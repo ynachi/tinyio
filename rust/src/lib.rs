@@ -68,6 +68,7 @@ mod io;
 mod options;
 mod ring;
 mod sched;
+mod sync;
 #[cfg(test)]
 mod testutil;
 
@@ -76,3 +77,4 @@ pub use crate::detail::fiber::FiberId;
 pub use crate::fs::OpenOptions;
 pub use crate::io::Io;
 pub use crate::options::Options;
+pub use crate::sync::{Attach, Baton, Latch, Mutex, MutexGuard, Scope, Semaphore, scope};
