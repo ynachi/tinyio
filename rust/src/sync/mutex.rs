@@ -47,6 +47,7 @@ pub struct Mutex<T> {
 }
 
 impl<T> Mutex<T> {
+    #[inline]
     pub fn new(at: &impl Attach, value: T) -> Mutex<T> {
         Mutex {
             sched: bind(at),
@@ -57,6 +58,7 @@ impl<T> Mutex<T> {
     }
 
     /// Wait for the lock, in FIFO order.
+    #[inline]
     pub fn lock<'a>(&'a self, cx: &Cx) -> MutexGuard<'a, T> {
         check_same(&self.sched, cx, "Mutex");
         if self.held.get() {
@@ -68,6 +70,7 @@ impl<T> Mutex<T> {
         MutexGuard { mutex: self }
     }
 
+    #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         if self.held.replace(true) {
             return None;
@@ -75,6 +78,7 @@ impl<T> Mutex<T> {
         Some(MutexGuard { mutex: self })
     }
 
+    #[inline]
     fn unlock(&self) {
         // With a waiter, `held` stays true: the lock moves straight to it, so a
         // fiber that runs first cannot barge in.
@@ -108,6 +112,7 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 }
 
 impl<T> Drop for MutexGuard<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         self.mutex.unlock();
     }

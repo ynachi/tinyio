@@ -16,6 +16,7 @@ pub struct Semaphore {
 }
 
 impl Semaphore {
+    #[inline]
     pub fn new(at: &impl Attach, permits: usize) -> Semaphore {
         Semaphore {
             sched: bind(at),
@@ -25,6 +26,7 @@ impl Semaphore {
     }
 
     /// Take a permit, waiting in FIFO order if none is free.
+    #[inline]
     pub fn acquire(&self, cx: &Cx) {
         check_same(&self.sched, cx, "Semaphore");
         match self.permits.get() {
@@ -34,6 +36,7 @@ impl Semaphore {
         }
     }
 
+    #[inline]
     pub fn try_acquire(&self) -> bool {
         match self.permits.get() {
             0 => false,
@@ -44,6 +47,7 @@ impl Semaphore {
         }
     }
 
+    #[inline]
     pub fn release(&self) {
         if !self.waiters.wake_one(&self.sched) {
             let n = self.permits.get();

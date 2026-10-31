@@ -30,8 +30,15 @@ impl WaitList {
         sched.park(self.kind);
     }
 
-    /// Wake the oldest waiter. `false` if there is none.
+    /// Wake the oldest waiter. `false` if there is none. The empty check is
+    /// inline so the uncontended path costs no call.
+    #[inline]
     pub(super) fn wake_one(&self, sched: &Sched) -> bool {
+        self.len.get() != 0 && self.wake_front(sched)
+    }
+
+    #[inline(never)]
+    fn wake_front(&self, sched: &Sched) -> bool {
         let Some(fiber) = self.queue.pop() else {
             return false;
         };
@@ -40,6 +47,7 @@ impl WaitList {
         true
     }
 
+    #[inline]
     pub(super) fn wake_all(&self, sched: &Sched) {
         while self.wake_one(sched) {}
     }
@@ -48,6 +56,7 @@ impl WaitList {
 impl Drop for WaitList {
     // Second line of defence: a parked fiber borrows its primitive, so safe
     // code cannot get here.
+    #[inline]
     fn drop(&mut self) {
         check!(
             self.len.get() == 0,

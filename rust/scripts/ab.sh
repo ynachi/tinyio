@@ -5,6 +5,7 @@
 #
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh context_switch
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh pingpong
+#   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh sync
 #
 # CPP_DIR is where the C++ release preset put its benchmark binaries
 # (context_switch_bench, pingpong_bench). ITERS scales the Rust arm only; the
@@ -14,12 +15,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BENCH=${1:?usage: ab.sh context_switch|pingpong}
+BENCH=${1:?usage: ab.sh context_switch|pingpong|sync}
 CPP_DIR=${CPP_DIR:?set CPP_DIR to the C++ release benchmark directory}
 ROUNDS=${ROUNDS:-15}
 case "$BENCH" in
   context_switch) ITERS=${ITERS:-10000000}; CPP_ARGS=() ;;
   pingpong)       ITERS=${ITERS:-200000};   CPP_ARGS=("$ITERS") ;;
+  sync)           ITERS=1;                  CPP_ARGS=() ;;
   *) echo "unknown bench: $BENCH" >&2; exit 2 ;;
 esac
 PIN=()
@@ -28,23 +30,47 @@ if [ -n "${CPU:-}" ] && command -v taskset >/dev/null; then PIN=(taskset -c "$CP
 cargo bench --bench "$BENCH" --no-run 2>/dev/null
 RUST_BENCH=$(ls -t target/release/deps/"$BENCH"-* | grep -v '\.d$' | head -1)
 
-cpp_once()  { "${PIN[@]}" "$CPP_DIR/${BENCH}_bench" "${CPP_ARGS[@]}" | awk '/^ns\// {print $2}'; }
-rust_once() { "${PIN[@]}" "$RUST_BENCH" --iters "$ITERS" --rounds 1 | awk -F= '/ns_per_op/ {print $2}'; }
+# Each arm prints "name<TAB>ns/op" lines; single-metric benches use the name "ns/op".
+labels() { sed -nE 's/^(.*): ([0-9.e+-]+) ns\/op$/\1\t\2/p'; }
+cpp_once() {
+  case "$BENCH" in
+    sync) "${PIN[@]}" "$CPP_DIR/sync_bench" 2>/dev/null | labels ;;
+    *)    "${PIN[@]}" "$CPP_DIR/${BENCH}_bench" "${CPP_ARGS[@]}" 2>/dev/null | awk '/^ns\// {print "ns/op\t"$2}' ;;
+  esac
+}
+rust_once() {
+  case "$BENCH" in
+    sync) "${PIN[@]}" "$RUST_BENCH" | labels ;;
+    *)    "${PIN[@]}" "$RUST_BENCH" --iters "$ITERS" --rounds 1 | awk -F= '/ns_per_op/ {print "ns/op\t"$2}' ;;
+  esac
+}
 
 pairs=$(mktemp)
 for r in $(seq 1 "$ROUNDS"); do
   if (( r % 2 )); then c=$(cpp_once); u=$(rust_once); else u=$(rust_once); c=$(cpp_once); fi
-  echo "$r $c $u" | tee -a "$pairs" >&2
+  { echo "$c" | sed "s/^/$r\tC\t/"; echo "$u" | sed "s/^/$r\tR\t/"; } >> "$pairs"
+  echo "round $r done" >&2
 done
 
 python3 -I - "$pairs" "$BENCH" <<'PY'
 import statistics as st, sys
-rows = [tuple(map(float, l.split())) for l in open(sys.argv[1])]
-ratios = [u / c for _, c, u in rows]          # < 1.0: Rust is faster in that round
-print(f"bench={sys.argv[2]} rounds={len(rows)}")
-print(f"C++  ns/op: median {st.median(c for _, c, _ in rows):.1f}")
-print(f"Rust ns/op: median {st.median(u for _, _, u in rows):.1f}")
-print(f"paired Rust/C++ ratio: median {st.median(ratios):.3f}  min {min(ratios):.3f}  max {max(ratios):.3f}")
-print(f"rounds where Rust was faster: {sum(r < 1 for r in ratios)}/{len(ratios)}")
+from collections import defaultdict
+runs = defaultdict(lambda: defaultdict(dict))        # name -> round -> {"C": v, "R": v}
+order = []
+for line in open(sys.argv[1]):
+    rnd, arm, name, val = line.rstrip("\n").split("\t")
+    if name not in order:
+        order.append(name)
+    runs[name][int(rnd)][arm] = float(val)
+print(f"bench={sys.argv[2]}")
+for name in order:
+    rows = [v for v in runs[name].values() if "C" in v and "R" in v]
+    c = st.median(v["C"] for v in rows)
+    u = st.median(v["R"] for v in rows)
+    ratios = [v["R"] / v["C"] for v in rows]          # < 1.0: Rust is faster that round
+    # A whole operation under ~1 ns in C++ may mean the compiler deleted the loop.
+    note = "  [C++ < 1 ns: check the loop was not optimised away]" if c < 1.0 else ""
+    print(f"{name}: C++ {c:.2f}  Rust {u:.2f} ns/op  paired Rust/C++ median {st.median(ratios):.3f} "
+          f"(min {min(ratios):.3f}, max {max(ratios):.3f})  Rust faster {sum(r < 1 for r in ratios)}/{len(ratios)}{note}")
 PY
 rm -f "$pairs"

@@ -72,6 +72,10 @@ strict mode rejects by definition.
 
 **14. The `compile_fail` doctest for a child borrowing a local fails with E0373, not E0597.** Making `Scope`'s marker types covariant makes that doctest compile, so the invariant markers are what stop it.
 
+**15. The stock C++ `sync_bench` has no baseline for its first three rows.** The compiler deletes those loops (0.32 ns per lock/unlock pair, `3.7e-06 ns/op` for latch create + count down), so the baseline is a scratch copy with an `asm volatile("" :: "r"(&x) : "memory")` barrier per iteration, which is not committed.
+
+**16. Two uncontended operations are slower than C++.** Mutex lock/unlock 0.98 ns vs 0.53 (paired ratio 1.83, 0/11 rounds faster) and latch create + count down 2.86 ns vs 1.09 (ratio 2.62, 0/11); the causes are the cross-`Io` pointer check (Rule 13) and the `Rc<Sched>` increment/decrement (open decision 1), both kept on purpose. The other rows are ahead: semaphore 0.97 vs 2.54 ns, `scope` spawn + join 76.9 vs 100.6 ns (`TaskGroup`), contended mutex 30.9 vs 57.1 ns.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

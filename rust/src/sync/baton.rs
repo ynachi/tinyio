@@ -23,6 +23,7 @@ pub struct Baton {
 }
 
 impl Baton {
+    #[inline]
     pub fn new(at: &impl Attach) -> Baton {
         Baton {
             sched: bind(at),
@@ -32,6 +33,7 @@ impl Baton {
     }
 
     /// Aborts on a second concurrent waiter: one-shot means one.
+    #[inline]
     pub fn wait(&self, cx: &Cx) {
         check_same(&self.sched, cx, "Baton");
         match self.state.get() {
@@ -46,10 +48,12 @@ impl Baton {
         }
     }
 
+    #[inline]
     pub fn is_posted(&self) -> bool {
         self.state.get() == State::Posted
     }
 
+    #[inline]
     pub fn post(&self) {
         if self.is_posted() {
             return;

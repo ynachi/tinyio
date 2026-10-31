@@ -17,6 +17,7 @@ pub struct Latch {
 }
 
 impl Latch {
+    #[inline]
     pub fn new(at: &impl Attach, count: usize) -> Latch {
         Latch {
             sched: bind(at),
@@ -26,6 +27,7 @@ impl Latch {
     }
 
     /// Aborts if the count is already zero (counting below zero is a bug).
+    #[inline]
     pub fn count_down(&self) {
         let n = self.count.get();
         check!(n > 0, "Latch::count_down called more times than its count");
@@ -36,6 +38,7 @@ impl Latch {
     }
 
     /// Wait for the count to reach zero; returns at once if it already has.
+    #[inline]
     pub fn wait(&self, cx: &Cx) {
         check_same(&self.sched, cx, "Latch");
         if self.count.get() > 0 {

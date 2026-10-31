@@ -28,6 +28,10 @@ harness = false
 name = "pingpong"
 harness = false
 
+[[bench]]
+name = "sync"
+harness = false
+
 [profile.release]
 debug = 1
 lto = "thin"

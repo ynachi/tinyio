@@ -48,11 +48,13 @@ impl sealed::Sealed for Cx {
 impl Attach for Io {}
 impl Attach for Cx {}
 
+#[inline]
 pub(super) fn bind(at: &impl Attach) -> Rc<Sched> {
     Rc::clone(sealed::Sealed::sched(at))
 }
 
 /// Rule 13: a primitive built on one `Io` must not be used from another.
+#[inline]
 pub(super) fn check_same(bound: &Rc<Sched>, cx: &Cx, what: &str) {
     check!(
         Rc::ptr_eq(bound, cx.sched()),
