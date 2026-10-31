@@ -5,7 +5,9 @@
 // submit, reap, resume) with no network stack and no cross-thread machinery.
 //
 // The Rust twin is rust/benches/pingpong.rs; scripts/ab.sh runs them
-// interleaved. Prints "ns/roundtrip: <f> ns".
+// interleaved. Usage: pingpong_bench [rounds] [timeout_ms]; a non-zero timeout
+// is put on every Read and Write, to measure the cost of arming one.
+// Prints "ns/roundtrip: <f> ns".
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -20,6 +22,7 @@
 
 int main(int argc, char** argv) {
     const std::size_t rounds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 200000;
+    const auto timeout = std::chrono::milliseconds(argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 0);
 
     std::array<int, 2> sv{};
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv.data()) != 0) {
@@ -38,8 +41,8 @@ int main(int argc, char** argv) {
         const auto start = std::chrono::steady_clock::now();
         std::byte byte{0};
         for (std::size_t i = 0; i < rounds; ++i) {
-            if (!rt.Write(a, std::span<const std::byte>(&byte, 1)) ||
-                !rt.Read(a, std::span<std::byte>(&byte, 1))) {
+            if (!rt.Write(a, std::span<const std::byte>(&byte, 1), -1, timeout) ||
+                !rt.Read(a, std::span<std::byte>(&byte, 1), -1, timeout)) {
                 std::cerr << "ping failed\n";
                 std::exit(1);
             }
@@ -53,8 +56,8 @@ int main(int argc, char** argv) {
     (void)io.Spawn([&](tinyio::IO& rt) noexcept {
         std::byte byte{0};
         for (std::size_t i = 0; i < rounds; ++i) {
-            if (!rt.Read(b, std::span<std::byte>(&byte, 1)) ||
-                !rt.Write(b, std::span<const std::byte>(&byte, 1))) {
+            if (!rt.Read(b, std::span<std::byte>(&byte, 1), -1, timeout) ||
+                !rt.Write(b, std::span<const std::byte>(&byte, 1), -1, timeout)) {
                 std::cerr << "pong failed\n";
                 std::exit(1);
             }

@@ -72,8 +72,9 @@ mod sched;
 mod sync;
 #[cfg(test)]
 mod testutil;
+mod timer;
 
-pub use crate::cx::{Cx, is_cancelled};
+pub use crate::cx::{Cx, Timed, is_cancelled};
 pub use crate::detail::fiber::FiberId;
 pub use crate::fs::OpenOptions;
 pub use crate::io::Io;

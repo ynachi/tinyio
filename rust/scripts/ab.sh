@@ -8,6 +8,7 @@
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 CPU=2 scripts/ab.sh sync
 #   CPP_DIR=build/release/benchmarks/cpp ROUNDS=15 scripts/ab.sh post   # multi-threaded: do not pin
 #
+# TIMEOUT_MS=30000 (pingpong only) puts that timeout on every read and write.
 # CPP_DIR is where the C++ release preset put its benchmark binaries
 # (context_switch_bench, pingpong_bench). ITERS scales the Rust arm only; the
 # C++ benches have their own fixed sizes, so keep ITERS at the default unless
@@ -21,7 +22,7 @@ CPP_DIR=${CPP_DIR:?set CPP_DIR to the C++ release benchmark directory}
 ROUNDS=${ROUNDS:-15}
 case "$BENCH" in
   context_switch) ITERS=${ITERS:-10000000}; CPP_ARGS=() ;;
-  pingpong)       ITERS=${ITERS:-200000};   CPP_ARGS=("$ITERS") ;;
+  pingpong)       ITERS=${ITERS:-200000};   CPP_ARGS=("$ITERS" "${TIMEOUT_MS:-0}") ;;
   sync|post)      ITERS=1;                  CPP_ARGS=() ;;
   *) echo "unknown bench: $BENCH" >&2; exit 2 ;;
 esac
@@ -42,7 +43,7 @@ cpp_once() {
 rust_once() {
   case "$BENCH" in
     sync|post) "${PIN[@]}" "$RUST_BENCH" | labels ;;
-    *)    "${PIN[@]}" "$RUST_BENCH" --iters "$ITERS" --rounds 1 | awk -F= '/ns_per_op/ {print "ns/op\t"$2}' ;;
+    *)    "${PIN[@]}" "$RUST_BENCH" --iters "$ITERS" --rounds 1 --timeout-ms "${TIMEOUT_MS:-0}" | awk -F= '/ns_per_op/ {print "ns/op\t"$2}' ;;
   esac
 }
 

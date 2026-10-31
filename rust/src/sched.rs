@@ -15,12 +15,13 @@
 //!          +-------------- push_ready (one way in) <---+
 //! ```
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::ffi::c_void;
 use std::io;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use io_uring::opcode;
 use io_uring::squeue::Entry;
@@ -34,6 +35,7 @@ use crate::detail::stack::Stack;
 use crate::options::Validated;
 use crate::remote::Shared;
 use crate::ring::{Ring, UserData};
+use crate::timer::{TICK_NS, Wheel};
 
 /// Closures needing more alignment than the header are refused.
 const MAX_TASK_ALIGN: usize = 64;
@@ -117,6 +119,14 @@ pub struct Sched {
     /// The eventfd read must be (re)queued. While set the loop never blocks:
     /// sleeping with the read unarmed could miss a wake.
     rearm_pending: Cell<bool>,
+    /// Per-op timeouts. Accessed only through `with_timers`.
+    timers: UnsafeCell<Wheel<Hdr>>,
+    /// Time zero for the monotonic clock the wheel runs on.
+    epoch: Instant,
+    /// The current tick's `now`, or 0 when it must be read again.
+    now_cache: Cell<u64>,
+    /// Scratch for `process_expired_timers`, kept to avoid an allocation per call.
+    expired: Cell<Vec<Hdr>>,
     opts: Validated,
 }
 
@@ -135,6 +145,10 @@ impl Sched {
             stopping: Cell::new(false),
             shared: OnceCell::new(),
             rearm_pending: Cell::new(false),
+            timers: UnsafeCell::new(Wheel::new()),
+            epoch: Instant::now(),
+            now_cache: Cell::new(0),
+            expired: Cell::new(Vec::new()),
             opts,
         })
     }
@@ -147,6 +161,100 @@ impl Sched {
         check!(self.shared.set(shared).is_ok(), "ring opened twice");
         self.rearm_pending.set(true);
         Ok(())
+    }
+
+    /// Run `f` with the wheel. `f` is a short closure in this file that never
+    /// re-enters the scheduler.
+    fn with_timers<R>(&self, f: impl FnOnce(&mut Wheel<Hdr>) -> R) -> R {
+        // SAFETY: single thread (Rules 1, 2), and `f` never calls back into
+        // anything that touches the wheel, so this is the only live reference.
+        f(unsafe { &mut *self.timers.get() })
+    }
+
+    /// Monotonic nanoseconds, read once per tick. 0 is reserved for "stale".
+    fn now_ns(&self) -> u64 {
+        match self.now_cache.get() {
+            0 => {
+                let now = self.epoch.elapsed().as_nanos() as u64 + 1;
+                self.now_cache.set(now);
+                now
+            }
+            cached => cached,
+        }
+    }
+
+    pub(crate) fn invalidate_clock(&self) {
+        self.now_cache.set(0);
+    }
+
+    /// Give the running fiber's op in flight a deadline. Costs no SQE and no
+    /// kernel timer.
+    pub(crate) fn arm_timeout(&self, hdr: Hdr, d: Duration) {
+        // SAFETY: the running fiber's header is live.
+        let h = unsafe { hdr.as_ref() };
+        check!(
+            h.timer.get().is_none(),
+            "fiber {} armed two timeouts",
+            h.id.get()
+        );
+        let deadline = self
+            .now_ns()
+            .saturating_add(d.as_nanos().min(u128::from(u64::MAX)) as u64);
+        h.timer
+            .set(Some(self.with_timers(|w| w.arm(hdr, deadline))));
+    }
+
+    /// How long the loop may sleep before the nearest timeout could be due.
+    fn timer_bound(&self) -> Option<Duration> {
+        if !self.with_timers(|w| w.has_armed()) {
+            return None; // no clock read when nothing is armed
+        }
+        let now = self.now_ns();
+        self.with_timers(|w| w.ns_until_next(now))
+            .map(Duration::from_nanos)
+    }
+
+    /// Phase 4 of the tick, after the reap so finished ops are already
+    /// disarmed: cancel every op whose deadline passed. One `ASYNC_CANCEL` per
+    /// op, submitted at once (invariant 7: it must reach the kernel before the
+    /// fiber's next op can reuse the same `user_data`). While stopping, the
+    /// drain's cancel owns every op, so a stopped op stays `ECANCELED`.
+    pub(crate) fn process_expired_timers(&self) {
+        if self.stopping.get() || !self.with_timers(|w| w.has_armed()) {
+            return;
+        }
+        let now = self.now_ns();
+        let mut due = self.expired.take();
+        self.with_timers(|w| w.expire(now, &mut due));
+        // Clear every cell first: queuing an SQE can flush and reap, and a reap
+        // disarms through this cell.
+        for hdr in &due {
+            // SAFETY: a fiber with an armed timer is parked in its `syscall`.
+            unsafe { hdr.as_ref() }.timer.set(None);
+        }
+        let mut issued = false;
+        for hdr in due.drain(..) {
+            // SAFETY: as above.
+            let h = unsafe { hdr.as_ref() };
+            let entry = opcode::AsyncCancel::new(h.op_user_data.get()).build();
+            // SAFETY: the cancel entry carries no pointers.
+            match unsafe { self.push_sqe(&entry, UserData::Cancel) } {
+                Ok(()) => {
+                    h.timed_out.set(true);
+                    issued = true;
+                }
+                Err(e) => {
+                    // No SQE now: try again one slot later.
+                    crate::check::error(format_args!("timeout cancel not queued: {e}"));
+                    h.timer
+                        .set(Some(self.with_timers(|w| w.arm(hdr, now + TICK_NS))));
+                }
+            }
+        }
+        self.expired.set(due);
+        if issued && let Err(e) = self.ring.submit(false, || self.reap()) {
+            crate::check::error(format_args!("timeout cancel submit failed: {e}"));
+        }
     }
 
     pub(crate) fn shared(&self) -> &Arc<Shared> {
@@ -534,6 +642,9 @@ impl Sched {
                 h.wait.get().name()
             ));
         }
+        if let Some(id) = h.timer.take() {
+            self.with_timers(|w| w.disarm(id));
+        }
         self.push_ready(hdr);
     }
 
@@ -561,15 +672,17 @@ impl Sched {
         if runnable {
             return self.ring.submit(true, reap);
         }
+        let bound = self.timer_bound();
         // Posts only write the eventfd while this flag is up, so announce the
         // sleep and re-check before blocking (see `Shared::announce_sleep`).
         let shared = self.shared();
         let result = if shared.announce_sleep() {
             self.ring.submit(true, reap)
         } else {
-            self.ring.wait(None, reap)
+            self.ring.wait(bound, reap)
         };
         shared.clear_sleep();
+        self.invalidate_clock();
         result
     }
 
@@ -606,6 +719,11 @@ impl Sched {
         check!(
             h.task.get().is_none(),
             "finished fiber {} still owns a task",
+            h.id.get()
+        );
+        check!(
+            h.timer.get().is_none(),
+            "fiber {} finished with its timeout still armed",
             h.id.get()
         );
         self.live.set(self.live.get() - 1);
@@ -997,6 +1115,26 @@ mod tests {
                 io.sched().push_ready(h);
             },
             &["push_ready on finished fiber"],
+        );
+    }
+
+    // Prediction: a fiber that ends with a timeout still armed would leave a wheel
+    // entry pointing at a recycled stack, so finishing aborts, naming the fiber.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn death_fiber_finishes_with_a_timer_armed() {
+        death_test(
+            "sched::tests::death_fiber_finishes_with_a_timer_armed",
+            || {
+                let mut io = io();
+                io.spawn(|cx| {
+                    let s = cx.sched();
+                    s.arm_timeout(s.current(), std::time::Duration::from_secs(1));
+                })
+                .unwrap();
+                io.run_until_done();
+            },
+            &["fiber 1 finished with its timeout still armed"],
         );
     }
 }

@@ -90,6 +90,12 @@ strict mode rejects by definition.
 
 **22. The producer-side fence cannot be exercised on x86**, because the locked compare-exchange and queue push before it already order the accesses; only the arm64 CI job covers it. The lock-step test in `ring.rs` fails on all three owner-side mutations I tried (no flag, no fence/re-check, re-check ignoring posts); the end-to-end race test in `tests/remote.rs` catches only a flag that is never raised.
 
+## Stage 5
+
+**23. The plan's late-cancel prediction does not reproduce.** With the immediate submit in `process_expired_timers` removed, `the_cancel_cannot_hit_the_next_op` still passed 5 of 5: the queued cancel is flushed by the next tick's submit, before the fiber can resume (only its own CQE wakes it). The immediate submit is kept (invariant 7) as defence in depth; it costs one syscall on a rare path.
+
+**24. Timeout accuracy and cost.** The wait bound is the end of the nearest occupied 64 ms slot, so a timeout (a zero one included) fires up to one slot late; while stopping, expiry does nothing and the drain's cancel owns every op, so a stopped op is `ECANCELED`. A 30 s timeout on every op adds 245 ns per 4-op ping-pong round trip (C++: 335 ns); paired 0.961 against C++.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

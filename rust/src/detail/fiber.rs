@@ -27,6 +27,7 @@ use super::context::Context;
 use super::stack::Stack;
 use crate::cx::Cx;
 use crate::sched::Sched;
+use crate::timer::TimerId;
 
 /// A unique, monotonically increasing fiber identifier (a recycled stack gets
 /// a fresh one for every execution).
@@ -143,6 +144,14 @@ pub(crate) struct FiberHeader {
     /// Where the closure sits on this fiber's stack.
     pub(crate) task_ptr: Cell<*mut u8>,
     pub(crate) stack: Cell<Stack>,
+    /// The wheel entry of the op in flight, if it has a timeout. A fiber never
+    /// finishes with this set.
+    pub(crate) timer: Cell<Option<TimerId>>,
+    /// Set when the wheel expired the op and a cancel was queued, so the
+    /// `-ECANCELED` that follows is reported as `ETIMEDOUT`.
+    pub(crate) timed_out: Cell<bool>,
+    /// The `user_data` of the op in flight: what a timeout cancel targets.
+    pub(crate) op_user_data: Cell<u64>,
 }
 
 impl FiberHeader {
@@ -158,6 +167,9 @@ impl FiberHeader {
             task: Cell::new(None),
             task_ptr: Cell::new(std::ptr::null_mut()),
             stack: Cell::new(stack),
+            timer: Cell::new(None),
+            timed_out: Cell::new(false),
+            op_user_data: Cell::new(0),
         }
     }
 

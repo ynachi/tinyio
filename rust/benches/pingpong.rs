@@ -4,13 +4,15 @@
 //! byte over a socketpair. Each round trip is two writes and two reads, so it
 //! measures the whole syscall path (SQE, suspend, submit, reap, resume).
 //!
-//! Usage: `cargo bench --bench pingpong -- [--iters N] [--rounds R]`
+//! Usage: `cargo bench --bench pingpong -- [--iters N] [--rounds R] [--timeout-ms T]`
+//! A non-zero `T` puts that timeout on every read and write, to measure the
+//! cost of arming one.
 //! Prints one `ns_per_op=<f>` line (ns per round trip) per round, then the median.
 
 use std::cell::Cell;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tinyio::{Io, Options};
 
@@ -23,7 +25,8 @@ fn arg(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn one_round(iters: u64) -> f64 {
+fn one_round(iters: u64, timeout_ms: u64) -> f64 {
+    let timeout = Duration::from_millis(timeout_ms);
     let (a, b) = UnixStream::pair().unwrap();
     let mut io = Io::new(Options::default()).unwrap();
     let elapsed = Rc::new(Cell::new(0u128));
@@ -32,8 +35,13 @@ fn one_round(iters: u64) -> f64 {
         let mut byte = [0u8; 1];
         let start = Instant::now();
         for _ in 0..iters {
-            cx.write(&a, &byte, None).unwrap();
-            cx.read(&a, &mut byte, None).unwrap();
+            if timeout_ms == 0 {
+                cx.write(&a, &byte, None).unwrap();
+                cx.read(&a, &mut byte, None).unwrap();
+            } else {
+                cx.timeout(timeout).write(&a, &byte, None).unwrap();
+                cx.timeout(timeout).read(&a, &mut byte, None).unwrap();
+            }
         }
         out.set(start.elapsed().as_nanos());
     })
@@ -41,8 +49,13 @@ fn one_round(iters: u64) -> f64 {
     io.spawn(move |cx| {
         let mut byte = [0u8; 1];
         for _ in 0..iters {
-            cx.read(&b, &mut byte, None).unwrap();
-            cx.write(&b, &byte, None).unwrap();
+            if timeout_ms == 0 {
+                cx.read(&b, &mut byte, None).unwrap();
+                cx.write(&b, &byte, None).unwrap();
+            } else {
+                cx.timeout(timeout).read(&b, &mut byte, None).unwrap();
+                cx.timeout(timeout).write(&b, &byte, None).unwrap();
+            }
         }
     })
     .unwrap();
@@ -53,7 +66,8 @@ fn one_round(iters: u64) -> f64 {
 fn main() {
     let iters = arg("--iters", 200_000);
     let rounds = arg("--rounds", 5);
-    let mut results: Vec<f64> = (0..rounds).map(|_| one_round(iters)).collect();
+    let timeout_ms = arg("--timeout-ms", 0);
+    let mut results: Vec<f64> = (0..rounds).map(|_| one_round(iters, timeout_ms)).collect();
     for r in &results {
         println!("ns_per_op={r:.3}");
     }

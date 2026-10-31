@@ -99,7 +99,7 @@ impl Cx {
     /// Every pointer inside `entry` must stay valid until this call returns.
     /// Callers pass pointers into data they borrow across the call: the fiber
     /// is parked until the CQE, so the borrow outlives the kernel's use.
-    unsafe fn syscall_ex(&self, entry: &Entry) -> Result<u32, Failed> {
+    unsafe fn syscall_ex(&self, entry: &Entry, timeout: Option<Duration>) -> Result<u32, Failed> {
         let not_submitted = |err| Failed {
             err,
             submitted: false,
@@ -122,10 +122,24 @@ impl Cx {
         // in this frame, which does not return before the CQE (park below).
         unsafe { sched.push_sqe(entry, ud) }.map_err(not_submitted)?;
 
+        // SAFETY: the running fiber's header is live.
+        let header = unsafe { me.as_ref() };
+        header.timed_out.set(false);
+        header.op_user_data.set(ud.encode());
+        if let Some(d) = timeout {
+            sched.arm_timeout(me, d);
+        }
+
         sched.park(WaitKind::Io);
 
         let res = completion.result();
-        if res < 0 {
+        if res == -libc::ECANCELED && header.timed_out.get() {
+            // The wheel expired the op and cancelled it: that is a timeout.
+            Err(Failed {
+                err: errno(libc::ETIMEDOUT),
+                submitted: true,
+            })
+        } else if res < 0 {
             Err(Failed {
                 err: errno(-res),
                 submitted: true,
@@ -139,15 +153,30 @@ impl Cx {
     ///
     /// # Safety
     /// As `syscall_ex`.
-    unsafe fn syscall(&self, entry: &Entry) -> io::Result<u32> {
+    unsafe fn syscall(&self, entry: &Entry, timeout: Option<Duration>) -> io::Result<u32> {
         // SAFETY: forwarded.
-        unsafe { self.syscall_ex(entry) }.map_err(|f| f.err)
+        unsafe { self.syscall_ex(entry, timeout) }.map_err(|f| f.err)
+    }
+
+    /// The same I/O calls, each failing with `ETIMEDOUT` after `d`.
+    pub fn timeout(&self, d: Duration) -> Timed<'_> {
+        Timed { cx: self, d }
     }
 
     /// `read(2)` at `offset`, or at the file position when `None`. May return
     /// fewer bytes than `buf.len()` (always at most 0x7fff_f000). `Ok(0)` is
     /// end of file.
     pub fn read(&self, fd: &impl AsFd, buf: &mut [u8], offset: Option<u64>) -> io::Result<usize> {
+        self.read_with(fd, buf, offset, None)
+    }
+
+    fn read_with(
+        &self,
+        fd: &impl AsFd,
+        buf: &mut [u8],
+        offset: Option<u64>,
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
         let off = file_offset(offset)?;
         let len = buf.len().min(MAX_RW_LEN) as u32;
         let entry = opcode::Read::new(Fd(fd.as_fd().as_raw_fd()), buf.as_mut_ptr(), len)
@@ -156,19 +185,29 @@ impl Cx {
         // SAFETY: `buf` is borrowed for this whole call and the fiber is
         // parked until the CQE, so the kernel's writes land in live memory;
         // `fd` is borrowed too, so it stays open.
-        unsafe { self.syscall(&entry) }.map(|n| n as usize)
+        unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
     }
 
     /// `write(2)` at `offset`, or at the file position when `None`. May write
     /// fewer bytes than `buf.len()`.
     pub fn write(&self, fd: &impl AsFd, buf: &[u8], offset: Option<u64>) -> io::Result<usize> {
+        self.write_with(fd, buf, offset, None)
+    }
+
+    fn write_with(
+        &self,
+        fd: &impl AsFd,
+        buf: &[u8],
+        offset: Option<u64>,
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
         let off = file_offset(offset)?;
         let len = buf.len().min(MAX_RW_LEN) as u32;
         let entry = opcode::Write::new(Fd(fd.as_fd().as_raw_fd()), buf.as_ptr(), len)
             .offset(off)
             .build();
         // SAFETY: as in `read`: `buf` and `fd` are borrowed across the call.
-        unsafe { self.syscall(&entry) }.map(|n| n as usize)
+        unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
     }
 
     /// `openat(2)` relative to the current directory.
@@ -181,7 +220,7 @@ impl Cx {
             .mode(opts.mode_bits())
             .build();
         // SAFETY: `c_path` is a local of this frame, alive across the call.
-        let fd = unsafe { self.syscall(&entry) }?;
+        let fd = unsafe { self.syscall(&entry, None) }?;
         // SAFETY: a successful openat returns a fresh descriptor that nothing
         // else in the process owns or will close.
         Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
@@ -195,7 +234,7 @@ impl Cx {
     pub fn close(&self, fd: OwnedFd) -> io::Result<()> {
         let entry = opcode::Close::new(Fd(fd.as_raw_fd())).build();
         // SAFETY: the entry carries no pointers.
-        match unsafe { self.syscall_ex(&entry) } {
+        match unsafe { self.syscall_ex(&entry, None) } {
             Ok(_) => {
                 // The kernel closed it; dropping `fd` would close it again.
                 std::mem::forget(fd);
@@ -226,11 +265,34 @@ impl Cx {
             .nsec(d.subsec_nanos());
         let entry = opcode::Timeout::new(&raw const ts).build();
         // SAFETY: `ts` is a local of this frame, alive across the call.
-        match unsafe { self.syscall(&entry) } {
+        match unsafe { self.syscall(&entry, None) } {
             // A timeout SQE completes with -ETIME when it fires: success here.
             Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
             r => r.map(|_| ()),
         }
+    }
+}
+
+/// A [`Cx`] whose next I/O call gives up after a deadline, from [`Cx::timeout`].
+/// The call fails with `ETIMEDOUT` (`io::ErrorKind::TimedOut`). If the runtime
+/// is shutting down instead, it fails with `ECANCELED`, never `ETIMEDOUT`.
+///
+/// Deadlines are kept on a coarse wheel (64 ms slots), so a timeout can fire up
+/// to one slot late, and a zero duration expires on the next pass of the loop.
+pub struct Timed<'a> {
+    cx: &'a Cx,
+    d: Duration,
+}
+
+impl Timed<'_> {
+    /// [`Cx::read`] with the deadline.
+    pub fn read(&self, fd: &impl AsFd, buf: &mut [u8], offset: Option<u64>) -> io::Result<usize> {
+        self.cx.read_with(fd, buf, offset, Some(self.d))
+    }
+
+    /// [`Cx::write`] with the deadline.
+    pub fn write(&self, fd: &impl AsFd, buf: &[u8], offset: Option<u64>) -> io::Result<usize> {
+        self.cx.write_with(fd, buf, offset, Some(self.d))
     }
 }
 

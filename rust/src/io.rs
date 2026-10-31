@@ -66,6 +66,7 @@ impl Io {
         // Phase 1: posted closures become fibers, then resume. Resuming is
         // what queues SQEs, so doing it first means the submit below carries
         // them into the kernel this tick.
+        self.sched.invalidate_clock();
         self.sched.drain_remote();
         self.sched.resume_ready(self.sched.opts().batch_max_size);
 
@@ -84,6 +85,7 @@ impl Io {
         // next tick's phase 1 resumes them. Then re-queue the eventfd read.
         self.sched.reap();
         self.sched.arm_wake();
+        self.sched.process_expired_timers();
         submitted
     }
 
