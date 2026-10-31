@@ -18,11 +18,10 @@ OS thread
     └── fiber: handle client B
 ```
 
-Each `IO` instance is **single-threaded** — only the thread that created it may call I/O operations. Scaling is 
-done horizontally by spawning multiple IO contexts. Cross-thread dispatch is done through `post()`. For network 
-traffic, `SO_REUSE` is a great way to distribute traffic. Tinyio is extremely fast and low latency. It outperformed top  
-share nothing libs during most our benchmarks. Also, its tests and demo are always built against sanitizers (ASAN, TSAN, UBSAN) 
-and Valgrind to catch memory errors and leaks and fix them.
+Each `IO` instance is **single-threaded** — only the thread that created it may call I/O operations. Scaling is done
+horizontally by spawning multiple `IO` contexts. Cross-thread dispatch is done through `Post()`; for network traffic,
+multiple listeners can share one port via `SO_REUSEPORT`. Every push is built and tested in CI under ASan+UBSan and
+TSan, plus a clang-format check.
 
 ---
 
@@ -31,13 +30,15 @@ and Valgrind to catch memory errors and leaks and fix them.
 | Item               | Minimum           | Recommended |
 |--------------------|-------------------|-------------|
 | Linux kernel       | 6.1               | 6.6+        |
-| liburing           | 2.8               | 2.12+       |
+| liburing           | 2.9               | 2.9+        |
 | Compiler (x86-64)  | Clang 20 / GCC 15 | Clang 22    |
 | Compiler (aarch64) | Clang 20 / GCC 16 | Clang 22    |
 | C++ standard       | C++23             | —           |
 
-The kernel floor is set by the io_uring features the runtime actually uses,
-not by what io_uring could do:
+The build pins liburing 2.9 and builds it in the tree; `TINYIO_FETCH_LIBURING=OFF` takes the system one through
+pkg-config (still >= 2.9).
+
+The kernel floor is set by the io_uring features the runtime actually uses, not by what io_uring could do:
 
 | Feature                                    | Needs |
 |--------------------------------------------|-------|
@@ -46,9 +47,8 @@ not by what io_uring could do:
 | `IORING_SETUP_TASKRUN_FLAG`                | 5.19  |
 | `IORING_ASYNC_CANCEL_ALL` / `_ANY`         | 5.19  |
 
-`DEFER_TASKRUN` is in the default ring flags, and the shutdown path cancels
-every in-flight request with a single `IORING_ASYNC_CANCEL_ALL |
-IORING_ASYNC_CANCEL_ANY`. There is no fallback for an older kernel.
+`DEFER_TASKRUN` is in the default ring flags, and the shutdown path cancels every in-flight request with a single
+`IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_ANY`. There is no fallback for an older kernel.
 
 ---
 
@@ -63,12 +63,13 @@ using namespace tinyio;
 int main() {
     IO io(0, IoOptions{});
 
-    io.Spawn([](IO& io) noexcept {
+    (void)io.Spawn([](IO& io) noexcept {
         auto fd = TRY(io.Open("/tmp/hello.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644));
 
         std::string_view msg = "hello from a fiber\n";
         std::span buf(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        TRY_VOID(io.Write(fd, buf));
+        auto n = TRY(io.Write(fd, buf));   // n = bytes written
+        (void)n;
 
         TRY_VOID(io.Close(std::move(fd)));
     });
@@ -91,7 +92,8 @@ static Result<void> handle_client(IO& io, UniqueFd client) noexcept {
         auto n = TRY(io.Read(client, std::span{buf}));
         if (n == 0) break;
         // write response ...
-        TRY_VOID(io.Write(client, response));
+        auto w = TRY(io.Write(client, response));
+        (void)w;
     }
     return {};
 }
@@ -101,7 +103,7 @@ static Result<void> accept_loop(IO& io, uint16_t port, std::stop_token st) noexc
 
     while (!st.stop_requested()) {
         auto client = TRY(io.Accept(server));
-        io.Spawn([c = std::move(client)](IO& io) mutable noexcept {
+        (void)io.Spawn([c = std::move(client)](IO& io) mutable noexcept {
             (void)handle_client(io, std::move(c));
         });
     }
@@ -118,7 +120,7 @@ int main() {
         auto st = stops.back().get_token();
         threads.emplace_back([i, st] {
             IO io(i, IoOptions{});
-            io.Spawn([st](IO& io) noexcept {
+            (void)io.Spawn([st](IO& io) noexcept {
                 (void)accept_loop(io, 8080, st);
             });
             io.Run(st);
@@ -138,7 +140,7 @@ The full example is in `examples/tinyio/03_http_services.cc`.
 ### `IO` — the event loop
 
 ```cpp
-// Construction — takes a worker id, options, and optional fixed buffer config.
+// Construction — takes a worker id, options, and optional fixed buffer configs.
 IO io(0, IoOptions{});
 
 // Spawn a fiber on the owner thread.
@@ -166,53 +168,60 @@ kernel completes the operation.
 
 ```cpp
 // Files
-Result<Fd>       io.Open(path, flags, mode = 0644)
-Result<void>     io.Close(Fd&&)
-Result<uint32_t> io.Read(Fd&, std::span<std::byte>, off_t offset = -1)
-Result<uint32_t> io.Write(Fd&, std::span<const std::byte>, off_t offset = -1)
-Result<uint32_t> io.Readv(Fd&, std::span<const iovec>, off_t offset = -1)
-Result<uint32_t> io.Writev(Fd&, std::span<const iovec>, off_t offset = -1)
-Result<void>     io.Fsync(Fd&, bool datasync = false)
-Result<void>     io.Fallocate(Fd&, int mode, off_t offset, off_t len)
-Result<void>     io.Ftruncate(Fd&, off_t len)   // kernel 6.9+
-Result<void>     io.Remove(path)
-Result<void>     io.Rename(from, to)
+Result<UniqueFd>  io.Open(path, flags, mode = 0644)
+Result<void>      io.Close(UniqueFd)
+Result<uint32_t>  io.Read(const UniqueFd&, std::span<std::byte>, off_t offset = -1)
+Result<void>      io.ReadExact(const UniqueFd&, std::span<std::byte>, off_t offset = -1)
+Result<uint32_t>  io.Write(const UniqueFd&, std::span<const std::byte>, off_t offset = -1)
+Result<void>      io.WriteAll(const UniqueFd&, std::span<const std::byte>, off_t offset = -1)
+Result<uint32_t>  io.Readv(const UniqueFd&, std::span<const iovec>, off_t offset = -1)
+Result<uint32_t>  io.Writev(const UniqueFd&, std::span<const iovec>, off_t offset = -1)
+Result<void>      io.Fsync(const UniqueFd&, bool datasync = false)
+Result<void>      io.Fallocate(const UniqueFd&, int mode, off_t offset, off_t len)
+Result<void>      io.Ftruncate(const UniqueFd&, off_t len)   // kernel 6.9+
+Result<void>      io.Remove(path)
+Result<void>      io.Rename(from, to)
 
 // Network
-Result<Fd>       io.Accept(Fd& server, int flags = SOCK_NONBLOCK | SOCK_CLOEXEC)
-Result<Fd>       io.Accept(Fd& server, SocketAddress& client_addr, int flags = ...)
-Result<void>     io.Connect(Fd&, const SocketAddress&)
-Result<uint32_t> io.Poll(Fd&, unsigned poll_mask)
+Result<UniqueFd>  io.Accept(const UniqueFd& server, int flags = SOCK_NONBLOCK | SOCK_CLOEXEC,
+                            std::chrono::nanoseconds timeout = {})
+Result<UniqueFd>  io.Accept(const UniqueFd& server, SocketAddress& client_addr,
+                            int flags = ..., std::chrono::nanoseconds timeout = {})
+Result<void>      io.Connect(const UniqueFd&, const SocketAddress&)
+Result<uint32_t>  io.Poll(const UniqueFd&, unsigned poll_mask)
 
 // Fixed (registered) buffers — faster I/O path
-Result<uint32_t> io.ReadFixed(Fd&, FixedBuffer&, size_t len, off_t offset = -1)
-Result<uint32_t> io.WriteFixed(Fd&, const FixedBuffer&, size_t len, off_t offset = -1)
+Result<uint32_t>  io.ReadFixed(const UniqueFd&, FixedBuffer&, size_t len, off_t offset = -1)
+Result<uint32_t>  io.WriteFixed(const UniqueFd&, const FixedBuffer&, size_t len, off_t offset = -1)
 
 // Timers
-Result<void>     io.SleepForNs(std::chrono::nanoseconds)
+Result<void>      io.SleepForNs(std::chrono::nanoseconds)
 ```
 
 ### `TcpListener` — convenience socket setup
 
 ```cpp
 // Bind to address + port (IPv4 or IPv6 auto-detected).
-Result<Fd> TcpListener::bind(const SocketAddress& addr, int backlog = 4096);
-Result<Fd> TcpListener::bind(uint16_t port, const char* ip = nullptr, int backlog = 4096);
+Result<UniqueFd> TcpListener::Bind(const SocketAddress& addr, int backlog = 4096);
+Result<UniqueFd> TcpListener::Bind(uint16_t port, const char* ip = nullptr, int backlog = 4096);
 ```
 
-Sets `SO_REUSEPORT`, `SO_REUSEADDR`, and `TCP_NODELAY` automatically.
+Sets `SO_REUSEPORT`, `SO_REUSEADDR`, `TCP_NODELAY` (inherited by accepted clients) and `O_NONBLOCK` automatically.
 
 ### `IoOptions` — tuning
 
 ```cpp
 IoOptions opts;
-opts.sq_entries        = 4096;     // SQ ring size
-opts.stack_size        = 256*1024; // fiber stack size
-opts.guard_size        = 4096;     // guard page below each stack
-opts.max_idle_fibers   = 1024;     // fiber pool high-water mark
-opts.batch_max_size    = 128;      // max fibers resumed per tick
-opts.tick_timeout_ms   = 10;       // max wait in io_uring_submit_and_wait
-opts.worker_cpu_affinity = {0};    // pin to CPU (empty = no pinning)
+opts.sq_entries         = 4096;     // SQ ring size
+opts.stack_size         = 256*1024; // fiber stack size
+opts.guard_size         = 4096;     // guard page below each stack
+opts.max_idle_fibers    = 1024;     // fiber pool high-water mark
+opts.batch_max_size     = 128;      // max fibers resumed per tick
+opts.post_queue_capacity = 4096;    // cross-thread Post() queue size
+opts.sq_thread_cpu      = -1;       // -1 = no SQ poll thread
+opts.sq_thread_idle_ms  = 2000;
+opts.worker_cpu_affinity = {0};     // pin to CPU (empty = no pinning)
+opts.buffer_pools = {{.slot_size = 4096, .slots = 256}};  // fixed buffer size classes
 ```
 
 ### Error handling
@@ -234,50 +243,62 @@ auto n = TRY(io.Read(fd, buf));   // returns the error to the caller on failure
 TRY_VOID(io.Fsync(fd));           // Result<void>: just propagate
 ```
 
-### Fixed buffer pool
+### Fixed buffer pools
 
-Registered buffers bypass the kernel's bounce-buffer copy on every I/O call.
+Registered buffers bypass the kernel's bounce-buffer copy on every I/O call. Each entry in
+`IoOptions::buffer_pools` is one **size class** with its own pool of slots; a read or write names the slot
+and the kernel DMAs directly into it.
 
 ```cpp
-// One runtime, one pool: registered with the ring at construction
 IoOptions opts;
-opts.buffer_pool = BufferPoolConfig{.slot_size = 4096, .slots = 256};
+opts.buffer_pools = {
+    {.slot_size = 4096,  .slots = 512},
+    {.slot_size = 65536, .slots = 64},
+};
 IO io(0, opts);
 
 // Inside a fiber
-auto buf = TRY(io.TakeFixedBuffer());   // AcquireFixedBuffer parks the fiber instead
-auto n   = TRY(io.ReadFixed(fd, *buf, buf->Size()));
-// buf returns to pool automatically on destruction
+auto buf = TRY(io.TakeFixedBuffer(4096));   // non-blocking; EAGAIN when that class is empty
+auto wait = io.AcquireFixedBuffer(4096);    // parks the fiber instead
+auto n    = TRY(io.ReadFixed(fd, buf, buf.Size()));
+// buf returns to its pool automatically on destruction
 ```
 
-### Synchronization (`TaskGroup`, `Mutex`, `Semaphore`, `Latch`)
+### Synchronization (`Baton`, `Latch`, `Semaphore`, `Mutex`, `TaskGroup`)
 
-tinyio provides fiber-aware synchronization primitives that correctly suspend the fiber without blocking the underlying OS thread.
+tinyio provides fiber-aware synchronization primitives that correctly suspend the fiber without blocking the
+underlying OS thread.
 
 #### `TaskGroup<T>`
-Use `TaskGroup` to run multiple fibers concurrently and wait for them to finish (Structured Concurrency).
+Use `TaskGroup` to run multiple fibers concurrently and wait for them to finish (structured concurrency). The
+destructor asserts that no tasks are still active, so children cannot outlive the group's scope.
 
 ```cpp
 // 1. Fire-and-forget (TaskGroup<void> deduced)
 tinyio::TaskGroup group(io);
-group.Spawn([](IO& io) { /* Task 1 */ });
-group.Spawn([](IO& io) { /* Task 2 */ });
-group.Wait(); // Suspends until all tasks finish
+(void)group.Spawn([](IO& io) noexcept { /* Task 1 */ });
+(void)group.Spawn([](IO& io) noexcept { /* Task 2 */ });
+TRY_VOID(group.Wait());   // suspends until all tasks finish
 
-// 2. Collecting results
+// 2. Collecting results — capacity is fixed at construction
 tinyio::TaskGroup<int> results(io, 2);
-results.Spawn([](IO& io) -> Result<int> { return 42; });
-results.Spawn([](IO& io) -> Result<int> { return 100; });
-results.Wait();
+(void)results.Spawn([](IO& io) noexcept -> Result<int> { return 42; });
+(void)results.Spawn([](IO& io) noexcept -> Result<int> { return 100; });
+TRY_VOID(results.Wait());
+// results.Results() -> std::vector<std::optional<Result<int>>>
+//   nullopt = slot never spawned
+//   engaged = check the inner Result<T>: the task's value, its error,
+//             or the spawn error pre-filled into the slot
 ```
 
 ### Cross-thread dispatch
 
 ```cpp
-// From any thread — enqueues a task into the lock-free moodycamel::ConcurrentQueue
+// From any thread — enqueues a task into a lock-free MPMC queue (the moodycamel
+// ConcurrentQueue YLT ships, wrapped in src/tinyio/detail/mpsc_queue.hpp)
 // and wakes the owner thread via eventfd.
 bool ok = io.Post([](IO& io) noexcept {
-    io.Spawn(some_task);
+    (void)io.Spawn(some_task);
 });
 // ok == false if the queue is full
 ```
@@ -287,6 +308,8 @@ bool ok = io.Post([](IO& io) noexcept {
 ## Building
 
 ### From source
+
+The compiler comes from the `CC` / `CXX` environment variables on first configure.
 
 ```bash
 # Configure and build (debug, tests enabled)
@@ -301,8 +324,9 @@ cmake --preset release
 cmake --build --preset release
 ```
 
-Build output lands in `build/`. The presets use `clang-22` / `clang++-22`; edit `CMakePresets.json` to change the
-compiler.
+Build output lands in `build/<preset>`. There is also a make wrapper for the common tasks: `make dev`, `make asan`,
+`make tsan`, `make release` (configure + build + test), `make check` (asan + tsan, what CI runs), `make t T=<pattern>`
+(run matching tests), `make fmt` / `make fmt-check`.
 
 ### CMake integration
 
@@ -310,6 +334,9 @@ compiler.
 find_package(tinyio REQUIRED)
 target_link_libraries(my_app PRIVATE tinyio::tinyio)
 ```
+
+The installed package needs only Threads and a system liburing >= 2.9 (found through pkg-config); YLT's headers
+install alongside tinyio's own.
 
 ---
 
@@ -325,9 +352,9 @@ works on both Apple Silicon (arm64) and Intel/Rosetta (amd64) without any Linux 
 
 ### Image
 
-Ubuntu 26.04 with clang-22, GCC 15, and liburing 2.14 (the version Ubuntu 26.04 ships natively). All C++ library
-dependencies (GTest, Abseil, mimalloc, …) are fetched by CMake FetchContent on first run and cached in an arch-specific
-named volume, so subsequent runs are fast.
+Ubuntu 26.04 with clang-22, GCC 15, and liburing 2.14 (the version Ubuntu 26.04 ships natively). The remaining
+dependencies (YLT, GTest, mimalloc when enabled) are fetched by CMake FetchContent on first run and cached in an
+arch-specific named volume, so subsequent runs are fast.
 
 The container uses the same `dev` CMake preset as local builds. The build volume is mounted at `/workspace/build` (the
 preset's `binaryDir`), so the workflow inside the container is identical to working locally:
@@ -364,9 +391,8 @@ TIO_SANITIZER=thread docker compose -f dev-tools/compose.yaml run --rm test-arm6
 | `TIO_SANITIZER` value | Effect                             |
 |-----------------------|------------------------------------|
 | `none` (default)      | No instrumentation                 |
-| `address`             | ASAN — memory errors, leaks        |
-| `thread`              | TSAN — data races on `post()` path |
-| `undefined`           | UBSAN — UB in arithmetic and casts |
+| `address`             | ASan + UBSan                       |
+| `thread`              | TSan — data races on `Post()` path |
 
 ### Interactive shell
 
@@ -391,63 +417,51 @@ docker compose -f dev-tools/compose.yaml build
 
 ## Running under sanitizers
 
-You can enable sanitizers during configuration by using CMake options.
-
-### ASAN (AddressSanitizer)
-
-Catches heap/stack overflows, use-after-free, double-free.
+The build has three sanitizer profiles, one CMake preset each:
 
 ```bash
-cmake --preset dev -DTINYIO_ENABLE_ASAN=ON -B build_asan
-cmake --build build_asan -j$(nproc)
+cmake --workflow --preset asan   # AddressSanitizer + UndefinedBehaviorSanitizer
+cmake --workflow --preset tsan   # ThreadSanitizer
+```
 
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 ./build_asan/tests/my_test
+Each configures, builds and runs the full test suite. The underlying cache variable is
+`TINYIO_SANITIZER` (`none` | `address` | `thread`) if you configure manually. ASan and TSan are mutually exclusive;
+UBSan is not separate — the `address` profile carries it.
+
+### ASan (AddressSanitizer + UBSan)
+
+Catches heap/stack overflows, use-after-free, double-free, plus signed overflow, misaligned access and shift UB.
+
+```bash
+cmake --preset asan -B build_asan
+cmake --build build_asan -j$(nproc)
+ctest --preset asan
 ```
 
 The fiber context switch calls `__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber` so ASAN understands
 stack ownership. If you see false positives on context-switch frames, verify those hooks are present in
-`include/tinyio/detail/sanitizer_hooks.hpp`.
+`src/tinyio/detail/sanitizer_hooks.hpp`.
 
 ### TSAN (ThreadSanitizer)
 
-Catches data races on the `post()` / MPSC queue cross-thread path.
+Catches data races on the `Post()` / MPMC queue cross-thread path.
 
 ```bash
-cmake --preset dev -DTINYIO_ENABLE_TSAN=ON -B build_tsan
+cmake --preset tsan -B build_tsan
 cmake --build build_tsan -j$(nproc)
-
-TSAN_OPTIONS=halt_on_error=1 ./build_tsan/tests/my_test
+ctest --preset tsan
 ```
 
 > **Known limitation**: TSAN may segfault at address `0x0000000000d8` on context switches. This is a pre-existing
 > interaction between TSAN's fake-stack and the hand-rolled assembly context switch — not a bug in your code. Use
-`TSAN_OPTIONS=history_size=7` to get better race reports when it does work.
+> `TSAN_OPTIONS=history_size=7` to get better race reports when it does work.
 
-The fiber switch calls `__tsan_switch_to_fiber` so TSAN knows fiber switches are not races.
-
-### UBSAN (UndefinedBehaviorSanitizer)
-
-Catches signed overflow, null dereference, misaligned access, and shift UB.
-
-```bash
-cmake --preset dev -DTINYIO_ENABLE_UBSAN=ON -B build_ubsan
-cmake --build build_ubsan -j$(nproc)
-
-./build_ubsan/tests/my_test
-```
-
-### Combining ASAN + UBSAN
-
-```bash
-cmake --preset dev -DTINYIO_ENABLE_ASAN=ON -DTINYIO_ENABLE_UBSAN=ON -B build_asan_ubsan
-```
-
-Do not combine TSAN with ASAN or UBSAN — they are mutually exclusive.
+The fiber switch calls `__tsan_create_fiber` / `__tsan_switch_to_fiber` so TSAN knows fiber switches are not races.
 
 ### Valgrind
 
 Slower but catches memory leaks and use of uninitialised values that sanitizers miss, including leaked `mmap` regions
-from `allocate_stack`.
+from stack allocation.
 
 ```bash
 # Build without sanitizers, with debug info
@@ -459,11 +473,11 @@ valgrind \
   --leak-check=full \
   --track-origins=yes \
   --error-exitcode=1 \
-  ./build_valgrind/tests/my_test
+  -- ./build_valgrind/tests/<test_binary>
 ```
 
 For fiber stacks to be tracked correctly, each `mmap`-allocated stack should be registered with
-`VALGRIND_STACK_REGISTER` (not yet done — see roadmap Phase 5).
+`VALGRIND_STACK_REGISTER` (not yet done).
 
 ---
 
@@ -482,4 +496,4 @@ For fiber stacks to be tracked correctly, each `mmap`-allocated stack should be 
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see `LICENCE`.

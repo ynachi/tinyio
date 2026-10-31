@@ -27,8 +27,8 @@
 namespace tinyio::detail::context {
 
 struct Context {
-  /// Saved stack pointer while suspended. Meaningless while running.
-  void* sp = nullptr;
+    /// Saved stack pointer while suspended. Meaningless while running.
+    void* sp = nullptr;
 };
 
 /// Entry point of a new context. It must never return: there is no frame
@@ -50,7 +50,7 @@ namespace tinyio::detail::context {
 
 /// Suspends the running context into @p from and resumes @p to.
 inline void Switch(Context& from, const Context& to) noexcept {
-  TinyioSwitchContext(&from.sp, to.sp);
+    TinyioSwitchContext(&from.sp, to.sp);
 }
 
 }  // namespace tinyio::detail::context

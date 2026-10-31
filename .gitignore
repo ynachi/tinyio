@@ -99,6 +99,12 @@ debug/
 # Mac
 .DS_Store
 
+# Maintainer's private notes (internal benchmark machines and protocol)
+NOTES.md
+
+# Design proposals kept out of the public tree (maintainer's local copies)
+proposals/
+
 # Google Test artifacts
 libgtest.a
 libgtest_main.a
@@ -112,14 +118,7 @@ tests/file*.txt
 
 compile_commands.json
 
-# Rust
-*/*/target/
-Cargo.lock
-benchmarks/rust/tcp/target
-/target
-dump.rdb
-go-benchmark.iml
-/testdata
-**/*/.rustc_info.json
+# The root Makefile is part of the build machinery: one command per task.
+!/Makefile
 # The root Makefile is part of the build machinery: one command per task.
 !/Makefile

@@ -14,15 +14,15 @@ switches back to the scheduler. The scheduler reaps completions, marks fibers
 ready and switches back into them. Everything else is bookkeeping around
 that cycle.
 
-The core is about 1,100 lines of implementation, split by concern into four
+The core is about 1,300 lines of implementation, split by concern into four
 files, plus the headers they lean on:
 
 | File | Lines | What lives there |
 |------|-------|------------------|
-| `runtime/runtime.cc` | 371 | construction, activation, the run loop, shutdown |
-| `runtime/scheduler.cc` | 173 | fibers: spawn, resume, suspend, destroy, yield |
-| `runtime/event_loop.cc` | 295 | the tick, submit/wait, reap, timers, the eventfd wakeup |
-| `runtime/io_ops.cc` | 234 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
+| `runtime/runtime.cc` | 398 | construction, activation, the run loop, shutdown |
+| `runtime/scheduler.cc` | 188 | fibers: spawn, resume, suspend, destroy, yield |
+| `runtime/event_loop.cc` | 324 | the tick, submit/wait, reap, timers, the eventfd wakeup |
+| `runtime/io_ops.cc` | 406 | the thin `Read`/`Write`/`Open`/`Accept`/… wrappers |
 
 The class is still one `IO`: these are translation units, not layers, and a
 single operation crosses several of them.
@@ -41,7 +41,7 @@ File names below are relative to `src/tinyio/`.
 
 ### 1. The context switch
 
-`detail/context.hpp`, `detail/context.cc` (~233 lines).
+`detail/context.hpp`, `detail/context.cc` (~269 lines).
 
 - Draw the stack `Make()` builds, byte by byte, and check it against what
   `TinyioSwitchContext` pops (`InitialFrame`: 64 bytes on x86_64, 176 on
@@ -113,7 +113,7 @@ File names below are relative to `src/tinyio/`.
 
 ### 8. Sync primitives
 
-`runtime/fiber_sync.hpp`: `Latch`, `Semaphore`, `Mutex`, `TaskGroup`.
+`runtime/fiber_sync.hpp`: `Baton`, `Latch`, `Semaphore`, `Mutex`, `TaskGroup`.
 
 - Built on two hooks only: `IO::ParkRunning()` and `IO::Unpark()`.
 - `Mutex::Unlock` and `Semaphore::Release` hand ownership straight to the
@@ -188,7 +188,7 @@ Each one names where it is enforced and what breaks without it.
 
 10. **The runtime never wakes a sync-parked fiber; only its primitive does.**
     `ParkOn()` parks without a cancellation path, and neither does
-    `AcquireFixedBuffer()`: the runtime never closes its buffer pool. A fiber
+    `AcquireFixedBuffer()`: the runtime never closes its buffer pools. A fiber
     still live at quiesce is a deadlock, and `AbortIfParkedFibers()` aborts. (Force-waking
     at shutdown leaked mutex ownership and woke parents before children.)
 
@@ -225,23 +225,13 @@ prediction marks the part you don't own yet. Turn each one into a test.
 
 ## Open findings from the review
 
-Good first changes once the reading is done; each touches a different layer.
-
-1. **ASan fiber hooks** (`detail/sanitizer_hooks.hpp`):
-   `FinishCurrentFiber` should pass `nullptr` as `fake_stack_save` on the
-   final switch, or every finished fiber leaks its fake stack (the `asan`
-   preset enables `detect_stack_use_after_return`). `SuspendFiber` passes no
-   destination stack, so ASan sees the scheduler stack as `[0,0)`: capture
-   `bottom_old`/`size_old` from the first `__sanitizer_finish_switch_fiber` in
-   `FiberEntry` and pass them back.
-2. **Stack guard and fiber count**: a frame larger than the 4 KB guard can
-   land in the neighbouring fiber's stack; build with
-   `-fstack-clash-protection` or enlarge the guard. Each stack is two VMAs, so
-   `vm.max_map_count` (65,530) caps a process at ~32K fibers.
-3. **x86 shadow stack**: the switch assembly lives in a C++ file, so
-   `-fcf-protection` marks the binary shadow-stack compatible while the
-   switch breaks shadow stacks. Latent until SHSTK is enabled. Build
-   `detail/context.cc` with `-fcf-protection=branch`, or move the asm to a `.S`.
-4. Minor: no CFI on `TinyioSwitchContext`; idle fibers keep dirty stack
-   pages (`MADV_FREE` on caching); `TimerWheel::NsUntilNext()` scans all 512
-   slots on every sleep.
+1. **Fiber VMA count at scale**: each stack is two VMAs (`PROT_NONE` guard +
+   `PROT_READ|PROT_WRITE` stack), so the default `vm.max_map_count` (65,530)
+   caps a process at ~32K fibers.
+2. **Idle stack RSS**: finished fibers cached in `idle_fibers_` keep dirty
+   stack pages warm for reuse; applications with deep stack bursts can
+   consider `MADV_FREE` beyond the top page on recycle.
+3. **Deterministic Simulation Testing**: a draft proposal for event-loop
+   interception (virtual time, staged CQE min-heap over real `io_uring`,
+   chaos ready-queue scheduling, and power-cut / torn-write crash simulation
+   on real files) exists alongside the tree; it is not implemented.

@@ -1,81 +1,19 @@
+# Every third-party dependency tinyio's build uses is declared here, each one
+# behind the option that needs it. Library, tests, examples and benchmarks only
+# link the targets this file defines; none of them looks a package up itself.
+#
+#   tinyio::liburing   liburing >= 2.9, pinned and built in the tree by default
+#   Threads::Threads
+#   yalantinglibs      YLT, header-only: easylog, struct_pack
+#   mimalloc-static    TINYIO_USE_MIMALLOC
+#   GTest::gtest       TINYIO_BUILD_TESTS
+#   gflags::gflags     TINYIO_BUILD_EXAMPLES
 include(FetchContent)
-include(ExternalProject)
 
 function(tinyio_configure_dependencies)
-    # google/crc32c 1.1.2 still declares a pre-3.5 CMake policy baseline.
-    # CMake 4 removed that compatibility mode, so provide the supported floor
-    # without modifying the dependency's source tree.
-    if (CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND
-            NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
-        set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
-    endif ()
-
-    #
-    # MIMALLOC
-    #
-    if (TINYIO_USE_MIMALLOC)
-        set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-        set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-        set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
-        FetchContent_Declare(mimalloc
-                SYSTEM
-                GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
-                GIT_TAG v3.3.2 GIT_SHALLOW ON)
-        FetchContent_MakeAvailable(mimalloc)
-    endif ()
-
-    # openssl, min 3 required
-    find_package(OpenSSL 3 REQUIRED)
-    message(STATUS "OpenSSL: ${OPENSSL_VERSION}")
     find_package(Threads REQUIRED)
 
-    #
-    # LIBURING
-    #
-    # tinyio needs liburing >= 2.9 (io_uring_prep_ftruncate). Distributions lag, so the
-    # default is to build a pinned tag as a static library inside the build tree.
-    set(TINYIO_LIBURING_TAG liburing-2.9)
-    if (TINYIO_FETCH_LIBURING)
-        set(_lu_src ${CMAKE_BINARY_DIR}/_deps/liburing)
-        set(_lu_lib ${_lu_src}/src/liburing.a)
-        ExternalProject_Add(liburing_ext
-                GIT_REPOSITORY https://github.com/axboe/liburing.git
-                GIT_TAG ${TINYIO_LIBURING_TAG}
-                GIT_SHALLOW ON
-                SOURCE_DIR ${_lu_src}
-                BUILD_IN_SOURCE ON
-                UPDATE_DISCONNECTED ON
-                CONFIGURE_COMMAND ./configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
-                BUILD_COMMAND make -C src -j4 liburing.a
-                INSTALL_COMMAND ""
-                BUILD_BYPRODUCTS ${_lu_lib})
-        file(MAKE_DIRECTORY ${_lu_src}/src/include)
-        add_library(tinyio_liburing STATIC IMPORTED GLOBAL)
-        set_target_properties(tinyio_liburing PROPERTIES
-                IMPORTED_LOCATION ${_lu_lib}
-                INTERFACE_INCLUDE_DIRECTORIES ${_lu_src}/src/include)
-        add_dependencies(tinyio_liburing liburing_ext)
-        add_library(tinyio::liburing ALIAS tinyio_liburing)
-    else ()
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(LibUring REQUIRED IMPORTED_TARGET liburing>=2.9)
-        add_library(tinyio::liburing ALIAS PkgConfig::LibUring)
-    endif ()
-
-    #
-    # GTEST
-    #
-    if (TINYIO_BUILD_TESTS)
-        set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-        FetchContent_Declare(
-                googletest
-                SYSTEM
-                GIT_REPOSITORY https://github.com/google/googletest.git
-                GIT_TAG v1.17.0
-                GIT_SHALLOW TRUE)
-        FetchContent_MakeAvailable(googletest)
-    endif ()
+    tinyio_configure_liburing()
 
     #
     # YLT (yalantinglibs)
@@ -126,21 +64,125 @@ function(tinyio_configure_dependencies)
             GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(yalantinglibs)
 
-    add_library(tinyio::ylt ALIAS yalantinglibs)
+    #
+    # MIMALLOC
+    #
+    if (TINYIO_USE_MIMALLOC)
+        set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(mimalloc
+                SYSTEM
+                GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+                GIT_TAG v3.3.2 GIT_SHALLOW ON)
+        FetchContent_MakeAvailable(mimalloc)
+    endif ()
 
     #
-    # BENCHMARK
+    # GTEST
     #
-    if (TINYIO_BUILD_BENCH)
-        set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
-        set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-        set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    if (TINYIO_BUILD_TESTS)
+        set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
         FetchContent_Declare(
-                benchmark
+                googletest
                 SYSTEM
-                GIT_REPOSITORY https://github.com/google/benchmark.git
-                GIT_TAG v1.9.5
+                GIT_REPOSITORY https://github.com/google/googletest.git
+                GIT_TAG v1.17.0
                 GIT_SHALLOW TRUE)
-        FetchContent_MakeAvailable(benchmark)
+        FetchContent_MakeAvailable(googletest)
     endif ()
+
+    #
+    # GFLAGS
+    #
+    # Only the examples parse flags. gflags comes from the system (libgflags-dev
+    # in the toolchain image); it never reaches the library.
+    if (TINYIO_BUILD_EXAMPLES)
+        # gflags 2.2 only creates the namespaced target (gflags::gflags) when
+        # this is set before find_package.
+        set(GFLAGS_USE_TARGET_NAMESPACE TRUE)
+        find_package(gflags REQUIRED)
+    endif ()
+endfunction()
+
+# tinyio::liburing. tinyio needs liburing >= 2.9 (io_uring_prep_ftruncate) and
+# distributions lag, so the default is to build a pinned tag as a static
+# library inside the build tree. TINYIO_FETCH_LIBURING=OFF takes the system one
+# through pkg-config instead.
+#
+# The pinned copy is downloaded and configured while CMake configures, and
+# only liburing.a is left for the build. liburing's ./configure is what
+# generates part of its headers (compat.h, io_uring_version.h), so this way
+# <liburing.h> resolves right after a fresh configure: an IDE indexing the
+# project does not have to wait for a first build.
+function(tinyio_configure_liburing)
+    if (NOT TINYIO_FETCH_LIBURING)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(LibUring REQUIRED IMPORTED_TARGET GLOBAL liburing>=2.9)
+        add_library(tinyio::liburing INTERFACE IMPORTED GLOBAL)
+        target_link_libraries(tinyio::liburing INTERFACE PkgConfig::LibUring)
+        return ()
+    endif ()
+
+    FetchContent_Declare(
+            liburing
+            GIT_REPOSITORY https://github.com/axboe/liburing.git
+            GIT_TAG liburing-2.9
+            GIT_SHALLOW TRUE)
+    # liburing has no CMakeLists.txt, so this only downloads it.
+    FetchContent_MakeAvailable(liburing)
+
+    set(_src "${liburing_SOURCE_DIR}")
+    set(_lib "${_src}/src/liburing.a")
+    # A shared libtinyio.so absorbs liburing.a, which then has to be PIC.
+    if (TINYIO_BUILD_SHARED)
+        set(_cflags "LIBURING_CFLAGS=-fPIC")
+    else ()
+        set(_cflags "")
+    endif ()
+
+    find_program(TINYIO_MAKE NAMES gmake make REQUIRED)
+
+    # Start over when the compilers or the flags change: ./configure records
+    # the compilers in config-host.mak, and a liburing.a built without -fPIC
+    # cannot go into a shared library. The stamp is also a dependency of the
+    # build step below, so liburing.a is rebuilt along with it.
+    set(_stamp "${_src}/.tinyio-configured")
+    set(_want "${CMAKE_C_COMPILER};${CMAKE_CXX_COMPILER};${_cflags}")
+    set(_have "")
+    if (EXISTS "${_stamp}")
+        file(READ "${_stamp}" _have)
+    endif ()
+    if (NOT _have STREQUAL _want)
+        message(STATUS "Configuring liburing")
+        if (EXISTS "${_src}/config-host.mak")
+            execute_process(COMMAND "${TINYIO_MAKE}" -C src clean
+                    WORKING_DIRECTORY "${_src}" OUTPUT_QUIET)
+        endif ()
+        execute_process(
+                COMMAND ./configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
+                WORKING_DIRECTORY "${_src}"
+                RESULT_VARIABLE _rc
+                OUTPUT_QUIET)
+        if (NOT _rc EQUAL 0)
+            message(FATAL_ERROR "liburing ./configure failed (${_rc})")
+        endif ()
+        file(WRITE "${_stamp}" "${_want}")
+    endif ()
+
+    add_custom_command(
+            OUTPUT "${_lib}"
+            COMMAND "${TINYIO_MAKE}" -C src -j4 ${_cflags} liburing.a
+            DEPENDS "${_stamp}"
+            WORKING_DIRECTORY "${_src}"
+            COMMENT "Building liburing.a"
+            VERBATIM)
+    add_custom_target(tinyio_liburing_build DEPENDS "${_lib}")
+
+    add_library(tinyio::liburing STATIC IMPORTED GLOBAL)
+    set_target_properties(tinyio::liburing PROPERTIES
+            IMPORTED_LOCATION "${_lib}"
+            INTERFACE_INCLUDE_DIRECTORIES "${_src}/src/include")
+    add_dependencies(tinyio::liburing tinyio_liburing_build)
 endfunction()

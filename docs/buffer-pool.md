@@ -1,5 +1,13 @@
 # The fixed buffer pool: one runtime, one pool
 
+> **Superseded in part.** Written 2026-10-24, when the runtime had exactly one
+> pool. The multiclass change (commit `7c835bd`) went back to a list of size
+> classes: `IoOptions::buffer_pools` is a vector, and
+> `TakeFixedBuffer(slot_size)` / `AcquireFixedBuffer(slot_size)` pick the
+> class. Section 1's argument for the single-pool shape no longer applies;
+> the mechanics below (chunked registration, FIFO handover, shutdown
+> behaviour) still describe each pool correctly.
+
 Status: **LIVING DOCUMENT** — written 2026-10-24, right after the port from
 kio landed, while the reasoning was still fresh. Code:
 `src/tinyio/runtime/buffer_pool.{hpp,cc}`,

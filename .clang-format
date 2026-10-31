@@ -1,16 +1,39 @@
 ---
 Language: Cpp
 BasedOnStyle: Google
-ColumnLimit: 90
+Standard: Latest
+
+ColumnLimit: 100
+IndentWidth: 4
+AccessModifierOffset: -4
 DerivePointerAlignment: false
+IndentPPDirectives: AfterHash
+
+# Every body gets braces and its own line: no `if (x) return;` that the next
+# edit silently turns into a two-statement body.
+InsertBraces: true
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Include groups, in order: the file's own header (clang-format finds it),
+# C system, C++ standard library, third-party, tinyio, other local headers.
+# The first matching rule wins.
 IncludeBlocks: Regroup
 IncludeCategories:
-  - Regex: '^<.*/' # Like <boost/lexical_cast.hpp>
+  # liburing.h would otherwise pass for a C system header.
+  - Regex: '^<liburing'
     Priority: 3
-  - Regex: '^<.*\.' # Like <fcntl.h>
+  # <fcntl.h>, <sys/eventfd.h>, <linux/futex.h>
+  - Regex: '^<([a-z0-9_]+|sys/.+|linux/.+|arpa/.+|netinet/.+|net/.+)\.h>$'
     Priority: 1
-  - Regex: '^<' # Like <vector>
+  # <vector>
+  - Regex: '^<[a-z0-9_]+>$'
     Priority: 2
-  - Regex: '^"' # Like "util/auth-util.h"
+  # tinyio itself, in either spelling.
+  - Regex: '^[<"]tinyio/'
     Priority: 4
-IndentPPDirectives: AfterHash
+  # <ylt/easylog.hpp>, <gtest/gtest.h>, <gflags/gflags.h>
+  - Regex: '^<'
+    Priority: 3
+  - Regex: '^"'
+    Priority: 5

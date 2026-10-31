@@ -18,8 +18,8 @@
 // Always brace the call site:
 //   if (a) { CHECK(cond); } else { g(); }
 #ifndef CHECK
-#  define CHECK(cond) \
-    if (cond) {       \
-    } else            \
-      ELOG(FATAL) << "Check failed: " #cond << " "
+#    define CHECK(cond) \
+        if (cond) {     \
+        } else          \
+            ELOG(FATAL) << "Check failed: " #cond << " "
 #endif
