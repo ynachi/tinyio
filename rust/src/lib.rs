@@ -65,6 +65,7 @@ mod cx;
 mod detail;
 mod fs;
 mod io;
+pub mod net;
 mod options;
 mod remote;
 mod ring;

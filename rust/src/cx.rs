@@ -9,6 +9,7 @@
 use std::ffi::CString;
 use std::io;
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -22,6 +23,8 @@ use io_uring::types::{Fd, Timespec};
 use crate::check::check;
 use crate::detail::fiber::{FiberId, FiberState, WaitKind};
 use crate::fs::OpenOptions;
+use crate::net::PollEvents;
+use crate::net::addr::{self, RawAddr};
 use crate::ring::{Completion, UserData};
 use crate::sched::Sched;
 
@@ -210,6 +213,111 @@ impl Cx {
         unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
     }
 
+    /// Accept a connection, parking the fiber until one arrives. The new
+    /// descriptor is close-on-exec; wrap it with `TcpStream::from`.
+    ///
+    /// The listener is borrowed while the call is parked, so it cannot be closed
+    /// under it:
+    ///
+    /// ```compile_fail,E0505
+    /// use tinyio::net::TcpListener;
+    /// let mut io = tinyio::Io::new(Default::default()).unwrap();
+    /// io.spawn(|cx| {
+    ///     let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    ///     tinyio::scope(cx, |s| {
+    ///         s.spawn(|c| { let _ = c.accept(&l); }).unwrap();
+    ///         drop(l); // closes the fd the child is parked on
+    ///     });
+    /// }).unwrap();
+    /// io.run_until_done();
+    /// ```
+    /// ```
+    /// use tinyio::net::TcpListener;
+    /// let mut io = tinyio::Io::new(Default::default()).unwrap();
+    /// io.spawn(|cx| {
+    ///     let l = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    ///     tinyio::scope(cx, |s| {
+    ///         s.spawn(|c| { let _ = c.timeout(std::time::Duration::from_millis(1)).accept(&l); }).unwrap();
+    ///     });
+    ///     drop(l); // the twin: dropped after the scope has joined
+    /// }).unwrap();
+    /// io.run_until_done();
+    /// ```
+    pub fn accept(&self, listener: &impl AsFd) -> io::Result<OwnedFd> {
+        self.accept_with(listener, None).map(|(fd, _)| fd)
+    }
+
+    /// [`accept`](Self::accept), also returning the peer's address.
+    pub fn accept_addr(&self, listener: &impl AsFd) -> io::Result<(OwnedFd, SocketAddr)> {
+        let (fd, peer) = self.accept_with(listener, None)?;
+        peer.map(|peer| (fd, peer))
+            .ok_or_else(|| errno(libc::EAFNOSUPPORT))
+    }
+
+    fn accept_with(
+        &self,
+        listener: &impl AsFd,
+        timeout: Option<Duration>,
+    ) -> io::Result<(OwnedFd, Option<SocketAddr>)> {
+        let mut raw = RawAddr::zeroed();
+        let mut len = size_of::<RawAddr>() as libc::socklen_t;
+        let entry = opcode::Accept::new(
+            Fd(listener.as_fd().as_raw_fd()),
+            raw.bytes.as_mut_ptr().cast(),
+            &raw mut len,
+        )
+        .flags(libc::SOCK_CLOEXEC)
+        .build();
+        // SAFETY: `raw` and `len` are locals of this frame, alive across the
+        // call; `listener` is borrowed, so it stays open.
+        let fd = unsafe { self.syscall(&entry, timeout) }?;
+        // SAFETY: a successful accept returns a fresh descriptor that nothing
+        // else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+        Ok((fd, addr::decode(&raw, len)))
+    }
+
+    /// Connect a socket to `addr`, parking the fiber until the handshake is
+    /// done. See `TcpStream::connect` for the usual way in.
+    pub fn connect(&self, socket: &impl AsFd, addr: &SocketAddr) -> io::Result<()> {
+        self.connect_with(socket, addr, None)
+    }
+
+    fn connect_with(
+        &self,
+        socket: &impl AsFd,
+        addr: &SocketAddr,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        let (raw, len) = addr::encode(addr);
+        let entry = opcode::Connect::new(
+            Fd(socket.as_fd().as_raw_fd()),
+            raw.bytes.as_ptr().cast(),
+            len,
+        )
+        .build();
+        // SAFETY: `raw` is a local of this frame, alive across the call;
+        // `socket` is borrowed, so it stays open.
+        unsafe { self.syscall(&entry, timeout) }.map(drop)
+    }
+
+    /// Wait until `fd` is ready for any of `events`; returns the events that
+    /// are ready (`ERR` and `HUP` can be set without being asked for).
+    pub fn poll(&self, fd: &impl AsFd, events: PollEvents) -> io::Result<PollEvents> {
+        self.poll_with(fd, events, None)
+    }
+
+    fn poll_with(
+        &self,
+        fd: &impl AsFd,
+        events: PollEvents,
+        timeout: Option<Duration>,
+    ) -> io::Result<PollEvents> {
+        let entry = opcode::PollAdd::new(Fd(fd.as_fd().as_raw_fd()), events.bits()).build();
+        // SAFETY: the entry carries no pointers; `fd` is borrowed across the call.
+        unsafe { self.syscall(&entry, timeout) }.map(PollEvents::from_bits)
+    }
+
     /// `openat(2)` relative to the current directory.
     pub fn open(&self, path: impl AsRef<Path>, opts: &OpenOptions) -> io::Result<OwnedFd> {
         let flags = opts.flags()?;
@@ -293,6 +401,30 @@ impl Timed<'_> {
     /// [`Cx::write`] with the deadline.
     pub fn write(&self, fd: &impl AsFd, buf: &[u8], offset: Option<u64>) -> io::Result<usize> {
         self.cx.write_with(fd, buf, offset, Some(self.d))
+    }
+
+    /// [`Cx::accept`] with the deadline.
+    pub fn accept(&self, listener: &impl AsFd) -> io::Result<OwnedFd> {
+        self.cx
+            .accept_with(listener, Some(self.d))
+            .map(|(fd, _)| fd)
+    }
+
+    /// [`Cx::accept_addr`] with the deadline.
+    pub fn accept_addr(&self, listener: &impl AsFd) -> io::Result<(OwnedFd, SocketAddr)> {
+        let (fd, peer) = self.cx.accept_with(listener, Some(self.d))?;
+        peer.map(|peer| (fd, peer))
+            .ok_or_else(|| errno(libc::EAFNOSUPPORT))
+    }
+
+    /// [`Cx::connect`] with the deadline.
+    pub fn connect(&self, socket: &impl AsFd, addr: &SocketAddr) -> io::Result<()> {
+        self.cx.connect_with(socket, addr, Some(self.d))
+    }
+
+    /// [`Cx::poll`] with the deadline.
+    pub fn poll(&self, fd: &impl AsFd, events: PollEvents) -> io::Result<PollEvents> {
+        self.cx.poll_with(fd, events, Some(self.d))
     }
 }
 

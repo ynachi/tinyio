@@ -18,7 +18,9 @@ unsafe budget (section 5) and the build stages (section 9). The C++ runtime in
 | 3. Sync primitives (`Mutex<T>`, `Semaphore`, `Latch`, `Baton`), `scope` | done |
 | 4. `Remote`, `post`, `stop`, `run`, full shutdown | done |
 | 5. Timeouts (`Cx::timeout`, timer wheel) | done |
-| 6-8 | see the plan |
+| 6. Net (`net::TcpListener`/`TcpStream`, `accept`/`connect`/`poll`, `std::io` adapter, examples 01-05) | done |
+| 7. Fixed buffers (optional) | next |
+| 8. Hardening (aarch64 hardware, sanitizers) | see the plan |
 
 ## Commands
 
@@ -26,6 +28,7 @@ unsafe budget (section 5) and the build stages (section 9). The C++ runtime in
 make dev        # clippy + gate + tests: what a stage must pass before review
 make miri       # nightly: queue / double-push tests under Miri
 make bench      # context-switch bench (release)
+cargo run --example 01_hello_echo -- --port=8080   # the five examples are in examples/
 scripts/ab.sh pingpong   # paired A/B against the C++ build (also: context_switch, sync, post); see the script header
 make docker-test
 ```

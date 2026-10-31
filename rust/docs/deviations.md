@@ -96,6 +96,16 @@ strict mode rejects by definition.
 
 **24. Timeout accuracy and cost.** The wait bound is the end of the nearest occupied 64 ms slot, so a timeout (a zero one included) fires up to one slot late; while stopping, expiry does nothing and the drain's cancel owns every op, so a stopped op is `ECANCELED`. A 30 s timeout on every op adds 245 ns per 4-op ping-pong round trip (C++: 335 ns); paired 0.961 against C++.
 
+## Stage 6
+
+**25. `net/sockopt.rs` joins the unsafe budget.** Socket creation, `setsockopt`, `bind` and `listen` need `libc`, and std cannot set `SO_REUSEPORT` or a backlog; the plan said `net/` calls only safe code. The address codec, listener and stream are `forbid(unsafe_code)`.
+
+**26. Smaller than the C++ net layer, on purpose.** `SO_SNDBUF`/`SO_RCVBUF` setters are not ported, and the examples take `--name=value` flags and end on `--seconds` or an accept timeout instead of SIGINT handlers (no `unsafe` means no signal handler without a dependency).
+
+**27. HTTP throughput is 2 to 4% behind C++, cause unknown.** Measured with a throwaway load generator (32 keep-alive connections, 2 workers on 2 cores, load on the other 2, distinct port per run): Rust 215k and 222k req/s against C++ 222k and 224k, paired 0.962 and 0.976 over 2 x 15 rounds, faster in 5/15 each time. Not batching (about 0.13 `io_uring_enter` per request in both), and not cache aliasing of the fiber headers (stack colouring tested: 0.980 and 1.022, no effect, reverted).
+
+**28. The IPv6 integration test skips where there is no IPv6 loopback** (this sandbox has none); the sockaddr codec's unit tests pin the v6 layout and length everywhere.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had
