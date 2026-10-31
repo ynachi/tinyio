@@ -63,13 +63,16 @@
 mod check;
 mod cx;
 mod detail;
+mod fs;
 mod io;
 mod options;
+mod ring;
 mod sched;
 #[cfg(test)]
 mod testutil;
 
 pub use crate::cx::{Cx, is_cancelled};
 pub use crate::detail::fiber::FiberId;
+pub use crate::fs::OpenOptions;
 pub use crate::io::Io;
 pub use crate::options::Options;

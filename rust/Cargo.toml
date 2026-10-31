@@ -24,6 +24,10 @@ tracing = ["dep:tracing"]
 name = "context_switch"
 harness = false
 
+[[bench]]
+name = "pingpong"
+harness = false
+
 [profile.release]
 debug = 1
 lto = "thin"

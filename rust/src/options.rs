@@ -19,6 +19,9 @@ pub struct Options {
     pub max_idle_fibers: usize,
     /// Most fibers resumed per tick before the loop submits and reaps.
     pub batch_max_size: usize,
+    /// io_uring submission queue entries (the kernel rounds up to a power of
+    /// two). The completion queue is twice this.
+    pub sq_entries: u32,
 }
 
 impl Default for Options {
@@ -28,6 +31,7 @@ impl Default for Options {
             guard_size: 64 * 1024,
             max_idle_fibers: 1024,
             batch_max_size: 128,
+            sq_entries: 4096,
         }
     }
 }
@@ -39,6 +43,7 @@ pub(crate) struct Validated {
     pub guard_size: usize,
     pub max_idle_fibers: usize,
     pub batch_max_size: usize,
+    pub sq_entries: u32,
 }
 
 use crate::detail::stack::page_size;
@@ -51,6 +56,9 @@ impl Options {
         }
         if self.batch_max_size == 0 {
             return Err(invalid("batch_max_size must be at least 1"));
+        }
+        if self.sq_entries < 2 {
+            return Err(invalid("sq_entries must be at least 2"));
         }
         let round = |v: usize| {
             v.checked_add(page - 1)
@@ -67,6 +75,7 @@ impl Options {
             guard_size,
             max_idle_fibers: self.max_idle_fibers,
             batch_max_size: self.batch_max_size,
+            sq_entries: self.sq_entries,
         })
     }
 }

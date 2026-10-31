@@ -1,0 +1,65 @@
+# Deviations from `architecture-plan.md`
+
+Where the implementation departs from the plan, why, and the evidence. The plan
+stays as written; this file is the errata.
+
+## Stage 2
+
+**1. The `GETEVENTS` submit is a plain enter, not a zero-timeout wait.**
+The plan (section 6, "`GETEVENTS` and cancels") says a runnable tick should call
+`submit_with_args(1, &SubmitArgs::new().timespec(&ZERO))` and treat `ETIME` as
+success. Measured on Linux 6.18, one call each, `DEFER_TASKRUN` ring:
+
+| call | ns/call |
+|------|---------|
+| `submit_with_args(1, zero timespec)` | 22,672 |
+| `enter(len, 0, GETEVENTS)` (what liburing's `io_uring_submit_and_get_events` does) | 122 |
+| `getpid()` | 101 |
+
+Waiting for one CQE with a zero timeout is a real sleep/wake cycle. In the
+context-switch bench it made a yield 108 ns instead of 15 ns (one tick per 128
+resumes, so ~22 us per tick). `Ring::submit(true)` therefore calls the crate's
+`Submitter::enter` (unsafe, inside `ring.rs`, which is in the unsafe budget) with
+`min_complete = 0` and `IORING_ENTER_GETEVENTS`. Cost: one `unsafe` block.
+
+`tests/io.rs::completion_is_reaped_while_the_loop_stays_runnable` guards the
+behaviour (a CQE landing while other fibers stay ready is reaped promptly), but
+it cannot distinguish this from the crate's plain `submit()`: `io-uring` 0.7.15's
+`submit()` also adds `GETEVENTS` when the `TASKRUN` flag is already visible, and
+in a single-threaded test it always is. The explicit form matters only when a
+completion races the syscall.
+
+**2. Drain cancel is `CancelBuilder::any().all()`.** The plan says `any()` is
+enough. On Linux 6.18 it is (the kernel treats `ANY` as "all matches"; verified
+with 3 pending reads and a timeout). `all()` is kept to mirror the C++
+`ALL | ANY` and so the intent does not rest on that detail.
+
+**3. The ring lives in `Sched`, not beside it.** `Cx` holds the scheduler handle
+and nothing else (Rule 13), and `Cx::syscall` needs the ring, so `Sched` owns
+`Ring`. It stays a separate type (`ring.rs`), opened by `Io::new`, closed by
+`Io::drop` before the stacks are freed (never in `Sched::drop`).
+
+**4. The ring is enabled in `Io::new`.** The plan enables it on the thread that
+calls `run`. `Io` is `!Send`, so that is the creating thread, and `SINGLE_ISSUER`
+binds to it either way.
+
+**5. `ring.reap` copies CQEs to a stack batch and handles them after the borrow
+of the `IoUring` has ended**, so the callback can never re-enter the ring (Rule 5
+by construction rather than by care).
+
+**6. `Cx::open` takes a `tinyio::OpenOptions`** (a mirror of `std::fs::OpenOptions`
+with the same validation) instead of raw `libc::O_*` bits.
+
+**7. `close` consumes the `OwnedFd`.** If the call is refused before reaching the
+kernel (`ECANCELED`, `ENOSPC`) the fd is dropped, which closes it synchronously;
+otherwise the kernel owns the close and the fd is forgotten.
+
+**8. Miri runs with `-Zmiri-permissive-provenance`.** The plan requires
+`expose_provenance` / `with_exposed_provenance` for `user_data`, which Miri's
+strict mode rejects by definition.
+
+## Process note
+
+A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had
+reflowed the text the edit targeted, so the replace was a silent no-op. Mutation
+checks now assert the edit applied (`grep -c`) before trusting the result.

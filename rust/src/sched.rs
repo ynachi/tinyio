@@ -21,12 +21,17 @@ use std::io;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use io_uring::opcode;
+use io_uring::squeue::Entry;
+use io_uring::types::CancelBuilder;
+
 use crate::check::{check, dcheck, fatal};
 use crate::cx::Cx;
 use crate::detail::context::{self, Context};
 use crate::detail::fiber::{FiberHeader, FiberId, FiberState, TaskOps, WaitKind};
 use crate::detail::stack::Stack;
 use crate::options::Validated;
+use crate::ring::{Ring, UserData};
 
 /// Closures needing more alignment than the header are refused.
 const MAX_TASK_ALIGN: usize = 64;
@@ -102,6 +107,11 @@ pub(crate) struct Sched {
     /// Spawned and not yet finished (never-started ones count).
     live: Cell<usize>,
     next_id: Cell<u64>,
+    ring: Ring,
+    /// Invariant 11: once set, `syscall`, `yield_now` and `spawn` fail with
+    /// `ECANCELED` before touching anything, so a drain only ever shrinks
+    /// `inflight`. Sticky: a stopped runtime does not restart.
+    stopping: Cell<bool>,
     opts: Validated,
 }
 
@@ -116,18 +126,41 @@ impl Sched {
             registry: Cell::new(Vec::new()),
             live: Cell::new(0),
             next_id: Cell::new(1),
+            ring: Ring::closed(),
+            stopping: Cell::new(false),
             opts,
         })
+    }
+
+    /// Create the ring. Called by `Io::new` on the thread that will run the loop.
+    pub(crate) fn open_ring(&self) -> io::Result<()> {
+        self.ring.open(self.opts.sq_entries)
     }
 
     pub(crate) fn opts(&self) -> &Validated {
         &self.opts
     }
 
-    /// Invariant 9: nothing ready (and, from stage 2 on, nothing in flight and
-    /// nothing posted). Live fibers do not count.
+    /// Invariant 9: nothing ready, nothing in flight (and, from stage 4,
+    /// nothing posted). Live fibers do not count: one parked on a sync
+    /// primitive waits for no completion either. The one function the tick and
+    /// the drain both use.
     pub(crate) fn quiesced(&self) -> bool {
-        self.ready.is_empty()
+        self.ready.is_empty() && self.ring.inflight() == 0
+    }
+
+    pub(crate) fn inflight(&self) -> usize {
+        self.ring.inflight()
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.get()
+    }
+
+    /// Start shutting down (invariant 11). Never undone.
+    #[cfg_attr(not(test), allow(dead_code))] // `Io::run` calls it from stage 4
+    pub(crate) fn begin_stop(&self) {
+        self.stopping.set(true);
     }
 
     // ---------------------------------------------------------------- spawn
@@ -136,6 +169,9 @@ impl Sched {
     where
         F: FnOnce(&Cx) + 'static,
     {
+        if self.stopping.get() {
+            return Err(io::Error::from_raw_os_error(libc::ECANCELED));
+        }
         let size = size_of::<F>();
         let align = align_of::<F>();
         if align > MAX_TASK_ALIGN {
@@ -303,7 +339,6 @@ impl Sched {
 
     /// Park the running fiber until `unpark(.., kind)`. Rule 3: only the
     /// primitive named by `kind` may wake it.
-    #[allow(dead_code)] // first callers land in stage 3 (sync); tested here
     pub(crate) fn park(&self, kind: WaitKind) {
         let hdr = self.current();
         // SAFETY: the running fiber is live.
@@ -351,6 +386,98 @@ impl Sched {
         // fiber gets a fresh frame from `make`.
         unsafe { context::switch(&h.context, &self.sched_ctx) };
         fatal(format_args!("finished fiber {} was resumed", h.id.get()))
+    }
+
+    // ------------------------------------------------------------------ I/O
+
+    /// Queue one counted SQE for the running fiber's op or a cancel. If the SQ
+    /// is full, submit what is queued so the kernel consumes entries, and try
+    /// once more; still full is `ENOSPC`. (Reaping would not help: it frees CQ
+    /// space, not SQ slots.)
+    ///
+    /// # Safety
+    /// As [`Ring::push`]: the entry's pointers stay valid until its CQE.
+    pub(crate) unsafe fn push_sqe(&self, entry: &Entry, ud: UserData) -> io::Result<()> {
+        // SAFETY: forwarded from this fn's contract.
+        if unsafe { self.ring.push(entry, ud) }.is_ok() {
+            return Ok(());
+        }
+        self.ring.submit(false, || {
+            self.reap();
+        })?;
+        // SAFETY: as above.
+        unsafe { self.ring.push(entry, ud) }.map_err(|_| io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+
+    /// Reap completions: each one wakes the fiber that owns it. Reaping only
+    /// marks fibers ready, so it is safe from inside a fiber too.
+    pub(crate) fn reap(&self) -> usize {
+        self.ring.reap(|hdr| self.wake_io(hdr))
+    }
+
+    /// A CQE ends an I/O wait, and only a CQE does (Rule 3). The fiber must be
+    /// parked on `Io` (Rule 13); anything else aborts.
+    fn wake_io(&self, hdr: Hdr) {
+        // SAFETY: the CQE's fiber is parked in its `syscall` frame, so live.
+        let h = unsafe { hdr.as_ref() };
+        if h.state.get() != FiberState::Waiting || h.wait.get() != WaitKind::Io {
+            fatal(format_args!(
+                "CQE for fiber {} which is {:?}/{}, not waiting on I/O (Rule 13)",
+                h.id.get(),
+                h.state.get(),
+                h.wait.get().name()
+            ));
+        }
+        self.push_ready(hdr);
+    }
+
+    /// Test hook: hand queued SQEs to the kernel without waiting for anything.
+    #[cfg(test)]
+    pub(crate) fn submit_now(&self) {
+        self.ring
+            .submit(false, || {
+                self.reap();
+            })
+            .unwrap();
+    }
+
+    /// Phase 2 of the tick: submit, and block in the kernel only when nothing
+    /// is runnable (invariant 8). A runnable tick still enters the kernel with
+    /// `GETEVENTS` so deferred completion work runs (see `Ring::submit`).
+    pub(crate) fn submit_or_wait(&self) -> io::Result<()> {
+        let runnable = self.ring.cq_ready() || !self.ready.is_empty();
+        let reap = || {
+            self.reap();
+        };
+        if runnable {
+            self.ring.submit(true, reap)
+        } else {
+            self.ring.wait(None, reap)
+        }
+    }
+
+    /// Cancel everything in flight with ONE SQE and submit it now (invariant
+    /// 7). `any().all()` is `ASYNC_CANCEL_ANY | ASYNC_CANCEL_ALL`, as in the
+    /// C++: ANY matches whatever the `user_data`. (On this kernel ANY alone
+    /// already cancels every match, which the plan relies on; ALL is kept so the
+    /// intent does not depend on that.) `false` if the SQE could not be queued;
+    /// the caller retries.
+    #[cfg_attr(not(test), allow(dead_code))] // `Io::run` calls it from stage 4
+    pub(crate) fn try_cancel_all(&self) -> bool {
+        let entry = opcode::AsyncCancel2::new(CancelBuilder::any().all()).build();
+        // SAFETY: the cancel entry carries no pointers.
+        let queued = unsafe { self.push_sqe(&entry, UserData::Cancel) };
+        if let Err(e) = queued {
+            crate::check::error(format_args!("cancel SQE not queued: {e}"));
+            return false;
+        }
+        if let Err(e) = self.ring.submit(false, || {
+            self.reap();
+        }) {
+            // Queued, so it goes out with the next submit; the loop retries.
+            crate::check::error(format_args!("cancel submit failed: {e}"));
+        }
+        true
     }
 
     // ----------------------------------------------------- recycle and free
@@ -456,7 +583,15 @@ impl Sched {
     /// one is unfinished (the seatbelt, section 6 "Shutdown"). Closures of
     /// never-started fibers are dropped without running.
     pub(crate) fn teardown(&self) {
+        check!(
+            self.ring.inflight() == 0,
+            "Io dropped with {} operation(s) still in flight: the kernel would keep \
+             pointers into freed stacks (invariant 2). Run `run_until_done` first",
+            self.ring.inflight()
+        );
         self.abort_if_started_live("Io dropped");
+        // Ring first: after this the kernel holds nothing of ours.
+        self.ring.close();
         self.ready.forget_all();
         self.idle_head.set(None);
         self.idle_len.set(0);

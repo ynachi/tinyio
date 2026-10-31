@@ -45,7 +45,7 @@ fn main() {
     let rounds = arg("--rounds", 5);
     let mut results: Vec<f64> = (0..rounds).map(|_| one_round(iters)).collect();
     for r in &results {
-        println!("ns_per_switch={r:.3}");
+        println!("ns_per_op={r:.3}");
     }
     results.sort_by(|a, b| a.total_cmp(b));
     println!("median ns/switch: {:.3}", results[results.len() / 2]);

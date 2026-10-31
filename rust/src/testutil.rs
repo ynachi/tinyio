@@ -33,3 +33,16 @@ pub(crate) fn death_test(name: &str, body: fn(), expect: &[&str]) {
         );
     }
 }
+
+/// Abort the process if a test binary runs for more than 60 s: a hung drain
+/// would otherwise stall `cargo test` forever.
+pub(crate) fn watchdog() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            eprintln!("watchdog: unit tests still running after 60s, aborting (hang?)");
+            std::process::abort();
+        });
+    });
+}

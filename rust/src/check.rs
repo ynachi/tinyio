@@ -17,6 +17,12 @@ pub(crate) fn fatal(msg: fmt::Arguments<'_>) -> ! {
     std::process::abort()
 }
 
+/// Report a recoverable problem on stderr (a failed tick, say). tinyio has no
+/// logger of its own yet; Rule 9 keeps `tracing` spans out of fibers.
+pub(crate) fn error(msg: fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr().lock(), "tinyio: error: {msg}");
+}
+
 /// `check!(cond, "fmt", args..)`: abort with a message when `cond` is false.
 /// Always on, including in release builds.
 macro_rules! check {

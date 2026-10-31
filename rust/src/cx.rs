@@ -1,22 +1,50 @@
-#![forbid(unsafe_code)]
 //! `Cx`: what a fiber holds. It carries the scheduler handle and nothing else
 //! (Rule 13: a fiber's identity is `sched.current`, never the `Cx` it was
 //! given, so a scoped child may legally hold its parent's `&Cx`).
 //!
-//! The unsafe budget lists `cx.rs` for stage 2's `syscall`; stage 1 has none.
+//! Every I/O call goes through [`Cx::syscall`], the one path an SQE takes
+//! from a fiber. `unsafe` is confined to that path and the thin typed wrappers
+//! over it, each of which borrows its buffer for the whole blocking call.
 
+use std::ffi::CString;
 use std::io;
 use std::marker::PhantomData;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
-use crate::detail::fiber::FiberId;
+use io_uring::opcode;
+use io_uring::squeue::Entry;
+use io_uring::types::{Fd, Timespec};
+
+use crate::check::check;
+use crate::detail::fiber::{FiberId, FiberState, WaitKind};
+use crate::fs::OpenOptions;
+use crate::ring::{Completion, UserData};
 use crate::sched::Sched;
 
 /// Marker that makes a type `!Send + !Sync` (Rule 1).
 pub(crate) type NotSend = PhantomData<*const ()>;
 
-/// The handle a fiber uses to reach its runtime: spawn, yield, and (from
-/// stage 2) perform I/O. `!Send`: it never leaves the thread of its `Io`.
+/// The kernel's cap on one read or write; longer buffers get a short count.
+const MAX_RW_LEN: usize = 0x7fff_f000;
+
+fn errno(code: i32) -> io::Error {
+    io::Error::from_raw_os_error(code)
+}
+
+/// Why a `syscall` failed, and whether the SQE ever reached the ring. A
+/// descriptor handed to a refused `close` is still ours; one handed to a close
+/// that ran is gone.
+struct Failed {
+    err: io::Error,
+    submitted: bool,
+}
+
+/// The handle a fiber uses to reach its runtime: spawn, yield and perform
+/// I/O. `!Send`: it never leaves the thread of its `Io`.
 pub struct Cx {
     sched: Rc<Sched>,
     _p: NotSend,
@@ -37,7 +65,8 @@ impl Cx {
 
     /// Start another fiber on this thread. It runs after the current one
     /// next suspends. `f` must own everything it uses (`'static`); it cannot
-    /// capture this `Cx`, and receives its own.
+    /// capture this `Cx`, and receives its own. `ECANCELED` once the runtime
+    /// is shutting down.
     pub fn spawn<F>(&self, f: F) -> io::Result<FiberId>
     where
         F: FnOnce(&Cx) + 'static,
@@ -46,9 +75,171 @@ impl Cx {
     }
 
     /// Give the thread to other ready fibers; resume after they have had a turn.
+    /// `ECANCELED` once the runtime is shutting down (invariant 11), so a
+    /// loop that checks the result ends.
     pub fn yield_now(&self) -> io::Result<()> {
+        if self.sched.stopping() {
+            return Err(errno(libc::ECANCELED));
+        }
         self.sched.yield_current();
         Ok(())
+    }
+
+    /// The one path every I/O call takes (invariants 1, 2, 3, 11):
+    ///
+    /// 1. refuse with `ECANCELED` if the runtime is stopping, touching nothing;
+    /// 2. queue the SQE (if the SQ is full, submit and try once more);
+    /// 3. park on `WaitKind::Io`: the `Completion` below stays on this stack
+    ///    until the CQE arrives, and nothing else can resume the fiber;
+    /// 4. map a negative result to an `io::Error`.
+    ///
+    /// `Failed::submitted` says whether step 2 succeeded.
+    ///
+    /// # Safety
+    /// Every pointer inside `entry` must stay valid until this call returns.
+    /// Callers pass pointers into data they borrow across the call: the fiber
+    /// is parked until the CQE, so the borrow outlives the kernel's use.
+    unsafe fn syscall_ex(&self, entry: &Entry) -> Result<u32, Failed> {
+        let not_submitted = |err| Failed {
+            err,
+            submitted: false,
+        };
+        let sched = &*self.sched;
+        if sched.stopping() {
+            return Err(not_submitted(errno(libc::ECANCELED)));
+        }
+        let me = sched.current();
+        // SAFETY: the running fiber's header is live.
+        let state = unsafe { me.as_ref() }.state.get();
+        check!(
+            state == FiberState::Running,
+            "syscall from a non-running fiber (invariant 1)"
+        );
+
+        let completion = Completion::new(me);
+        let ud = UserData::Fiber(std::ptr::NonNull::from(&completion));
+        // SAFETY: pointer validity is this fn's contract; `completion` lives
+        // in this frame, which does not return before the CQE (park below).
+        unsafe { sched.push_sqe(entry, ud) }.map_err(not_submitted)?;
+
+        sched.park(WaitKind::Io);
+
+        let res = completion.result();
+        if res < 0 {
+            Err(Failed {
+                err: errno(-res),
+                submitted: true,
+            })
+        } else {
+            Ok(res.unsigned_abs())
+        }
+    }
+
+    /// [`syscall_ex`](Self::syscall_ex) for callers that only want the error.
+    ///
+    /// # Safety
+    /// As `syscall_ex`.
+    unsafe fn syscall(&self, entry: &Entry) -> io::Result<u32> {
+        // SAFETY: forwarded.
+        unsafe { self.syscall_ex(entry) }.map_err(|f| f.err)
+    }
+
+    /// `read(2)` at `offset`, or at the file position when `None`. May return
+    /// fewer bytes than `buf.len()` (always at most 0x7fff_f000). `Ok(0)` is
+    /// end of file.
+    pub fn read(&self, fd: &impl AsFd, buf: &mut [u8], offset: Option<u64>) -> io::Result<usize> {
+        let off = file_offset(offset)?;
+        let len = buf.len().min(MAX_RW_LEN) as u32;
+        let entry = opcode::Read::new(Fd(fd.as_fd().as_raw_fd()), buf.as_mut_ptr(), len)
+            .offset(off)
+            .build();
+        // SAFETY: `buf` is borrowed for this whole call and the fiber is
+        // parked until the CQE, so the kernel's writes land in live memory;
+        // `fd` is borrowed too, so it stays open.
+        unsafe { self.syscall(&entry) }.map(|n| n as usize)
+    }
+
+    /// `write(2)` at `offset`, or at the file position when `None`. May write
+    /// fewer bytes than `buf.len()`.
+    pub fn write(&self, fd: &impl AsFd, buf: &[u8], offset: Option<u64>) -> io::Result<usize> {
+        let off = file_offset(offset)?;
+        let len = buf.len().min(MAX_RW_LEN) as u32;
+        let entry = opcode::Write::new(Fd(fd.as_fd().as_raw_fd()), buf.as_ptr(), len)
+            .offset(off)
+            .build();
+        // SAFETY: as in `read`: `buf` and `fd` are borrowed across the call.
+        unsafe { self.syscall(&entry) }.map(|n| n as usize)
+    }
+
+    /// `openat(2)` relative to the current directory.
+    pub fn open(&self, path: impl AsRef<Path>, opts: &OpenOptions) -> io::Result<OwnedFd> {
+        let flags = opts.flags()?;
+        let c_path = CString::new(path.as_ref().as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        let entry = opcode::OpenAt::new(Fd(libc::AT_FDCWD), c_path.as_ptr())
+            .flags(flags)
+            .mode(opts.mode_bits())
+            .build();
+        // SAFETY: `c_path` is a local of this frame, alive across the call.
+        let fd = unsafe { self.syscall(&entry) }?;
+        // SAFETY: a successful openat returns a fresh descriptor that nothing
+        // else in the process owns or will close.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    }
+
+    /// `close(2)`, asynchronously. Takes the descriptor. It is consumed
+    /// whenever the close was submitted and ran (even if the kernel reported an
+    /// error: the descriptor is gone either way). If the call never ran (refused
+    /// before reaching the ring, or cancelled before it executed) the descriptor
+    /// is closed synchronously by dropping it, and the error says why.
+    pub fn close(&self, fd: OwnedFd) -> io::Result<()> {
+        let entry = opcode::Close::new(Fd(fd.as_raw_fd())).build();
+        // SAFETY: the entry carries no pointers.
+        match unsafe { self.syscall_ex(&entry) } {
+            Ok(_) => {
+                // The kernel closed it; dropping `fd` would close it again.
+                std::mem::forget(fd);
+                Ok(())
+            }
+            Err(Failed { err, submitted }) => {
+                let never_ran = !submitted || err.raw_os_error() == Some(libc::ECANCELED);
+                if never_ran {
+                    drop(fd); // still ours: close it here
+                } else {
+                    std::mem::forget(fd); // failed in the kernel, which dropped it
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Sleep for `d` with an io_uring timeout SQE. It counts in flight, so
+    /// the loop sees a sleeping fiber as waiting on a completion, not as
+    /// stuck. `Ok` when the time has passed; `ECANCELED` if shutdown cut it
+    /// short. A zero duration returns at once without touching the ring.
+    pub fn sleep(&self, d: Duration) -> io::Result<()> {
+        if d.is_zero() {
+            return Ok(());
+        }
+        let ts = Timespec::new()
+            .sec(d.as_secs().min(i64::MAX as u64))
+            .nsec(d.subsec_nanos());
+        let entry = opcode::Timeout::new(&raw const ts).build();
+        // SAFETY: `ts` is a local of this frame, alive across the call.
+        match unsafe { self.syscall(&entry) } {
+            // A timeout SQE completes with -ETIME when it fires: success here.
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+            r => r.map(|_| ()),
+        }
+    }
+}
+
+/// `None` is the file position (-1); an offset above `i64::MAX` is invalid.
+fn file_offset(offset: Option<u64>) -> io::Result<u64> {
+    match offset {
+        None => Ok(u64::MAX),
+        Some(o) if o <= i64::MAX as u64 => Ok(o),
+        Some(_) => Err(errno(libc::EINVAL)),
     }
 }
 
@@ -56,4 +247,26 @@ impl Cx {
 /// down (`ECANCELED`). It has no `io::ErrorKind`, so match the raw code.
 pub fn is_cancelled(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::ECANCELED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offsets() {
+        assert_eq!(file_offset(None).unwrap(), u64::MAX);
+        assert_eq!(file_offset(Some(0)).unwrap(), 0);
+        assert_eq!(file_offset(Some(i64::MAX as u64)).unwrap(), i64::MAX as u64);
+        assert_eq!(
+            file_offset(Some(1 << 63)).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn cancelled_matches_only_ecanceled() {
+        assert!(is_cancelled(&errno(libc::ECANCELED)));
+        assert!(!is_cancelled(&errno(libc::EBADF)));
+    }
 }
