@@ -1,6 +1,12 @@
 # tinyio
 
-A low-latency, thread-per-core async I/O runtime for Linux. Built on `io_uring` with stackful fibers.
+I think high perf software can be simple to understand. I built tinyio for my personal projects after 
+trying out various IO libs. I was frustrated to see them as black boxes, where it was pretty hard to really 
+understand the lifecycle of an io request.
+
+Tinyio is a low-latency, thread-per-core async I/O runtime for Linux. Built on `io_uring` with stackful fibers.
+It is powerful (it outperformed libs like alibaba photonos lib on disk and network IO), yet easy to know exactly what happens 
+to you io requests.
 
 ---
 

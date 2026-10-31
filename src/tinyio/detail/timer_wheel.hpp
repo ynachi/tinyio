@@ -148,8 +148,7 @@ public:
         for (size_t w = 1; w < k_words; ++w) {
             if (const uint64_t word = occupied_[(start_word + w) & (k_words - 1)]; word != 0) {
                 const uint64_t off =
-                    (w * uint64_t{64} - static_cast<uint64_t>(start_bit)) +
-                    CountrZero(word);
+                    (w * uint64_t{64} - static_cast<uint64_t>(start_bit)) + CountrZero(word);
                 return wake_at_offset(off);
             }
         }
