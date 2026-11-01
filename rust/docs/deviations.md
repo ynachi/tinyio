@@ -106,6 +106,14 @@ strict mode rejects by definition.
 
 **28. The IPv6 integration test skips where there is no IPv6 loopback** (this sandbox has none); the sockaddr codec's unit tests pin the v6 layout and length everywhere.
 
+## Disk benches
+
+**29. `Cx::fallocate` was added** (mode 0 only) because the C++ write bench preallocates with `posix_fallocate` and the Rust twin must do the same to measure the same filesystem path.
+
+**30. Disk I/O matches C++ within this machine's noise.** Environment: a virtio disk in a microVM, no `fio` (so the control is a blocking `O_DIRECT` `pread` loop: 16.1k IOPS and 62 us at QD1, which is also what both runtimes get; 87.7k at QD32 and 128.7k at QD128 against about 200k for the io_uring runtimes). Paired, interleaved, one CPU, a freshly created file per arm: 64 KiB writes with 1 to 32 fibers, 9 rounds, medians of time per MiB 0.96 to 1.04 of C++; 4 KiB reads at QD 1/32/128, time per op 0.92 to 1.07 of C++ (15 rounds), individual ratios from 0.3 to 1.9. With the content check off in both, Rust is 0.94 to 0.97 on four of five scenarios.
+
+**31. The first verified read runs wrongly showed Rust 9% slower at QD128** (21 rounds, 1.09): the Rust content check took about 1.4 us per 4 KiB against 0.7 us in C++ (per-word division and a slice compare). Rewritten as blocks, then words, with `u64` compares, it is level, and `--no-verify` on the Rust bench exists to separate the checker from the runtime. The write bench submits `Write` where the C++ one submits `Writev` with one iovec.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

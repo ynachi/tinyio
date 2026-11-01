@@ -29,7 +29,7 @@ make dev        # clippy + gate + tests: what a stage must pass before review
 make miri       # nightly: queue / double-push tests under Miri
 make bench      # context-switch bench (release)
 cargo run --example 01_hello_echo -- --port=8080   # the five examples are in examples/
-scripts/ab.sh pingpong   # paired A/B against the C++ build (also: context_switch, sync, post); see the script header
+scripts/ab.sh pingpong   # paired A/B against the C++ build (also: context_switch, sync, post, disk_read, disk_write); see the script header
 make docker-test
 ```
 

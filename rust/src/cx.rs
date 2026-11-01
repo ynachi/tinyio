@@ -360,6 +360,20 @@ impl Cx {
         }
     }
 
+    /// Allocate disk space for `len` bytes at `offset` (`fallocate(2)`, mode 0),
+    /// growing the file if the range goes past its end. Later writes into the
+    /// range need no allocation.
+    pub fn fallocate(&self, fd: &impl AsFd, offset: u64, len: u64) -> io::Result<()> {
+        if offset > i64::MAX as u64 || len == 0 || len > i64::MAX as u64 {
+            return Err(errno(libc::EINVAL));
+        }
+        let entry = opcode::Fallocate::new(Fd(fd.as_fd().as_raw_fd()), len)
+            .offset(offset)
+            .build();
+        // SAFETY: the entry carries no pointers; `fd` is borrowed across the call.
+        unsafe { self.syscall(&entry, None) }.map(drop)
+    }
+
     /// Sleep for `d` with an io_uring timeout SQE. It counts in flight, so
     /// the loop sees a sleeping fiber as waiting on a completion, not as
     /// stuck. `Ok` when the time has passed; `ECANCELED` if shutdown cut it

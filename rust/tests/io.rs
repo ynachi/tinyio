@@ -407,3 +407,35 @@ fn is_cancelled_is_exact() {
     assert!(is_cancelled(&std::io::Error::from_raw_os_error(125)));
     assert!(!is_cancelled(&std::io::Error::from_raw_os_error(9)));
 }
+
+// Prediction: fallocate reserves the range and extends the file to cover it,
+// and the blocks are really allocated (not a sparse hole); a zero length or an
+// out-of-range offset is EINVAL.
+#[test]
+fn fallocate_reserves_space() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = TmpDir::new("falloc");
+    let path = dir.join("f");
+    let mut io = io();
+    let p = path.clone();
+    let codes = Rc::new(RefCell::new(Vec::new()));
+    let c = codes.clone();
+    io.spawn(move |cx| {
+        let fd = cx.open(&p, &rw_create()).unwrap();
+        cx.fallocate(&fd, 0, 4 << 20).unwrap();
+        c.borrow_mut()
+            .push(cx.fallocate(&fd, 0, 0).unwrap_err().raw_os_error());
+        c.borrow_mut()
+            .push(cx.fallocate(&fd, u64::MAX, 1).unwrap_err().raw_os_error());
+    })
+    .unwrap();
+    io.run_until_done();
+    let meta = std::fs::metadata(&path).unwrap();
+    assert_eq!(meta.len(), 4 << 20);
+    assert!(
+        meta.blocks() * 512 >= 4 << 20,
+        "{} blocks: a sparse file",
+        meta.blocks()
+    );
+    assert_eq!(*codes.borrow(), [Some(22), Some(22)]);
+}
