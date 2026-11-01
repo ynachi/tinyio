@@ -81,6 +81,14 @@ pub struct Bound<'a> {
     cx: &'a Cx,
 }
 
+impl std::fmt::Debug for Bound<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bound")
+            .field("stream", &self.stream)
+            .finish_non_exhaustive()
+    }
+}
+
 impl io::Read for Bound<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.cx.read(self.stream, buf, None)

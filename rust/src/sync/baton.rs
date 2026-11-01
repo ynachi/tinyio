@@ -23,6 +23,14 @@ pub struct Baton {
     waiters: WaitList,
 }
 
+impl std::fmt::Debug for Baton {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Baton")
+            .field("posted", &self.is_posted())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Baton {
     #[inline]
     pub fn new(at: &impl Attach) -> Baton {

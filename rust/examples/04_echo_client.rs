@@ -26,11 +26,15 @@ fn run_client(cx: &Cx, addr: SocketAddr, name: &str, messages: u64) -> io::Resul
     for _ in 0..messages {
         let mut sent = 0;
         while sent < msg.len() {
-            sent += cx.write(&conn, &msg.as_bytes()[sent..], None)?;
+            sent += cx.send(&conn, &msg.as_bytes()[sent..])?;
         }
         let mut got = 0;
         while got < buf.len() {
-            let n = cx.read(&conn, &mut buf[got..], None)?;
+            let n = cx.timeout(std::time::Duration::from_secs(10)).read(
+                &conn,
+                &mut buf[got..],
+                None,
+            )?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,

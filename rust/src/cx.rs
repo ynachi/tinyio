@@ -53,6 +53,20 @@ pub struct Cx {
     _p: NotSend,
 }
 
+impl std::fmt::Debug for Cx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cx").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Timed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timed")
+            .field("deadline", &self.d)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Cx {
     pub(crate) fn new(sched: Rc<Sched>) -> Cx {
         Cx {
@@ -164,6 +178,7 @@ impl Cx {
     }
 
     /// The same I/O calls, each failing with `ETIMEDOUT` after `d`.
+    #[must_use]
     pub fn timeout(&self, d: Duration) -> Timed<'_> {
         Timed { cx: self, d }
     }
@@ -428,8 +443,13 @@ impl Cx {
 /// The call fails with `ETIMEDOUT` (`io::ErrorKind::TimedOut`). If the runtime
 /// is shutting down instead, it fails with `ECANCELED`, never `ETIMEDOUT`.
 ///
-/// Deadlines are kept on a coarse wheel (64 ms slots), so a timeout can fire up
-/// to one slot late, and a zero duration expires on the next pass of the loop.
+/// Deadlines are kept on a coarse wheel whose slots are 64 ms wide and aligned
+/// to the runtime's clock, and a deadline is rounded up to the next slot
+/// boundary. A timeout therefore never fires early, but it can fire up to 64 ms
+/// late: any duration under 64 ms behaves like "the next boundary" (a zero
+/// duration included, which is 0 to 64 ms), and a 65 ms timeout fires at 65 to
+/// 128 ms. For finer timing use [`Cx::sleep`], which is exact.
+#[must_use = "a Timed does nothing until you call an I/O method on it"]
 pub struct Timed<'a> {
     cx: &'a Cx,
     d: Duration,

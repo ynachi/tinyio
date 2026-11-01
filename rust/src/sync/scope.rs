@@ -51,6 +51,14 @@ pub struct Scope<'scope, 'env: 'scope> {
     _p: NotSend,
 }
 
+impl std::fmt::Debug for Scope<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scope")
+            .field("running", &self.data.active.get())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'scope> Scope<'scope, '_> {
     /// Start a child fiber that may borrow anything that outlives the scope.
     /// It runs when the current fiber next suspends. `ECANCELED` once the

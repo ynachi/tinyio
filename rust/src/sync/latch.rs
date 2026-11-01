@@ -17,6 +17,14 @@ pub struct Latch {
     waiters: WaitList,
 }
 
+impl std::fmt::Debug for Latch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Latch")
+            .field("count", &self.count.get())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Latch {
     #[inline]
     pub fn new(at: &impl Attach, count: usize) -> Latch {

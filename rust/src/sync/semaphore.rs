@@ -25,6 +25,20 @@ pub struct Permit<'a> {
     sem: &'a Semaphore,
 }
 
+impl std::fmt::Debug for Semaphore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Semaphore")
+            .field("available", &self.permits.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Permit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Permit").finish_non_exhaustive()
+    }
+}
+
 impl Permit<'_> {
     /// Keep the permit taken: it is no longer given back on drop.
     pub fn forget(self) {
@@ -63,6 +77,7 @@ impl Semaphore {
     }
 
     /// Take a permit if one is free.
+    #[must_use = "dropping the permit releases it at once"]
     #[inline]
     pub fn try_acquire(&self) -> Option<Permit<'_>> {
         match self.permits.get() {

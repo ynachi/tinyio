@@ -15,18 +15,21 @@ use std::time::Duration;
 
 use common::flag;
 use tinyio::net::{TcpListener, TcpStream};
-use tinyio::{Cx, Io, Options};
+use tinyio::{Cx, Io, Options, is_cancelled};
+
+/// A client that sends nothing for this long is dropped.
+const CLIENT_IDLE: Duration = Duration::from_secs(60);
 
 fn handle_client(cx: &Cx, client: TcpStream) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
-        let n = cx.read(&client, &mut buf, None)?;
+        let n = cx.timeout(CLIENT_IDLE).read(&client, &mut buf, None)?;
         if n == 0 {
             return Ok(()); // the client closed
         }
         let mut sent = 0;
         while sent < n {
-            sent += cx.write(&client, &buf[sent..n], None)?;
+            sent += cx.send(&client, &buf[sent..n])?;
         }
     }
 }
@@ -48,7 +51,15 @@ fn main() -> io::Result<()> {
             // No client within the timeout: the server shuts itself down.
             let fd = match cx.timeout(accept_timeout).accept(&listener) {
                 Ok(fd) => fd,
-                Err(e) => return eprintln!("accept: {e}"),
+                // Idle too long, or the runtime is stopping: the server is done.
+                Err(e) if e.kind() == io::ErrorKind::TimedOut || is_cancelled(&e) => return,
+                // Anything else (EMFILE, ECONNABORTED, ...) is the client's or the
+                // system's trouble, not the server's: log, back off, go on.
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    let _ = cx.sleep(Duration::from_millis(10));
+                    continue;
+                }
             };
             let spawned = cx.spawn(move |cx| {
                 if let Err(e) = handle_client(cx, TcpStream::from(fd)) {

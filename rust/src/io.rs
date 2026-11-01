@@ -29,6 +29,12 @@ pub struct Io {
     _p: NotSend,
 }
 
+impl std::fmt::Debug for Io {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Io").finish_non_exhaustive()
+    }
+}
+
 impl Io {
     pub fn new(opts: Options) -> io::Result<Io> {
         let opts = opts.validate()?;
@@ -118,7 +124,23 @@ impl Io {
     /// fiber still live then can never be woken, which is a bug: it aborts,
     /// naming the primitive (invariant 10). `Remote::stop` makes it cancel and
     /// drain instead, then return.
+    ///
+    /// If a fiber panics, the runtime stops like `Remote::stop`: every other
+    /// fiber is cancelled and drained, then the first panic is resumed from
+    /// here, so it reaches the caller (and a test harness) as an ordinary panic.
     pub fn run_until_done(&mut self) {
+        self.run_until_done_inner();
+        self.resume_fiber_panic();
+    }
+
+    /// If a fiber panicked, the loop stopped and drained; re-raise the panic here.
+    fn resume_fiber_panic(&self) {
+        if let Some(payload) = self.sched.take_panic() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn run_until_done_inner(&mut self) {
         self.sched.activate();
         let mut errors = 0;
         while !self.sched.quiesced() {
@@ -139,8 +161,14 @@ impl Io {
     /// runnable, then cancel what is in flight and drain. A stopped `Io` stays
     /// stopped: `run` and `run_until_done` return at once and `spawn` fails
     /// with `ECANCELED`. A loop that keeps failing (three ticks in a row) also
-    /// ends in the drain.
+    /// ends in the drain. A panic in a fiber stops the runtime the same way and
+    /// is resumed from here afterwards (see [`run_until_done`](Self::run_until_done)).
     pub fn run(&mut self) {
+        self.run_inner();
+        self.resume_fiber_panic();
+    }
+
+    fn run_inner(&mut self) {
         if self.sched.stopping() {
             return;
         }

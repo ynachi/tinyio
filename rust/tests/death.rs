@@ -40,19 +40,51 @@ fn death_test_signal(name: &str, body: fn(), signal: i32, expect: &[&str]) {
     }
 }
 
-// Prediction (Rule 8): a panic escaping a fiber aborts the process (SIGABRT)
-// and the panic message reaches stderr first, so it is readable.
+// Prediction: a panic in a fiber does not abort the process. The runtime stops,
+// the other fibers are cancelled, and `run_until_done` resumes the panic with
+// its original payload, so the caller (or a test harness) sees an ordinary
+// panic.
 #[test]
-fn panic_in_fiber_aborts_with_a_readable_message() {
-    death_test(
-        "panic_in_fiber_aborts_with_a_readable_message",
-        || {
-            let mut io = Io::new(Options::default()).unwrap();
-            io.spawn(|_| panic!("boom from fiber")).unwrap();
-            io.run_until_done();
-        },
-        &["boom from fiber"],
-    );
+fn panic_in_fiber_is_resumed_from_run_until_done() {
+    let mut io = Io::new(Options::default()).unwrap();
+    let (r, _w) = std::io::pipe().unwrap();
+    let cancelled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let c = cancelled.clone();
+    io.spawn(move |cx| {
+        let mut b = [0u8; 1];
+        c.set(tinyio::is_cancelled(
+            &cx.read(&r, &mut b, None).unwrap_err(),
+        ));
+    })
+    .unwrap();
+    io.spawn(|_| panic!("boom from fiber")).unwrap();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.run_until_done()));
+    let payload = caught.unwrap_err();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom from fiber"));
+    assert!(cancelled.get(), "the other fiber was cancelled and drained");
+    // The Io is stopped and stays usable for dropping.
+    assert_eq!(io.spawn(|_| {}).unwrap_err().raw_os_error(), Some(125));
+}
+
+// Prediction: the same through `run`, with the panic taken from a posted task
+// on a running loop.
+#[test]
+fn panic_in_posted_task_is_resumed_from_run() {
+    let mut io = Io::new(Options::default()).unwrap();
+    io.remote().post(|_| panic!("boom from a post")).unwrap();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.run()));
+    let payload = caught.unwrap_err();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom from a post"));
+}
+
+// Prediction: only the first of several panics is resumed.
+#[test]
+fn the_first_of_two_panics_wins() {
+    let mut io = Io::new(Options::default()).unwrap();
+    io.spawn(|_| panic!("first")).unwrap();
+    io.spawn(|_| panic!("second")).unwrap();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.run_until_done()));
+    assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"first"));
 }
 
 // Prediction: dropping an Io after run_until_done is clean (exit 0, no abort).

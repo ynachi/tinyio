@@ -28,7 +28,7 @@ fn handle_client(cx: &Cx, client: TcpStream) -> io::Result<()> {
         }
         let mut sent = 0;
         while sent < RESPONSE.len() {
-            sent += cx.write(&client, &RESPONSE[sent..], None)?;
+            sent += cx.send(&client, &RESPONSE[sent..])?;
         }
     }
 }
@@ -41,7 +41,7 @@ fn main() {
 
     run_workers(workers, seconds, move |io, worker| {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = match TcpListener::bind(addr) {
+        let listener = match TcpListener::bind_reuse_port(addr) {
             Ok(l) => l,
             Err(e) => return eprintln!("worker {worker}: bind: {e}"),
         };
@@ -52,6 +52,7 @@ fn main() {
                     Err(e) if is_cancelled(&e) => return, // shutting down
                     Err(e) => {
                         eprintln!("worker {worker}: accept: {e}");
+                        let _ = cx.sleep(std::time::Duration::from_millis(10)); // e.g. EMFILE: do not spin
                         continue;
                     }
                 };

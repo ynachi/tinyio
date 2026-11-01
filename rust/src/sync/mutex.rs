@@ -73,6 +73,7 @@ impl<T> Mutex<T> {
     }
 
     /// Take the lock if it is free.
+    #[must_use = "dropping the guard unlocks at once"]
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         if self.held.replace(true) {
@@ -99,6 +100,26 @@ impl<T> Mutex<T> {
         if !self.waiters.wake_one(&self.sched) {
             self.held.set(false);
         }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Mutex");
+        if self.held.get() {
+            d.field("data", &format_args!("<locked>"));
+        } else {
+            // SAFETY: not held means no guard exists, so nothing else refers
+            // to the data while we read it.
+            d.field("data", unsafe { &*self.data.get() });
+        }
+        d.finish_non_exhaustive()
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for MutexGuard<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
     }
 }
 

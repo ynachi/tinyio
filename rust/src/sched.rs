@@ -15,9 +15,11 @@
 //!          +-------------- push_ready (one way in) <---+
 //! ```
 
+use std::any::Any;
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::ffi::c_void;
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -97,6 +99,12 @@ impl FiberQueue {
     }
 }
 
+impl std::fmt::Debug for Sched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sched").finish_non_exhaustive()
+    }
+}
+
 pub struct Sched {
     /// The scheduler's own context: where every fiber switches back to.
     sched_ctx: Context,
@@ -132,6 +140,9 @@ pub struct Sched {
     /// other fibers were live: retried first on the next drain, so a post that
     /// returned `Ok` is never silently lost.
     stalled: Cell<Option<Task>>,
+    /// The payload of the first panic that escaped a fiber. The loop stops and
+    /// `Io::run*` resumes it once the drain is done.
+    panic: Cell<Option<Box<dyn Any + Send>>>,
     /// Test hook: make the next N fiber acquisitions fail as if `mmap` did.
     #[cfg(test)]
     fail_acquires: Cell<u32>,
@@ -161,6 +172,7 @@ impl Sched {
             now_cache: Cell::new(0),
             expired: Cell::new(Vec::new()),
             stalled: Cell::new(None),
+            panic: Cell::new(None),
             #[cfg(test)]
             fail_acquires: Cell::new(0),
             opts,
@@ -366,6 +378,18 @@ impl Sched {
             Ok(()) => self.rearm_pending.set(false),
             Err(e) => crate::check::error(format_args!("eventfd read not queued: {e}")),
         }
+    }
+
+    /// A fiber panicked: keep the first payload and ask the loop to stop, so
+    /// every other fiber is cancelled and drained before the panic resumes.
+    fn record_panic(&self, payload: Box<dyn Any + Send>) {
+        let first = self.panic.take();
+        self.panic.set(Some(first.unwrap_or(payload)));
+        self.shared().request_stop();
+    }
+
+    pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send>> {
+        self.panic.take()
     }
 
     pub(crate) fn has_stalled(&self) -> bool {
@@ -976,8 +1000,13 @@ extern "C" fn fiber_entry(arg: *mut c_void) -> ! {
             Rc::from_raw(std::ptr::from_ref(sched))
         };
         let cx = Cx::new(rc);
+        // A panic must not unwind into the context-switch frame below this
+        // one: catch it here, remember it, and let the loop re-raise it.
         // SAFETY: spawn stored a live closure for this fiber.
-        unsafe { h.run_task(&cx) };
+        let outcome = catch_unwind(AssertUnwindSafe(|| unsafe { h.run_task(&cx) }));
+        if let Err(payload) = outcome {
+            sched.record_panic(payload);
+        }
         // `cx` (and the closure's captures) drop here, before the last switch:
         // this function never returns, so nothing after it would be dropped.
     }

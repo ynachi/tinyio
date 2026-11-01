@@ -237,13 +237,16 @@ fn poll_reports_readiness() {
     assert_eq!(*log.borrow(), ["out=true", "quiet=TimedOut", "in=true"]);
 }
 
-// Prediction: many listeners can bind one port (SO_REUSEPORT), and the stream
+// Prediction: a plain bind of an address already in use fails with AddrInUse
+// (like std); bind_reuse_port lets listeners share one port. The stream
 // options and shutdown behave: after shutdown(Write) the peer reads EOF.
 #[test]
 fn reuseport_options_and_shutdown() {
-    let a = TcpListener::bind(loopback()).unwrap();
+    let a = TcpListener::bind_reuse_port(loopback()).unwrap();
     let port = a.local_addr().unwrap();
-    TcpListener::bind(port).expect("a second listener on the same port (SO_REUSEPORT)");
+    let e = TcpListener::bind(port).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e:?}");
+    TcpListener::bind_reuse_port(port).expect("a second reuse-port listener on the same port");
 
     let mut io = io();
     let a = Rc::new(a);

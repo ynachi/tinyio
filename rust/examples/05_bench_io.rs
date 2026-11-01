@@ -44,6 +44,12 @@ fn do_write(cx: &Cx, file: &str, bytes: u64) -> io::Result<()> {
 }
 
 fn do_read(cx: &Cx, file: &str, bytes: u64, reads: u64) -> io::Result<()> {
+    if bytes < 2 * 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--mb is too small to read 4 KiB blocks from",
+        ));
+    }
     let fd = cx.open(file, OpenOptions::new().read(true))?;
     let mut block = vec![0u8; 4096];
     let mut state = 42u64; // xorshift64
@@ -69,7 +75,7 @@ const RESPONSE: &[u8] =
 fn serve(cx: &Cx, client: TcpStream) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     while cx.read(&client, &mut buf, None)? != 0 {
-        cx.write(&client, RESPONSE, None)?;
+        cx.send(&client, RESPONSE)?;
     }
     Ok(())
 }
@@ -100,12 +106,23 @@ fn main() -> io::Result<()> {
         "server" => {
             let port: u16 = flag("port", 8082);
             run_workers(flag("workers", 4), flag("seconds", 0), move |io, worker| {
-                let Ok(listener) = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))) else {
+                let Ok(listener) =
+                    TcpListener::bind_reuse_port(SocketAddr::from(([0, 0, 0, 0], port)))
+                else {
                     return eprintln!("worker {worker}: bind failed");
                 };
                 let _ = io.spawn(move |cx| {
-                    while let Ok(fd) = cx.accept(&listener) {
-                        let _ = cx.spawn(|cx| drop(serve(cx, TcpStream::from(fd))));
+                    loop {
+                        match cx.accept(&listener) {
+                            Ok(fd) => {
+                                let _ = cx.spawn(|cx| drop(serve(cx, TcpStream::from(fd))));
+                            }
+                            Err(e) if tinyio::is_cancelled(&e) => return,
+                            Err(e) => {
+                                eprintln!("worker {worker}: accept: {e}");
+                                let _ = cx.sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
                     }
                 });
             });

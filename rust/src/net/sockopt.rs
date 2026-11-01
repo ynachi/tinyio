@@ -63,13 +63,16 @@ fn set_nonblocking(fd: &impl AsFd) -> io::Result<()> {
     check(unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) }).map(drop)
 }
 
-/// A listening socket with the C++ defaults: `SO_REUSEADDR`, `SO_REUSEPORT`
-/// (so one thread per core can bind the same port), `TCP_NODELAY` (inherited
-/// by accepted sockets), non-blocking.
-pub(crate) fn listener(addr: &SocketAddr, backlog: i32) -> io::Result<OwnedFd> {
+/// A listening socket: `SO_REUSEADDR` (as std sets it), `SO_REUSEPORT` only on
+/// request (it lets other sockets of the same user bind the same port, so it
+/// must be asked for), `TCP_NODELAY` (inherited by accepted sockets),
+/// non-blocking.
+pub(crate) fn listener(addr: &SocketAddr, backlog: i32, reuse_port: bool) -> io::Result<OwnedFd> {
     let fd = tcp_socket(addr)?;
     set_int(&fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, true)?;
-    set_int(&fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, true)?;
+    if reuse_port {
+        set_int(&fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, true)?;
+    }
     set_nodelay(&fd, true)?;
     set_nonblocking(&fd)?;
     let (raw, len) = encode(addr);
