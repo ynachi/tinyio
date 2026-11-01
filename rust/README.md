@@ -22,6 +22,24 @@ unsafe budget (section 5) and the build stages (section 9). The C++ runtime in
 | 7. Fixed buffers (optional) | next |
 | 8. Hardening (aarch64 hardware, sanitizers) | see the plan |
 
+## Durable writes
+
+```rust
+// write the new version, make it durable, then swap it in atomically
+let tmp = cx.open("data.tmp", OpenOptions::new().write(true).create(true).truncate(true))?;
+cx.write_vectored(&tmp, &[IoSlice::new(&header), IoSlice::new(&body)], Some(0))?;
+cx.sync_data(&tmp)?;              // fdatasync: the data is on the device
+cx.close(tmp)?;
+cx.rename("data.tmp", "data")?;   // atomic: readers see the old file or the new one
+let dir = cx.open(".", OpenOptions::new().read(true))?;
+cx.sync_all(&dir)?;               // fsync the directory so the rename itself survives a crash
+cx.close(dir)?;
+```
+
+`sync_all`, `sync_data`, `read_vectored`, `write_vectored`, `set_len`, `rename`,
+`remove_file`, `remove_dir`, `metadata` and `metadata_path` all have a timed form
+on `cx.timeout(d)`.
+
 ## Commands
 
 ```

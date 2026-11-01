@@ -4,6 +4,7 @@
 //! this is a small mirror of it with the same validation rules.
 
 use std::io;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -165,5 +166,93 @@ mod tests {
             f & (libc::O_CREAT | libc::O_EXCL),
             libc::O_CREAT | libc::O_EXCL
         );
+    }
+}
+
+/// What `Cx::metadata` reports: the few fields storage code asks for, from one
+/// `statx`. (`std::fs::Metadata` cannot be built from a `statx` result.) More
+/// are added when a caller needs them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Metadata {
+    len: u64,
+    mode: u32,
+    modified: SystemTime,
+}
+
+impl Metadata {
+    pub(crate) fn from_statx(size: u64, mode: u32, mtime_sec: i64, mtime_nsec: u32) -> Metadata {
+        let nanos = Duration::from_nanos(u64::from(mtime_nsec));
+        let modified = match u64::try_from(mtime_sec) {
+            Ok(secs) => UNIX_EPOCH + Duration::from_secs(secs) + nanos,
+            // Before 1970: back off by whole seconds, then forward by the fraction.
+            Err(_) => UNIX_EPOCH - Duration::from_secs(mtime_sec.unsigned_abs()) + nanos,
+        };
+        Metadata {
+            len: size,
+            mode,
+            modified,
+        }
+    }
+
+    /// Size in bytes. (No `is_empty`: like `std::fs::Metadata`, a zero-length
+    /// file is still a file.)
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// A regular file (as opposed to a directory, symlink, device, ...).
+    pub fn is_file(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+
+    /// Time of last modification.
+    pub fn modified(&self) -> SystemTime {
+        self.modified
+    }
+
+    /// The `st_mode` bits: file type and permissions.
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+}
+
+const S_IFMT: u32 = libc::S_IFMT;
+const S_IFREG: u32 = libc::S_IFREG;
+const S_IFDIR: u32 = libc::S_IFDIR;
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    // Prediction: the type bits decide is_file / is_dir, and nothing else does.
+    #[test]
+    fn type_predicates() {
+        let file = Metadata::from_statx(3, S_IFREG | 0o644, 0, 0);
+        assert!(file.is_file() && !file.is_dir());
+        let dir = Metadata::from_statx(0, S_IFDIR | 0o755, 0, 0);
+        assert!(dir.is_dir() && !dir.is_file());
+        let other = Metadata::from_statx(0, libc::S_IFLNK | 0o777, 0, 0);
+        assert!(!other.is_file() && !other.is_dir());
+        assert_eq!(file.len(), 3);
+        assert_eq!(file.mode(), S_IFREG | 0o644);
+    }
+
+    // Prediction: modification times convert exactly, before the epoch too.
+    #[test]
+    fn times_convert() {
+        let m = Metadata::from_statx(0, 0, 10, 500);
+        assert_eq!(m.modified(), UNIX_EPOCH + Duration::new(10, 500));
+        let m = Metadata::from_statx(0, 0, -10, 500);
+        assert_eq!(
+            m.modified(),
+            UNIX_EPOCH - Duration::new(10, 0) + Duration::new(0, 500)
+        );
+        let m = Metadata::from_statx(0, 0, i64::MIN, 0);
+        assert!(m.modified() < UNIX_EPOCH);
     }
 }

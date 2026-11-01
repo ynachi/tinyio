@@ -6,8 +6,8 @@
 //! from a fiber. `unsafe` is confined to that path and the thin typed wrappers
 //! over it, each of which borrows its buffer for the whole blocking call.
 
-use std::ffi::CString;
-use std::io;
+use std::ffi::{CStr, CString};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use io_uring::opcode;
 use io_uring::squeue::Entry;
-use io_uring::types::{Fd, Timespec};
+use io_uring::types::{Fd, FsyncFlags, Timespec};
 
 use crate::check::check;
 use crate::detail::fiber::{FiberId, FiberState, WaitKind};
-use crate::fs::OpenOptions;
+use crate::fs::{Metadata, OpenOptions};
 use crate::net::PollEvents;
 use crate::net::addr::{self, RawAddr};
 use crate::ring::{Completion, UserData};
@@ -33,6 +33,9 @@ pub(crate) type NotSend = PhantomData<*const ()>;
 
 /// The kernel's cap on one read or write; longer buffers get a short count.
 const MAX_RW_LEN: usize = 0x7fff_f000;
+
+/// The most buffers one vectored call may carry (`IOV_MAX`); more is `EINVAL`.
+const IOV_MAX: usize = 1024;
 
 fn errno(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
@@ -361,11 +364,232 @@ impl Cx {
         unsafe { self.syscall(&entry, timeout) }.map(PollEvents::from_bits)
     }
 
+    /// `readv(2)`: read into several buffers in order, at `offset` or at the file
+    /// position when `None`. Like [`read`](Self::read) it may return less than
+    /// the buffers hold, and `Ok(0)` is end of file. More than 1,024 buffers
+    /// (`IOV_MAX`) is `EINVAL`. For one buffer prefer `read`: its opcode is cheaper.
+    pub fn read_vectored(
+        &self,
+        fd: &impl AsFd,
+        bufs: &mut [IoSliceMut<'_>],
+        offset: Option<u64>,
+    ) -> io::Result<usize> {
+        self.read_vectored_with(fd, bufs, offset, None)
+    }
+
+    fn read_vectored_with(
+        &self,
+        fd: &impl AsFd,
+        bufs: &mut [IoSliceMut<'_>],
+        offset: Option<u64>,
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
+        if bufs.len() > IOV_MAX {
+            return Err(errno(libc::EINVAL));
+        }
+        let off = file_offset(offset)?;
+        // `IoSliceMut` is documented to be ABI-compatible with `iovec` on Unix,
+        // which is what makes the pointer cast below sound.
+        let entry = opcode::Readv::new(
+            Fd(fd.as_fd().as_raw_fd()),
+            bufs.as_mut_ptr().cast::<libc::iovec>(),
+            bufs.len() as u32,
+        )
+        .offset(off)
+        .build();
+        // SAFETY: the iovec array (`bufs`) and every buffer it points at are
+        // borrowed for this whole call and the fiber is parked until the CQE,
+        // so the kernel reads the array and writes the buffers while they are
+        // live; `fd` is borrowed too, so it stays open.
+        unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
+    }
+
+    /// `writev(2)`: write several buffers in order, at `offset` or at the file
+    /// position when `None`. May write fewer bytes than the buffers hold. More
+    /// than 1,024 buffers (`IOV_MAX`) is `EINVAL`. On a socket use
+    /// [`send`](Self::send): `writev` there can raise `SIGPIPE`, as
+    /// [`write`](Self::write) can.
+    pub fn write_vectored(
+        &self,
+        fd: &impl AsFd,
+        bufs: &[IoSlice<'_>],
+        offset: Option<u64>,
+    ) -> io::Result<usize> {
+        self.write_vectored_with(fd, bufs, offset, None)
+    }
+
+    fn write_vectored_with(
+        &self,
+        fd: &impl AsFd,
+        bufs: &[IoSlice<'_>],
+        offset: Option<u64>,
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
+        if bufs.len() > IOV_MAX {
+            return Err(errno(libc::EINVAL));
+        }
+        let off = file_offset(offset)?;
+        // `IoSlice` is documented to be ABI-compatible with `iovec` on Unix.
+        let entry = opcode::Writev::new(
+            Fd(fd.as_fd().as_raw_fd()),
+            bufs.as_ptr().cast::<libc::iovec>(),
+            bufs.len() as u32,
+        )
+        .offset(off)
+        .build();
+        // SAFETY: as in `read_vectored`: the iovec array and the buffers are
+        // borrowed across the call and the fiber is parked until the CQE.
+        unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
+    }
+
+    /// `fsync(2)`: flush the file's data and metadata to the device.
+    pub fn sync_all(&self, fd: &impl AsFd) -> io::Result<()> {
+        self.sync_with(fd, FsyncFlags::empty(), None)
+    }
+
+    /// `fdatasync(2)`: flush the file's data, and the metadata needed to read
+    /// it back (its length), but not times and the like. Usually cheaper.
+    pub fn sync_data(&self, fd: &impl AsFd) -> io::Result<()> {
+        self.sync_with(fd, FsyncFlags::DATASYNC, None)
+    }
+
+    fn sync_with(
+        &self,
+        fd: &impl AsFd,
+        flags: FsyncFlags,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        let entry = opcode::Fsync::new(Fd(fd.as_fd().as_raw_fd()))
+            .flags(flags)
+            .build();
+        // SAFETY: the entry carries no pointers; `fd` is borrowed across the call.
+        unsafe { self.syscall(&entry, timeout) }.map(drop)
+    }
+
+    /// `ftruncate(2)`: make the file exactly `len` bytes, zero-filling when it grows.
+    pub fn set_len(&self, fd: &impl AsFd, len: u64) -> io::Result<()> {
+        self.set_len_with(fd, len, None)
+    }
+
+    fn set_len_with(&self, fd: &impl AsFd, len: u64, timeout: Option<Duration>) -> io::Result<()> {
+        if len > i64::MAX as u64 {
+            return Err(errno(libc::EINVAL));
+        }
+        let entry = opcode::Ftruncate::new(Fd(fd.as_fd().as_raw_fd()), len).build();
+        // SAFETY: the entry carries no pointers; `fd` is borrowed across the call.
+        unsafe { self.syscall(&entry, timeout) }.map(drop)
+    }
+
+    /// `renameat(2)`: move `from` to `to`, replacing `to` atomically if it
+    /// exists. Both are relative to the current directory unless absolute.
+    ///
+    /// With [`sync_data`](Self::sync_data) this is the durable-replace sequence:
+    ///
+    /// ```
+    /// use std::io::IoSlice;
+    /// use tinyio::{Io, OpenOptions};
+    /// let dir = std::env::temp_dir().join(format!("tinyio-doc-{}", std::process::id()));
+    /// std::fs::create_dir_all(&dir).unwrap();
+    /// let (live, tmp) = (dir.join("data"), dir.join("data.tmp"));
+    /// std::fs::write(&live, b"old").unwrap();
+    /// let mut io = Io::new(Default::default()).unwrap();
+    /// let (l, t, d) = (live.clone(), tmp.clone(), dir.clone());
+    /// io.spawn(move |cx| {
+    ///     let mut o = OpenOptions::new();
+    ///     o.write(true).create(true).truncate(true);
+    ///     let f = cx.open(&t, &o).unwrap();
+    ///     cx.write_vectored(&f, &[IoSlice::new(b"ne"), IoSlice::new(b"w")], Some(0)).unwrap();
+    ///     cx.sync_data(&f).unwrap(); // the data is on the device ...
+    ///     cx.close(f).unwrap();
+    ///     cx.rename(&t, &l).unwrap(); // ... before the name points at it
+    ///     let mut ro = OpenOptions::new();
+    ///     ro.read(true);
+    ///     let dfd = cx.open(&d, &ro).unwrap();
+    ///     cx.sync_all(&dfd).unwrap(); // and the rename itself survives a crash
+    ///     cx.close(dfd).unwrap();
+    /// }).unwrap();
+    /// io.run_until_done();
+    /// assert_eq!(std::fs::read(&live).unwrap(), b"new");
+    /// std::fs::remove_dir_all(&dir).unwrap();
+    /// ```
+    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+        self.rename_with(from.as_ref(), to.as_ref(), None)
+    }
+
+    fn rename_with(&self, from: &Path, to: &Path, timeout: Option<Duration>) -> io::Result<()> {
+        let (from, to) = (c_path(from)?, c_path(to)?);
+        let entry = opcode::RenameAt::new(
+            Fd(libc::AT_FDCWD),
+            from.as_ptr(),
+            Fd(libc::AT_FDCWD),
+            to.as_ptr(),
+        )
+        .build();
+        // SAFETY: both paths are locals of this frame, alive across the call.
+        unsafe { self.syscall(&entry, timeout) }.map(drop)
+    }
+
+    /// `unlinkat(2)`: delete a file (`NotFound` if it is missing, `IsADirectory`
+    /// for a directory; see [`remove_dir`](Self::remove_dir)).
+    pub fn remove_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.unlink_with(path.as_ref(), 0, None)
+    }
+
+    /// `unlinkat(2)` with `AT_REMOVEDIR`: delete an empty directory
+    /// (`DirectoryNotEmpty` otherwise).
+    pub fn remove_dir(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.unlink_with(path.as_ref(), libc::AT_REMOVEDIR, None)
+    }
+
+    fn unlink_with(&self, path: &Path, flags: i32, timeout: Option<Duration>) -> io::Result<()> {
+        let path = c_path(path)?;
+        let entry = opcode::UnlinkAt::new(Fd(libc::AT_FDCWD), path.as_ptr())
+            .flags(flags)
+            .build();
+        // SAFETY: `path` is a local of this frame, alive across the call.
+        unsafe { self.syscall(&entry, timeout) }.map(drop)
+    }
+
+    /// `statx(2)` on an open file or directory.
+    pub fn metadata(&self, fd: &impl AsFd) -> io::Result<Metadata> {
+        self.statx_with(fd.as_fd().as_raw_fd(), c"", libc::AT_EMPTY_PATH, None)
+    }
+
+    /// `statx(2)` on a path (following a final symlink, as `std::fs::metadata` does).
+    pub fn metadata_path(&self, path: impl AsRef<Path>) -> io::Result<Metadata> {
+        let path = c_path(path.as_ref())?;
+        self.statx_with(libc::AT_FDCWD, &path, 0, None)
+    }
+
+    fn statx_with(
+        &self,
+        dirfd: RawFd,
+        path: &CStr,
+        flags: i32,
+        timeout: Option<Duration>,
+    ) -> io::Result<Metadata> {
+        // SAFETY: `statx` is a plain C struct of integers; all-zero is a valid value.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        let entry = opcode::Statx::new(Fd(dirfd), path.as_ptr(), (&raw mut stx).cast())
+            .flags(flags)
+            .mask(libc::STATX_BASIC_STATS)
+            .build();
+        // SAFETY: `path` and `stx` are borrowed/locals of this frame, alive
+        // across the call; for the fd form the caller's descriptor is borrowed
+        // by the public method for the whole call.
+        unsafe { self.syscall(&entry, timeout) }?;
+        Ok(Metadata::from_statx(
+            stx.stx_size,
+            u32::from(stx.stx_mode),
+            stx.stx_mtime.tv_sec,
+            stx.stx_mtime.tv_nsec,
+        ))
+    }
+
     /// `openat(2)` relative to the current directory.
     pub fn open(&self, path: impl AsRef<Path>, opts: &OpenOptions) -> io::Result<OwnedFd> {
         let flags = opts.flags()?;
-        let c_path = CString::new(path.as_ref().as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        let c_path = c_path(path.as_ref())?;
         let entry = opcode::OpenAt::new(Fd(libc::AT_FDCWD), c_path.as_ptr())
             .flags(flags)
             .mode(opts.mode_bits())
@@ -465,6 +689,74 @@ impl Timed<'_> {
         self.cx.write_with(fd, buf, offset, Some(self.d))
     }
 
+    /// [`Cx::read_vectored`] with the deadline.
+    pub fn read_vectored(
+        &self,
+        fd: &impl AsFd,
+        bufs: &mut [IoSliceMut<'_>],
+        offset: Option<u64>,
+    ) -> io::Result<usize> {
+        self.cx.read_vectored_with(fd, bufs, offset, Some(self.d))
+    }
+
+    /// [`Cx::write_vectored`] with the deadline.
+    pub fn write_vectored(
+        &self,
+        fd: &impl AsFd,
+        bufs: &[IoSlice<'_>],
+        offset: Option<u64>,
+    ) -> io::Result<usize> {
+        self.cx.write_vectored_with(fd, bufs, offset, Some(self.d))
+    }
+
+    /// [`Cx::sync_all`] with the deadline.
+    pub fn sync_all(&self, fd: &impl AsFd) -> io::Result<()> {
+        self.cx.sync_with(fd, FsyncFlags::empty(), Some(self.d))
+    }
+
+    /// [`Cx::sync_data`] with the deadline.
+    pub fn sync_data(&self, fd: &impl AsFd) -> io::Result<()> {
+        self.cx.sync_with(fd, FsyncFlags::DATASYNC, Some(self.d))
+    }
+
+    /// [`Cx::set_len`] with the deadline.
+    pub fn set_len(&self, fd: &impl AsFd, len: u64) -> io::Result<()> {
+        self.cx.set_len_with(fd, len, Some(self.d))
+    }
+
+    /// [`Cx::rename`] with the deadline.
+    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+        self.cx
+            .rename_with(from.as_ref(), to.as_ref(), Some(self.d))
+    }
+
+    /// [`Cx::remove_file`] with the deadline.
+    pub fn remove_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.cx.unlink_with(path.as_ref(), 0, Some(self.d))
+    }
+
+    /// [`Cx::remove_dir`] with the deadline.
+    pub fn remove_dir(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.cx
+            .unlink_with(path.as_ref(), libc::AT_REMOVEDIR, Some(self.d))
+    }
+
+    /// [`Cx::metadata`] with the deadline.
+    pub fn metadata(&self, fd: &impl AsFd) -> io::Result<Metadata> {
+        self.cx.statx_with(
+            fd.as_fd().as_raw_fd(),
+            c"",
+            libc::AT_EMPTY_PATH,
+            Some(self.d),
+        )
+    }
+
+    /// [`Cx::metadata_path`] with the deadline.
+    pub fn metadata_path(&self, path: impl AsRef<Path>) -> io::Result<Metadata> {
+        let path = c_path(path.as_ref())?;
+        self.cx.statx_with(libc::AT_FDCWD, &path, 0, Some(self.d))
+    }
+
     /// [`Cx::send`] with the deadline.
     pub fn send(&self, fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
         self.cx.send_with(fd, buf, Some(self.d))
@@ -493,6 +785,11 @@ impl Timed<'_> {
     pub fn poll(&self, fd: &impl AsFd, events: PollEvents) -> io::Result<PollEvents> {
         self.cx.poll_with(fd, events, Some(self.d))
     }
+}
+
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
 /// `None` is the file position (-1); an offset above `i64::MAX` is invalid.

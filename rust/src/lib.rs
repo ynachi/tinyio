@@ -126,7 +126,7 @@ mod timer;
 
 pub use crate::cx::{Cx, Timed, is_cancelled};
 pub use crate::detail::fiber::FiberId;
-pub use crate::fs::OpenOptions;
+pub use crate::fs::{Metadata, OpenOptions};
 pub use crate::io::Io;
 pub use crate::options::Options;
 pub use crate::remote::{PostError, Remote};

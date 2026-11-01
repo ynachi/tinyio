@@ -383,3 +383,36 @@ fn listener_accept_stream_addresses_and_ring_close() {
         ]
     );
 }
+
+// Prediction: `Read::read_vectored` on the std adapter really reads into
+// several buffers (the default would fill only the first): ten bytes sent at
+// once arrive as 4 + 6 across a 4-byte and an 8-byte buffer.
+#[test]
+fn adapter_read_vectored_fills_several_buffers() {
+    use std::io::IoSliceMut;
+    let mut io = io();
+    let listener = Rc::new(TcpListener::bind(loopback()).unwrap());
+    let addr = listener.local_addr().unwrap();
+    let got = Rc::new(RefCell::new((0usize, Vec::new(), Vec::new())));
+    let (l, g) = (listener.clone(), got.clone());
+    io.spawn(move |cx| {
+        let s = l.accept(cx).unwrap();
+        cx.sleep(50 * MS).unwrap(); // the client's ten bytes have all arrived
+        let (mut a, mut b) = ([0u8; 4], [0u8; 8]);
+        let n = s
+            .with(cx)
+            .read_vectored(&mut [IoSliceMut::new(&mut a), IoSliceMut::new(&mut b)])
+            .unwrap();
+        *g.borrow_mut() = (n, a.to_vec(), b[..n - 4].to_vec());
+    })
+    .unwrap();
+    io.spawn(move |cx| {
+        let c = TcpStream::connect(cx, addr).unwrap();
+        cx.send(&c, b"0123456789").unwrap();
+        cx.sleep(150 * MS).unwrap();
+    })
+    .unwrap();
+    io.run_until_done();
+    let (n, a, b) = got.borrow().clone();
+    assert_eq!((n, a, b), (10, b"0123".to_vec(), b"456789".to_vec()));
+}

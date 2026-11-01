@@ -100,6 +100,10 @@ impl io::Read for Bound<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.cx.read(self.stream, buf, None)
     }
+
+    fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        self.cx.read_vectored(self.stream, bufs, None)
+    }
 }
 
 impl io::Write for Bound<'_> {
