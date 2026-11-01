@@ -68,7 +68,7 @@ strict mode rejects by definition.
 
 **12. `Sched::spawn_raw` (unsafe) backs `Scope::spawn`.** It is `spawn` without the `'static` bound, so no lifetime transmute is needed; `scope`'s join and its abort-on-unwind guard are what make it sound.
 
-**13. `Semaphore::acquire`, `Latch::wait`, `Baton::wait` and `Mutex::lock` return `()`/a guard, not a `Result`,** because nothing can cancel a park (Rule 3). `Latch::count_down` past zero and a second concurrent `Baton::wait` abort.
+**13. (Changed by the review fixes, item 32.) `Semaphore::acquire`, `Latch::wait`, `Baton::wait` and `Mutex::lock` now return `io::Result`** and are woken with `ECANCELED` by a stop. `Latch::count_down` past zero and a second concurrent `Baton::wait` still abort.
 
 **14. The `compile_fail` doctest for a child borrowing a local fails with E0373, not E0597.** Making `Scope`'s marker types covariant makes that doctest compile, so the invariant markers are what stop it.
 
@@ -113,6 +113,34 @@ strict mode rejects by definition.
 **30. Disk I/O matches C++ within this machine's noise.** Environment: a virtio disk in a microVM, no `fio` (so the control is a blocking `O_DIRECT` `pread` loop: 16.1k IOPS and 62 us at QD1, which is also what both runtimes get; 87.7k at QD32 and 128.7k at QD128 against about 200k for the io_uring runtimes). Paired, interleaved, one CPU, a freshly created file per arm: 64 KiB writes with 1 to 32 fibers, 9 rounds, medians of time per MiB 0.96 to 1.04 of C++; 4 KiB reads at QD 1/32/128, time per op 0.92 to 1.07 of C++ (15 rounds), individual ratios from 0.3 to 1.9. With the content check off in both, Rust is 0.94 to 0.97 on four of five scenarios.
 
 **31. The first verified read runs wrongly showed Rust 9% slower at QD128** (21 rounds, 1.09): the Rust content check took about 1.4 us per 4 KiB against 0.7 us in C++ (per-word division and a slice compare). Rewritten as blocks, then words, with `u64` compares, it is level, and `--no-verify` on the Rust bench exists to separate the checker from the runtime. The write bench submits `Write` where the C++ one submits `Writev` with one iovec.
+
+## Review fixes
+
+An independent review of the crate (three reviewers, each reading it as ordinary Rust) found no way to cause undefined behaviour from safe code, and the following reliability and API problems. Each has a regression test; the first four were reproduced before they were fixed.
+
+**32. Sync waits are cancellable.** `Remote::stop` used to abort the process if any fiber was parked on a `Mutex`, `Semaphore`, `Latch` or `Baton` (the producer it waited for had been cancelled). Parked lists are now registered with the scheduler (`WaitRegistry`, a `Vec` entry only on a list's 0 to 1 and 1 to 0 transitions), the shutdown wakes every waiter with `ECANCELED`, and a wait begun while stopping fails at once. A free lock is still taken while stopping. `Mutex::lock`, `Semaphore::acquire`, `Latch::wait` and `Baton::wait` return `io::Result`; the abort for a waiter nothing can wake remains for a stop-less `run_until_done` (a bug in the caller). Supersedes item 13 and invariant 10 of the plan for stopping runtimes.
+
+**33. Timeouts count from when they are armed.** The tick's cached clock was reused by `arm_timeout`, so a fiber that ran for a while after another armed a timeout got a deadline that many milliseconds early (a 300 ms timeout failed at once after 400 ms of work). `arm_timeout` reads the clock itself (about 20 ns).
+
+**34. A closure over a quarter of the stack is refused with `E2BIG`** (was half, `ENOMEM`): at half, a 120 KB capture on a 256 KB stack was accepted and the fiber then faulted on the guard page. The limit is documented on `Options::stack_size` and the `spawn` methods.
+
+**35. `Cx::send` (`MSG_NOSIGNAL`) is new, and `TcpStream`'s `io::Write` uses it.** `write(2)` on a socket or pipe whose peer is gone raises `SIGPIPE` if the process leaves the signal at its default (Rust's runtime ignores it before `main`, a library hosted elsewhere may not). `Cx::write` keeps `write(2)` semantics and says so.
+
+**36. A fiber's panic no longer aborts the process.** `fiber_entry` catches it (the one `catch_unwind` in the crate, which the gate now allows in `sched.rs`), stops the runtime, and `Io::run` / `run_until_done` resume the first payload after the drain. Panics inside tests' fibers now fail the test with its message instead of killing the binary. A panic through a `scope` with a live child still aborts (the child borrows the unwound frames).
+
+**37. `TcpListener::bind` no longer sets `SO_REUSEPORT`.** With it a second bind of a port in use succeeded and a stale or foreign server could share it; `bind` now reports `AddrInUse` like std. `TcpListener::bind_reuse_port` is the opt-in, and the multi-worker examples use it.
+
+**38. A posted closure that cannot get a fiber is kept, not dropped.** If the stack mapping fails while other fibers are live the closure waits (`stalled`) and is retried after a fiber finishes; with no live fiber to free a stack it is dropped and logged. Tested with a forced mapping failure.
+
+**39. IPv6 `flowinfo` and `scope_id` are stored raw (native endian), as std does;** the port is the only big-endian field. The old code byte-swapped `flowinfo`, which a round-trip test cannot see.
+
+**40. `Semaphore::acquire` returns a `Permit` (RAII, `forget` keeps it taken);** `release` adds a permit. `try_acquire` returns `Option<Permit>`. `MutexGuard`, `Permit` and `Timed` are `#[must_use]`; every public type has a `Debug`; `Mutex` has `get_mut` and `into_inner`.
+
+**41. Timeout precision is documented as it is:** a deadline rounds up to the next 64 ms boundary of the runtime's clock, so a timeout never fires early but can be up to 64 ms late, and anything under 64 ms behaves like the next boundary (measured by the reviewer: 1, 5 and 10 ms all took 64 ms). `Cx::sleep` is exact. The tests now check "never early" and "within a slot plus 100 ms".
+
+**42. Smaller changes.** `fiber_entry` takes its `Rc<Sched>` from a `Weak` the scheduler keeps of itself (two `unsafe` statements gone, and no pointer derived from `&Sched` bumps a count outside it); an expired timer whose fiber was already woken by a reap is skipped instead of cancelled; the 100k-round-trip lost-wakeup test shrank to 20k and yields after a short spin so a loaded one-CPU box no longer trips the 60 s watchdog; the examples back off on a failing `accept` instead of ending or spinning, set idle timeouts where they are not the benchmark, and `05_bench_io read` refuses `--mb=0`. Not changed: the single cancel-all in the drain has no retry (no reviewer could make an operation survive it), and the 64 KiB guard remains the only protection against a stack overflow.
+
+**43. Cost of the review fixes, measured Rust against Rust** (the tree before the fixes against after, release builds, pinned to one CPU, rounds interleaved, paired): ping-pong 1.014 (15 rounds) and 1.001 with a 30 s timeout on every operation (so the clock read in `arm_timeout` is not visible); context switch level to +3% (noise between builds: the code is untouched); uncontended mutex 0.99, latch 0.95, contended mutex 0.92 (faster); **semaphore acquire + release 1.11** (about 0.25 ns: `acquire` now returns a `Result<Permit>`) and **`scope` spawn + join 1.07** (about 5 ns of 80: the panic-catching entry, the `Weak` upgrade and the reserve/launch split; each tried in isolation and none accounts for all of it). Both stay ahead of the C++ twins (semaphore and `TaskGroup` rows of item 16).
 
 ## Process note
 

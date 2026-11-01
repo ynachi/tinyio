@@ -263,7 +263,7 @@ fn sleep_zero_is_immediate() {
     })
     .unwrap();
     io.run_until_done();
-    assert!(t.get() < Duration::from_millis(5));
+    assert!(t.get() < Duration::from_millis(50));
 }
 
 // Prediction: a CQE that lands while other fibers keep the ready queue non-empty

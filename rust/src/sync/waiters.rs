@@ -76,7 +76,7 @@ impl WaitList {
         };
         let len = self.len.get() - 1;
         self.len.set(len);
-        if len == 0 {
+        if len == 0 && self.reg_index.get() != UNREGISTERED {
             sched.sync_waits().remove(self);
         }
         sched.unpark(fiber, self.kind);
@@ -200,6 +200,48 @@ mod tests {
         unsafe {
             drop(Box::from_raw(a.as_ptr()));
             drop(Box::from_raw(b.as_ptr()));
+        }
+    }
+
+    // Prediction: shutdown's `cancel_all` wakes the waiters of every registered
+    // list, oldest first, each marked cancelled; the registry and the lists end
+    // up empty and unregistered, including after a swap-remove moved an entry.
+    #[test]
+    fn cancel_all_wakes_every_registered_list() {
+        let sched = Sched::new(Options::default().validate().unwrap());
+        let (l1, l2, l3) = (
+            WaitList::new(WaitKind::Mutex),
+            WaitList::new(WaitKind::Mutex),
+            WaitList::new(WaitKind::Mutex),
+        );
+        let headers = [waiting_header(), waiting_header(), waiting_header()];
+        for (list, h) in [&l1, &l2, &l3].into_iter().zip(headers) {
+            // SAFETY: live headers in no queue.
+            unsafe { list.queue.push(h) };
+            list.len.set(1);
+            sched.sync_waits().add(list);
+        }
+        // The first list drains by an ordinary wake: swap-remove moves l3 to slot 0.
+        assert!(l1.wake_one(&sched));
+        assert_eq!(l1.reg_index.get(), UNREGISTERED);
+        assert_eq!(l3.reg_index.get(), 0);
+        let _ = sched.pop_ready_for_test(); // l1's waiter, woken normally
+
+        sched.sync_waits().cancel_all(&sched);
+        for list in [&l2, &l3] {
+            assert_eq!(list.len.get(), 0);
+            assert_eq!(list.reg_index.get(), UNREGISTERED);
+        }
+        let woken = [sched.pop_ready_for_test(), sched.pop_ready_for_test()];
+        assert_eq!(woken.iter().flatten().count(), 2);
+        for h in woken.into_iter().flatten() {
+            // SAFETY: live test headers.
+            assert!(unsafe { h.as_ref() }.wait_cancelled.get());
+        }
+        assert!(sched.pop_ready_for_test().is_none());
+        for h in headers {
+            // SAFETY: allocated by `waiting_header`, unqueued by now.
+            drop(unsafe { Box::from_raw(h.as_ptr()) });
         }
     }
 

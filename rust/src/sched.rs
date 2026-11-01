@@ -21,7 +21,7 @@ use std::ffi::c_void;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,9 @@ impl std::fmt::Debug for Sched {
 }
 
 pub struct Sched {
+    /// This scheduler's own `Rc`, so a fiber can take a strong handle from the
+    /// `&Sched` it holds without pointer tricks.
+    me: Weak<Sched>,
     /// The scheduler's own context: where every fiber switches back to.
     sched_ctx: Context,
     current: Cell<Option<Hdr>>,
@@ -140,6 +143,8 @@ pub struct Sched {
     /// other fibers were live: retried first on the next drain, so a post that
     /// returned `Ok` is never silently lost.
     stalled: Cell<Option<Task>>,
+    /// `stalled` is occupied; a plain flag so the hot loop never touches the box.
+    has_stalled: Cell<bool>,
     /// The payload of the first panic that escaped a fiber. The loop stops and
     /// `Io::run*` resumes it once the drain is done.
     panic: Cell<Option<Box<dyn Any + Send>>>,
@@ -153,7 +158,8 @@ pub struct Sched {
 
 impl Sched {
     pub(crate) fn new(opts: Validated) -> Rc<Sched> {
-        Rc::new(Sched {
+        Rc::new_cyclic(|me| Sched {
+            me: me.clone(),
             sched_ctx: Context::empty(),
             current: Cell::new(None),
             ready: FiberQueue::new(),
@@ -172,6 +178,7 @@ impl Sched {
             now_cache: Cell::new(0),
             expired: Cell::new(Vec::new()),
             stalled: Cell::new(None),
+            has_stalled: Cell::new(false),
             panic: Cell::new(None),
             #[cfg(test)]
             fail_acquires: Cell::new(0),
@@ -271,6 +278,11 @@ impl Sched {
         for hdr in due.drain(..) {
             // SAFETY: as above.
             let h = unsafe { hdr.as_ref() };
+            if h.state.get() != FiberState::Waiting {
+                // Its CQE was reaped while an earlier cancel flushed the ring:
+                // the op is already over, there is nothing left to time out.
+                continue;
+            }
             let entry = opcode::AsyncCancel::new(h.op_user_data.get()).build();
             // SAFETY: the cancel entry carries no pointers.
             match unsafe { self.push_sqe(&entry, UserData::Cancel) } {
@@ -316,6 +328,7 @@ impl Sched {
 
     /// Shutdown step 5: drop closures that were posted but never became fibers.
     pub(crate) fn discard_posts(&self) {
+        self.has_stalled.set(false);
         drop(self.stalled.take());
         if let Some(s) = self.shared.get() {
             s.discard();
@@ -333,22 +346,29 @@ impl Sched {
             return;
         };
         for _ in 0..self.opts.batch_max_size {
-            let Some(task) = self.stalled.take().or_else(|| shared.pop()) else {
-                break;
-            };
-            let mut slot = Some(task);
-            // SAFETY: a posted task is `'static`, so it borrows nothing.
-            let Err(e) = (unsafe { self.spawn_from(&mut slot) }) else {
-                continue;
-            };
-            let Some(task) = slot else { continue };
-            if self.stopping.get() {
-                drop(task); // refused during shutdown, as documented
-            } else if self.live.get() == 0 {
-                crate::check::error(format_args!("posted task dropped, no fiber to run it: {e}"));
+            let stalled = if self.has_stalled.replace(false) {
+                self.stalled.take()
             } else {
-                self.stalled.set(Some(task));
+                None
+            };
+            let Some(task) = stalled.or_else(|| shared.pop()) else {
                 break;
+            };
+            match self.reserve::<Task>() {
+                // SAFETY: a posted task is `'static`, so it borrows nothing;
+                // `hdr` is a fresh reservation for a `Task`.
+                Ok(hdr) => drop(unsafe { self.launch(hdr, task) }),
+                Err(_) if self.stopping.get() => drop(task), // refused during shutdown
+                Err(e) if self.live.get() == 0 => {
+                    crate::check::error(format_args!(
+                        "posted task dropped, no fiber to run it: {e}"
+                    ));
+                }
+                Err(_) => {
+                    self.stalled.set(Some(task));
+                    self.has_stalled.set(true);
+                    break;
+                }
             }
         }
     }
@@ -393,10 +413,7 @@ impl Sched {
     }
 
     pub(crate) fn has_stalled(&self) -> bool {
-        let t = self.stalled.take();
-        let some = t.is_some();
-        self.stalled.set(t);
-        some
+        self.has_stalled.get()
     }
 
     #[cfg(test)]
@@ -458,37 +475,42 @@ impl Sched {
     where
         F: FnOnce(&Cx),
     {
-        let mut slot = Some(f);
-        // SAFETY: forwarded.
-        unsafe { self.spawn_from(&mut slot) }
+        let hdr = self.reserve::<F>()?;
+        // SAFETY: forwarded; `hdr` is a fresh reservation for an `F`.
+        Ok(unsafe { self.launch(hdr, f) })
     }
 
-    /// `spawn_raw` that takes the closure out of `slot` only on success, so a
-    /// caller whose spawn failed still has it.
-    ///
-    /// # Safety
-    /// As `spawn_raw`.
-    unsafe fn spawn_from<F>(&self, slot: &mut Option<F>) -> io::Result<FiberId>
-    where
-        F: FnOnce(&Cx),
-    {
+    /// Step one of a spawn: the checks that depend only on the closure's type,
+    /// and a fiber (idle or newly mapped) to put it on. Fails before any
+    /// closure has been moved, so a caller that still holds one keeps it.
+    fn reserve<F>(&self) -> io::Result<Hdr> {
         if self.stopping.get() {
             return Err(io::Error::from_raw_os_error(libc::ECANCELED));
         }
-        let size = size_of::<F>();
-        let align = align_of::<F>();
-        if align > MAX_TASK_ALIGN {
+        if align_of::<F>() > MAX_TASK_ALIGN {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         // The closure lives at the top of the fiber's own stack, so what it
         // takes is stack the fiber cannot use. Beyond a quarter of the stack
         // the fiber would be left too little to run in: refuse (E2BIG) rather
         // than accept it and fault on the guard page later.
-        if size > self.opts.stack_size / 4 {
+        if size_of::<F>() > self.opts.stack_size / 4 {
             return Err(io::Error::from_raw_os_error(libc::E2BIG));
         }
-        let hdr = self.acquire()?;
-        // SAFETY: `acquire` returns a live header owned by this scheduler.
+        self.acquire()
+    }
+
+    /// Step two of a spawn: put `f` on the reserved fiber and queue it.
+    ///
+    /// # Safety
+    /// As `spawn_raw`, and `hdr` came from `reserve::<F>()` and is used once.
+    unsafe fn launch<F>(&self, hdr: Hdr, f: F) -> FiberId
+    where
+        F: FnOnce(&Cx),
+    {
+        let size = size_of::<F>();
+        let align = align_of::<F>();
+        // SAFETY: `reserve` returns a live header owned by this scheduler.
         let h = unsafe { hdr.as_ref() };
 
         // The closure goes just below the header, aligned for its type.
@@ -496,9 +518,6 @@ impl Sched {
             .as_ptr()
             .cast::<u8>()
             .map_addr(|a| (a - size) & !(align - 1));
-        let Some(f) = slot.take() else {
-            fatal(format_args!("spawn_from called with an empty slot"));
-        };
         // SAFETY: `task_ptr..task_ptr+size` lies inside this fiber's usable
         // region (size <= usable/4 and the header is at the very top), is
         // aligned for `F`, and nothing else uses it: the fiber is new or idle.
@@ -522,7 +541,7 @@ impl Sched {
         h.state.set(FiberState::Ready);
         // SAFETY: `hdr` is live and in no queue (new, or taken off the idle list).
         unsafe { self.ready.push(hdr) };
-        Ok(FiberId(id))
+        FiberId(id)
     }
 
     /// An idle fiber, or a freshly mapped one.
@@ -993,11 +1012,8 @@ extern "C" fn fiber_entry(arg: *mut c_void) -> ! {
     // SAFETY: the scheduler outlives every header it owns.
     let sched = unsafe { &*h.sched.get() };
     {
-        // SAFETY: `Sched` is only ever built inside an `Rc` (`Sched::new`), so
-        // this pointer came from `Rc::as_ptr` and the count may be bumped.
-        let rc = unsafe {
-            Rc::increment_strong_count(std::ptr::from_ref(sched));
-            Rc::from_raw(std::ptr::from_ref(sched))
+        let Some(rc) = sched.me.upgrade() else {
+            fatal(format_args!("a fiber started on a scheduler that is gone"));
         };
         let cx = Cx::new(rc);
         // A panic must not unwind into the context-switch frame below this

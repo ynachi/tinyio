@@ -183,7 +183,7 @@ fn zero_guard_is_rejected() {
         guard_size: 0,
         ..Options::default()
     };
-    let err = Io::new(opts).err().expect("must fail");
+    let err = Io::new(opts).expect_err("must fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 

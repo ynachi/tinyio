@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;

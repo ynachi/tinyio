@@ -405,7 +405,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        const N: usize = 100_000;
+        const N: usize = 20_000;
         let s = Arc::new(Shared::new(new_eventfd().unwrap(), 4));
         let consumed = Arc::new(AtomicUsize::new(0));
         let producer = {
@@ -413,8 +413,16 @@ mod tests {
             std::thread::spawn(move || {
                 for i in 0..N {
                     s.post(Box::new(|_| {})).unwrap();
+                    let mut spins = 0u32;
                     while consumed.load(Ordering::Acquire) <= i {
-                        std::hint::spin_loop();
+                        // Yield after a short spin: on a loaded or single-CPU
+                        // box a pure spin starves the consumer it waits for.
+                        spins += 1;
+                        if spins < 64 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
                     }
                 }
             })

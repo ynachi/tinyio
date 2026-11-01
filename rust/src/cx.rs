@@ -178,7 +178,6 @@ impl Cx {
     }
 
     /// The same I/O calls, each failing with `ETIMEDOUT` after `d`.
-    #[must_use]
     pub fn timeout(&self, d: Duration) -> Timed<'_> {
         Timed { cx: self, d }
     }

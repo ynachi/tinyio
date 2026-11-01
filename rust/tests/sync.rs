@@ -287,18 +287,29 @@ fn scope_children_spawn_children() {
     assert_eq!(count.get(), 3);
 }
 
-// Prediction (Rule 13): a child using the PARENT's Cx to lock a mutex locks as
-// the child: it gets the lock and the parent, parked on the scope, is never queued.
+// Prediction (Rule 13): a scoped child that locks a *contended* mutex through its
+// parent's `Cx` parks the child, not the parent: the parent is waiting in the
+// scope's join, and queueing it twice would abort. The child waits for the holder
+// and then gets the lock.
 #[test]
 fn scoped_child_may_use_the_parents_cx() {
     let mut io = io();
     let m = Rc::new(Mutex::new(&io, 0u8));
+    let m1 = m.clone();
+    io.spawn(move |cx| {
+        let mut g = m1.lock(cx).unwrap();
+        cx.yield_now().unwrap(); // the scope below starts while we hold the lock
+        cx.yield_now().unwrap();
+        *g = 10;
+    })
+    .unwrap();
     let m2 = m.clone();
     io.spawn(move |cx| {
         scope(cx, |s| {
+            // `cx` is the parent's; the child contends for the held lock with it.
             s.spawn(|_| *m2.lock(cx).unwrap() += 1).unwrap();
         });
-        assert_eq!(*m2.try_lock().unwrap(), 1);
+        assert_eq!(*m2.try_lock().unwrap(), 11);
     })
     .unwrap();
     io.run_until_done();

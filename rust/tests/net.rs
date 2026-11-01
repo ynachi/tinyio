@@ -305,3 +305,41 @@ fn ipv6_round_trip() {
     io.run_until_done();
     assert_eq!(got.get(), 2);
 }
+
+// Prediction: connect_timeout to a live listener succeeds well inside its limit,
+// and `Timed::accept_addr` on a listener with no client fails with TimedOut.
+#[test]
+fn connect_timeout_and_timed_accept_addr() {
+    let mut io = io();
+    let listener = Rc::new(TcpListener::bind(loopback()).unwrap());
+    let addr = listener.local_addr().unwrap();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (l, lg) = (listener.clone(), log.clone());
+    io.spawn(move |cx| {
+        let quiet = cx.timeout(30 * MS).accept_addr(&*l).map(|_| ());
+        lg.borrow_mut()
+            .push(format!("quiet={:?}", quiet.map_err(|e| e.kind())));
+        let (_fd, peer) = cx.timeout(2_000 * MS).accept_addr(&*l).unwrap();
+        lg.borrow_mut()
+            .push(format!("peer_is_loopback={}", peer.ip().is_loopback()));
+    })
+    .unwrap();
+    let lg = log.clone();
+    io.spawn(move |cx| {
+        cx.sleep(100 * MS).unwrap(); // after the quiet accept has timed out
+        let started = Instant::now();
+        let c = TcpStream::connect_timeout(cx, addr, 2_000 * MS).unwrap();
+        assert_eq!(c.peer_addr().unwrap(), addr);
+        lg.borrow_mut()
+            .push(format!("fast={}", started.elapsed() < 500 * MS));
+        cx.sleep(50 * MS).unwrap();
+    })
+    .unwrap();
+    io.run_until_done();
+    let mut got = log.borrow().clone();
+    got.sort();
+    assert_eq!(
+        got,
+        ["fast=true", "peer_is_loopback=true", "quiet=Err(TimedOut)"]
+    );
+}

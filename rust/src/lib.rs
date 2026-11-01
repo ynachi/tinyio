@@ -1,8 +1,39 @@
 //! tinyio-rs: stackful fibers over io_uring, one ring per thread.
 //!
-//! The public API is safe (Rule 0): no sequence of calls to anything exported
-//! here can cause undefined behavior. `unsafe` lives only in the modules the
-//! plan's unsafe budget lists; see `docs/architecture-plan.md`.
+//! Fibers are ordinary closures with their own stacks, so I/O reads like
+//! blocking code (`let n = cx.read(&fd, &mut buf, None)?`) while the thread runs
+//! other fibers. An [`Io`] owns the ring and runs the loop; a [`Cx`] is what a
+//! fiber holds to do I/O; a [`Remote`] is the one handle other threads may use.
+//!
+//! The public API is safe: no sequence of calls to anything exported here can
+//! cause undefined behavior. `unsafe` is confined to the modules that switch
+//! stacks, talk to the ring, and wrap a few libc calls.
+//!
+//! # Shutdown
+//!
+//! [`Remote::stop`] makes [`Io::run`] cancel everything and return. I/O in
+//! flight completes with `ECANCELED` ([`is_cancelled`]); a fiber waiting on a
+//! [`Mutex`], [`Semaphore`], [`Latch`] or [`Baton`] is woken with `ECANCELED`
+//! too, and every later blocking call fails the same way, so a fiber that checks
+//! its results runs to its end. A lock that is free is still taken while
+//! stopping, so cleanup code can use it.
+//!
+//! # What aborts the process
+//!
+//! A panic in a fiber does not abort: the runtime stops and drains, then
+//! [`Io::run`] and [`Io::run_until_done`] resume the panic on the caller's
+//! thread. The process aborts, with a message that names the cause, for a
+//! broken invariant the types cannot rule out:
+//!
+//! - a fiber left waiting for something that can no longer happen (a re-entrant
+//!   `Mutex::lock`, a `Latch` whose count is never reached) once the loop has
+//!   nothing else to run,
+//! - a second concurrent waiter on a [`Baton`], or counting a [`Latch`] below zero,
+//! - using a primitive from an [`Io`] other than the one it was made on,
+//! - a [`scope`] unwound by a panic while a child fiber still borrows it,
+//! - dropping an [`Io`] with operations in flight.
+//!
+//! A fiber that overflows its stack faults on the guard page (SIGSEGV).
 //!
 //! # Compile-time guarantees
 //!

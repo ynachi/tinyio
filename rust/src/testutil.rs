@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Test helpers. `death_test` re-executes the test binary to observe an abort
 //! (the plan's layer 4: "TINYIO_CASE=<name>, assert an abort signal and the
 //! expected stderr text").

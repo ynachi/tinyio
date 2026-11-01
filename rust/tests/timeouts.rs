@@ -262,9 +262,10 @@ fn deadlines_fire_in_order() {
     assert_eq!(*order.borrow(), [130, 260, 400]);
 }
 
-// Prediction: a zero timeout expires on the first pass of the loop (within a slot).
+// Prediction: a zero timeout expires at the next slot boundary: within one 64 ms
+// slot, never more.
 #[test]
-fn zero_timeout_expires_at_once() {
+fn zero_timeout_expires_within_a_slot() {
     let (r, _w) = pending_pipe();
     let mut io = io();
     let took = Rc::new(Cell::new(Duration::MAX));
@@ -280,7 +281,41 @@ fn zero_timeout_expires_at_once() {
     })
     .unwrap();
     io.run_until_done();
-    assert!(took.get() < SLACK, "{:?}", took.get());
+    assert!(took.get() < 64 * MS + 100 * MS, "{:?}", took.get());
+}
+
+// Prediction: a timeout never fires early, whatever its length: deadlines are
+// rounded up to a slot boundary, so 1 ms, 10 ms and 70 ms all wait at least
+// their duration, and at most one slot more (plus scheduling slack).
+#[test]
+fn a_timeout_never_fires_early() {
+    let mut io = io();
+    let took = Rc::new(RefCell::new(Vec::new()));
+    let t = took.clone();
+    io.spawn(move |cx| {
+        for d in [1u64, 10, 70] {
+            let (r, _w) = pending_pipe();
+            let start = Instant::now();
+            let e = cx
+                .timeout(MS * d as u32)
+                .read(&r, &mut [0u8; 1], None)
+                .unwrap_err();
+            assert!(timed_out(&e));
+            t.borrow_mut().push((d, start.elapsed()));
+        }
+    })
+    .unwrap();
+    io.run_until_done();
+    for (d, elapsed) in took.borrow().iter() {
+        assert!(
+            *elapsed >= MS * *d as u32,
+            "{d} ms timeout fired after {elapsed:?}"
+        );
+        assert!(
+            *elapsed < MS * *d as u32 + 64 * MS + 100 * MS,
+            "{d} ms: {elapsed:?}"
+        );
+    }
 }
 
 // Prediction: 500 timed reads that all time out are all reported, with the
