@@ -56,6 +56,9 @@ pub(crate) struct Shared {
     /// Where the kernel writes the eventfd counter (Rule 12: it must not move,
     /// so it lives here and not in `Io`).
     wake_slot: AtomicU64,
+    /// Test hook: how many times `wake` wrote the eventfd.
+    #[cfg(test)]
+    wakes: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -67,6 +70,8 @@ impl Shared {
             sleeping: AtomicBool::new(false),
             wake: File::from(eventfd),
             wake_slot: AtomicU64::new(0),
+            #[cfg(test)]
+            wakes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -91,9 +96,22 @@ impl Shared {
             return Err(PostError::Full);
         }
         // Pairs with the fence in `announce_sleep`: either this sees the flag
-        // and wakes the owner, or the owner's re-check sees our count.
+        // or the owner's re-check sees our count. Only the producer whose swap
+        // takes the flag down writes the eventfd, so a burst into a sleeping
+        // loop costs one write, not one per post. The plain load stays in front
+        // so a post to a running loop is one load, not a read-modify-write on a
+        // line the owner also writes.
+        //
+        // No wakeup is lost: a producer that sees the flag up but loses the swap
+        // lost it either to another producer (who writes) or to the owner's own
+        // `clear_sleep` (the owner is awake). Either way the owner's next
+        // `announce_sleep` fence pairs with ours, so it finds our count in
+        // `pending` before it can block again. If our push is not visible yet,
+        // `pending() > 0` keeps the loop ticking. A producer that clears the
+        // flag while the owner is deciding not to block (`announce_sleep` true)
+        // writes a wake the owner did not need: one spurious eventfd completion.
         fence(Ordering::SeqCst);
-        if self.sleeping.load(Ordering::Relaxed) {
+        if self.sleeping.load(Ordering::Relaxed) && self.sleeping.swap(false, Ordering::SeqCst) {
             self.wake();
         }
         Ok(())
@@ -145,6 +163,8 @@ impl Shared {
 
     /// `WouldBlock` means the counter is saturated, which already wakes the reader.
     fn wake(&self) {
+        #[cfg(test)]
+        self.wakes.fetch_add(1, Ordering::Relaxed);
         match (&self.wake).write(&1u64.to_ne_bytes()) {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
@@ -232,6 +252,50 @@ mod tests {
         assert_eq!(s.pending(), 1);
         assert!(s.pop().is_some());
         assert_eq!(s.pending(), 0);
+    }
+
+    // Prediction: a burst of posts that arrives while the owner sleeps costs ONE
+    // eventfd write, not one per post. The owner announces the sleep (the queue
+    // is empty, so it would block) and does not consume; 4 threads post 1,000
+    // each; the write counter is exactly 1. Afterwards the owner clears the flag,
+    // drains, and every task is there.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_burst_while_asleep_writes_the_eventfd_once() {
+        let s = Arc::new(shared(4096));
+        assert!(!s.announce_sleep(), "empty queue: the owner would block");
+        let producers: Vec<_> = (0..4)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        s.post(noop()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for p in producers {
+            p.join().unwrap();
+        }
+        assert_eq!(s.wakes.load(Ordering::Relaxed), 1);
+        s.clear_sleep();
+        let mut popped = 0;
+        while s.pop().is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 4000);
+        assert_eq!(s.pending(), 0);
+    }
+
+    // Prediction: a busy owner (flag down) costs the producers no eventfd write at all.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn posts_to_a_running_owner_write_nothing() {
+        let s = shared(64);
+        for _ in 0..50 {
+            s.post(noop()).unwrap();
+        }
+        assert_eq!(s.wakes.load(Ordering::Relaxed), 0);
     }
 
     // Prediction: discarding after the close empties the queue and zeroes the

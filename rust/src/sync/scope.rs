@@ -26,6 +26,15 @@ impl ScopeData {
     }
 }
 
+/// Tells the scope a child is finished, when dropped.
+struct ChildDone<'a>(&'a ScopeData);
+
+impl Drop for ChildDone<'_> {
+    fn drop(&mut self) {
+        self.0.child_done();
+    }
+}
+
 /// Aborts if the scope frame is left (by a panic caught further up) while a
 /// child still borrows it. Unwinding through a live borrow would be UB.
 struct JoinGuard<'a>(&'a ScopeData);
@@ -69,8 +78,11 @@ impl<'scope> Scope<'scope, '_> {
     {
         let data = self.data;
         let child = move |cx: &Cx| {
-            f(cx); // consumes `f`, so its captures are gone before the parent can wake
-            data.child_done();
+            // Declared before the call so it drops after `f` is consumed, on a
+            // panic too: the captures are gone before the parent can wake, and
+            // an unwinding child still counts as done.
+            let _done = ChildDone(data);
+            f(cx);
         };
         data.active.set(data.active.get() + 1);
         // SAFETY: `scope` joins every child before returning, and aborts

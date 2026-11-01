@@ -249,3 +249,58 @@ fn panic_through_scope_with_a_live_child() {
         &["tinyio::scope left with 1 child fiber(s) still running"],
     );
 }
+
+// Prediction: a panic in a scoped child is resumed from `run_until_done` like
+// any fiber's; the parent's `scope` still returns (the child counts as done once
+// it has unwound), and nothing aborts. Before the fix the unwind skipped the
+// child's completion, the parent waited for ever, and the drain aborted with
+// "1 on Scope".
+#[test]
+fn panic_in_a_scoped_child_is_resumed_and_the_parent_resumes() {
+    let mut io = Io::new(Options::default()).unwrap();
+    let parent_after_scope = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = parent_after_scope.clone();
+    io.spawn(move |cx| {
+        tinyio::scope(cx, |s| {
+            s.spawn(|_| panic!("boom from a child")).unwrap();
+        });
+        flag.set(true);
+    })
+    .unwrap();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.run_until_done()));
+    assert_eq!(
+        caught.unwrap_err().downcast_ref::<&str>(),
+        Some(&"boom from a child")
+    );
+    assert!(parent_after_scope.get(), "the parent's scope returned");
+}
+
+// Prediction: the child's captures are dropped before the parent wakes, also on
+// the unwinding path (the borrow rule the scope relies on).
+#[test]
+fn a_panicking_child_drops_its_captures_before_the_parent_wakes() {
+    struct Mark(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("child capture dropped");
+        }
+    }
+    let mut io = Io::new(Options::default()).unwrap();
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let l = log.clone();
+    io.spawn(move |cx| {
+        let mark = Mark(l.clone());
+        tinyio::scope(cx, |s| {
+            s.spawn(move |_| {
+                let _mark = mark;
+                panic!("boom");
+            })
+            .unwrap();
+        });
+        l.borrow_mut().push("parent resumed");
+    })
+    .unwrap();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.run_until_done()));
+    assert!(caught.is_err());
+    assert_eq!(*log.borrow(), ["child capture dropped", "parent resumed"]);
+}

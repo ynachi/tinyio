@@ -454,4 +454,79 @@ mod tests {
         }
         producer.join().unwrap();
     }
+
+    // Prediction: with TWO producers racing to post into a sleeping owner, one
+    // post outstanding each, none is lost. Each round both post at the same
+    // moment and wait for both to be consumed, so one producer takes the flag
+    // down and writes the eventfd while the other's flag load saw it up and its
+    // swap saw it down: the case the single-producer test above cannot reach. A
+    // lost wakeup would leave the owner polling while a producer waits for it,
+    // and show up as a 5 s timeout.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn no_post_is_lost_with_two_racing_producers() {
+        use crate::remote::Shared;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const ROUNDS: usize = 10_000;
+        let s = Arc::new(Shared::new(new_eventfd().unwrap(), 4));
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let producers: Vec<_> = (0..2)
+            .map(|_| {
+                let (s, consumed) = (s.clone(), consumed.clone());
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        // Both producers leave the previous round together.
+                        wait_for(&consumed, 2 * round);
+                        s.post(Box::new(|_| {})).unwrap();
+                        wait_for(&consumed, 2 * round + 2);
+                    }
+                })
+            })
+            .collect();
+        let mut got = 0;
+        while got < 2 * ROUNDS {
+            if s.pop().is_some() {
+                got += 1;
+                consumed.store(got, Ordering::Release);
+                continue;
+            }
+            if !s.announce_sleep() {
+                let mut fds = libc::pollfd {
+                    fd: s.eventfd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd that outlives the call.
+                let ready = unsafe { libc::poll(&raw mut fds, 1, 5000) };
+                assert!(
+                    ready > 0,
+                    "lost wakeup: slept 5 s with work queued ({got}/{})",
+                    2 * ROUNDS
+                );
+                let mut counter = [0u8; 8];
+                // SAFETY: the buffer is 8 bytes, as an eventfd read requires.
+                unsafe { libc::read(s.eventfd(), counter.as_mut_ptr().cast(), 8) };
+            }
+            s.clear_sleep();
+        }
+        for p in producers {
+            p.join().unwrap();
+        }
+    }
+
+    /// Wait until `counter` reaches `target`: a short spin, then yield, so a
+    /// loaded or single-CPU machine does not starve the thread being waited for.
+    fn wait_for(counter: &std::sync::atomic::AtomicUsize, target: usize) {
+        let mut spins = 0u32;
+        while counter.load(std::sync::atomic::Ordering::Acquire) < target {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
 }
