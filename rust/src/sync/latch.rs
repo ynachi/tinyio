@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::io;
 use std::rc::Rc;
 
 use super::waiters::WaitList;
@@ -38,11 +39,13 @@ impl Latch {
     }
 
     /// Wait for the count to reach zero; returns at once if it already has.
+    /// `ECANCELED` if the runtime is stopping and the count never got there.
     #[inline]
-    pub fn wait(&self, cx: &Cx) {
+    pub fn wait(&self, cx: &Cx) -> io::Result<()> {
         check_same(&self.sched, cx, "Latch");
         if self.count.get() > 0 {
-            self.waiters.park(&self.sched);
+            self.waiters.wait(&self.sched)?;
         }
+        Ok(())
     }
 }

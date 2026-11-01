@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::io;
 use std::rc::Rc;
 
 use super::waiters::WaitList;
@@ -32,18 +33,24 @@ impl Baton {
         }
     }
 
+    /// Wait for `post`; returns at once if it has happened. `ECANCELED` if the
+    /// runtime is stopping (a producer that was cancelled will never post).
     /// Aborts on a second concurrent waiter: one-shot means one.
     #[inline]
-    pub fn wait(&self, cx: &Cx) {
+    pub fn wait(&self, cx: &Cx) -> io::Result<()> {
         check_same(&self.sched, cx, "Baton");
         match self.state.get() {
-            State::Posted => {}
+            State::Posted => Ok(()),
             State::Waiting => crate::check::fatal(format_args!(
                 "Baton: second concurrent wait (one-shot means one waiter)"
             )),
             State::Empty => {
                 self.state.set(State::Waiting);
-                self.waiters.park(&self.sched);
+                let woke = self.waiters.wait(&self.sched);
+                if woke.is_err() {
+                    self.state.set(State::Empty); // nobody waits any more
+                }
+                woke
             }
         }
     }

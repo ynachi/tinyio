@@ -1,4 +1,5 @@
 use std::cell::{Cell, UnsafeCell};
+use std::io;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -19,7 +20,7 @@ use crate::sched::Sched;
 /// io.spawn(|cx| {
 ///     let g = {
 ///         let m = tinyio::Mutex::new(cx, 1u8);
-///         m.lock(cx) // guard escapes the block that owns `m`
+///         m.lock(cx).unwrap() // guard escapes the block that owns `m`
 ///     };
 ///     drop(g);
 /// }).unwrap();
@@ -29,7 +30,7 @@ use crate::sched::Sched;
 /// let mut io = tinyio::Io::new(Default::default()).unwrap();
 /// io.spawn(|cx| {
 ///     let m = tinyio::Mutex::new(cx, 1u8);
-///     let g = m.lock(cx);
+///     let g = m.lock(cx).unwrap();
 ///     drop(g); // the twin: guard dropped inside the block
 /// }).unwrap();
 /// io.run_until_done();
@@ -57,25 +58,38 @@ impl<T> Mutex<T> {
         }
     }
 
-    /// Wait for the lock, in FIFO order.
+    /// Wait for the lock, in FIFO order. `ECANCELED` if the runtime is stopping
+    /// and the lock was not free.
     #[inline]
-    pub fn lock<'a>(&'a self, cx: &Cx) -> MutexGuard<'a, T> {
+    pub fn lock<'a>(&'a self, cx: &Cx) -> io::Result<MutexGuard<'a, T>> {
         check_same(&self.sched, cx, "Mutex");
         if self.held.get() {
             // `unlock` hands ownership over before waking us, so on return the lock is ours.
-            self.waiters.park(&self.sched);
+            self.waiters.wait(&self.sched)?;
         } else {
             self.held.set(true);
         }
-        MutexGuard { mutex: self }
+        Ok(MutexGuard { mutex: self })
     }
 
+    /// Take the lock if it is free.
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         if self.held.replace(true) {
             return None;
         }
         Some(MutexGuard { mutex: self })
+    }
+
+    /// The value, by exclusive access: no lock needed, nobody else can have it.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
+    /// Consume the mutex and return the value. Aborts if a fiber is still
+    /// waiting (it borrows the mutex, so safe code cannot get here).
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
     }
 
     #[inline]
@@ -90,6 +104,7 @@ impl<T> Mutex<T> {
 
 /// Releases the lock on drop. Owned by the guard, not by a fiber, so another
 /// fiber on the same thread may drop it.
+#[must_use = "dropping the guard unlocks at once"]
 pub struct MutexGuard<'a, T> {
     mutex: &'a Mutex<T>,
 }

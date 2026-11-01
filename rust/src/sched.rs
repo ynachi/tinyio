@@ -33,8 +33,9 @@ use crate::detail::context::{self, Context};
 use crate::detail::fiber::{FiberHeader, FiberId, FiberState, TaskOps, WaitKind};
 use crate::detail::stack::Stack;
 use crate::options::Validated;
-use crate::remote::Shared;
+use crate::remote::{Shared, Task};
 use crate::ring::{Ring, UserData};
+use crate::sync::waiters::WaitRegistry;
 use crate::timer::{TICK_NS, Wheel};
 
 /// Closures needing more alignment than the header are refused.
@@ -119,12 +120,21 @@ pub struct Sched {
     /// The eventfd read must be (re)queued. While set the loop never blocks:
     /// sleeping with the read unarmed could miss a wake.
     rearm_pending: Cell<bool>,
+    /// Lists with fibers parked on them, for shutdown to wake.
+    sync_waits: WaitRegistry,
     /// Per-op timeouts. Accessed only through `with_timers`.
     timers: UnsafeCell<Wheel<Hdr>>,
     /// Time zero for the monotonic clock the wheel runs on.
     epoch: Instant,
     /// The current tick's `now`, or 0 when it must be read again.
     now_cache: Cell<u64>,
+    /// A posted closure that could not get a fiber (stack mapping failed) while
+    /// other fibers were live: retried first on the next drain, so a post that
+    /// returned `Ok` is never silently lost.
+    stalled: Cell<Option<Task>>,
+    /// Test hook: make the next N fiber acquisitions fail as if `mmap` did.
+    #[cfg(test)]
+    fail_acquires: Cell<u32>,
     /// Scratch for `process_expired_timers`, kept to avoid an allocation per call.
     expired: Cell<Vec<Hdr>>,
     opts: Validated,
@@ -145,10 +155,14 @@ impl Sched {
             stopping: Cell::new(false),
             shared: OnceCell::new(),
             rearm_pending: Cell::new(false),
+            sync_waits: WaitRegistry::new(),
             timers: UnsafeCell::new(Wheel::new()),
             epoch: Instant::now(),
             now_cache: Cell::new(0),
             expired: Cell::new(Vec::new()),
+            stalled: Cell::new(None),
+            #[cfg(test)]
+            fail_acquires: Cell::new(0),
             opts,
         })
     }
@@ -183,6 +197,12 @@ impl Sched {
         }
     }
 
+    /// Read the clock now and refresh the tick's cached value with it.
+    fn fresh_now_ns(&self) -> u64 {
+        self.invalidate_clock();
+        self.now_ns()
+    }
+
     pub(crate) fn invalidate_clock(&self) {
         self.now_cache.set(0);
     }
@@ -197,8 +217,11 @@ impl Sched {
             "fiber {} armed two timeouts",
             h.id.get()
         );
+        // A fresh reading, not the tick's cached one: fibers run for a while
+        // between the tick's start and here, and a stale `now` would make the
+        // deadline early by exactly that long.
         let deadline = self
-            .now_ns()
+            .fresh_now_ns()
             .saturating_add(d.as_nanos().min(u128::from(u64::MAX)) as u64);
         h.timer
             .set(Some(self.with_timers(|w| w.arm(hdr, deadline))));
@@ -281,6 +304,7 @@ impl Sched {
 
     /// Shutdown step 5: drop closures that were posted but never became fibers.
     pub(crate) fn discard_posts(&self) {
+        drop(self.stalled.take());
         if let Some(s) = self.shared.get() {
             s.discard();
         }
@@ -288,17 +312,31 @@ impl Sched {
 
     /// Phase 1a of the tick: turn posted closures into fibers, at most
     /// `batch_max_size` so a flood cannot starve I/O. While stopping, `spawn`
-    /// refuses and the closure is dropped unrun.
+    /// refuses and the closure is dropped unrun. If no fiber can be had (the
+    /// stack mapping failed) the closure waits in `stalled` and the drain stops
+    /// until a later tick, when a finished fiber may have freed a stack; with no
+    /// fiber live to free one, nothing will change and the closure is dropped.
     pub(crate) fn drain_remote(&self) {
         let Some(shared) = self.shared.get() else {
             return;
         };
         for _ in 0..self.opts.batch_max_size {
-            let Some(task) = shared.pop() else { break };
-            if let Err(e) = self.spawn(move |cx| task(cx))
-                && !self.stopping.get()
-            {
-                crate::check::error(format_args!("posted task not spawned: {e}"));
+            let Some(task) = self.stalled.take().or_else(|| shared.pop()) else {
+                break;
+            };
+            let mut slot = Some(task);
+            // SAFETY: a posted task is `'static`, so it borrows nothing.
+            let Err(e) = (unsafe { self.spawn_from(&mut slot) }) else {
+                continue;
+            };
+            let Some(task) = slot else { continue };
+            if self.stopping.get() {
+                drop(task); // refused during shutdown, as documented
+            } else if self.live.get() == 0 {
+                crate::check::error(format_args!("posted task dropped, no fiber to run it: {e}"));
+            } else {
+                self.stalled.set(Some(task));
+                break;
             }
         }
     }
@@ -330,6 +368,18 @@ impl Sched {
         }
     }
 
+    pub(crate) fn has_stalled(&self) -> bool {
+        let t = self.stalled.take();
+        let some = t.is_some();
+        self.stalled.set(t);
+        some
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_acquires(&self, n: u32) {
+        self.fail_acquires.set(n);
+    }
+
     pub(crate) fn opts(&self) -> &Validated {
         &self.opts
     }
@@ -348,6 +398,15 @@ impl Sched {
 
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.get()
+    }
+
+    pub(crate) fn sync_waits(&self) -> &WaitRegistry {
+        &self.sync_waits
+    }
+
+    /// Shutdown: wake every fiber parked on a sync primitive with `ECANCELED`.
+    pub(crate) fn cancel_sync_waits(&self) {
+        self.sync_waits.cancel_all(self);
     }
 
     /// Start shutting down (invariant 11). Never undone.
@@ -375,6 +434,20 @@ impl Sched {
     where
         F: FnOnce(&Cx),
     {
+        let mut slot = Some(f);
+        // SAFETY: forwarded.
+        unsafe { self.spawn_from(&mut slot) }
+    }
+
+    /// `spawn_raw` that takes the closure out of `slot` only on success, so a
+    /// caller whose spawn failed still has it.
+    ///
+    /// # Safety
+    /// As `spawn_raw`.
+    unsafe fn spawn_from<F>(&self, slot: &mut Option<F>) -> io::Result<FiberId>
+    where
+        F: FnOnce(&Cx),
+    {
         if self.stopping.get() {
             return Err(io::Error::from_raw_os_error(libc::ECANCELED));
         }
@@ -383,9 +456,12 @@ impl Sched {
         if align > MAX_TASK_ALIGN {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        // Plan decision 3: a closure larger than half the stack is ENOMEM.
-        if size > self.opts.stack_size / 2 {
-            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        // The closure lives at the top of the fiber's own stack, so what it
+        // takes is stack the fiber cannot use. Beyond a quarter of the stack
+        // the fiber would be left too little to run in: refuse (E2BIG) rather
+        // than accept it and fault on the guard page later.
+        if size > self.opts.stack_size / 4 {
+            return Err(io::Error::from_raw_os_error(libc::E2BIG));
         }
         let hdr = self.acquire()?;
         // SAFETY: `acquire` returns a live header owned by this scheduler.
@@ -396,8 +472,11 @@ impl Sched {
             .as_ptr()
             .cast::<u8>()
             .map_addr(|a| (a - size) & !(align - 1));
+        let Some(f) = slot.take() else {
+            fatal(format_args!("spawn_from called with an empty slot"));
+        };
         // SAFETY: `task_ptr..task_ptr+size` lies inside this fiber's usable
-        // region (size <= usable/2 and the header is at the very top), is
+        // region (size <= usable/4 and the header is at the very top), is
         // aligned for `F`, and nothing else uses it: the fiber is new or idle.
         unsafe { task_ptr.cast::<F>().write(f) };
         h.task_ptr.set(task_ptr);
@@ -409,7 +488,7 @@ impl Sched {
         h.wait.set(WaitKind::None);
 
         // SAFETY: the region below `task_ptr` is this fiber's stack; it holds
-        // far more than one frame (stack_size >= 4 pages, closure <= half).
+        // far more than one frame (stack_size >= 4 pages, closure <= a quarter).
         unsafe {
             h.context
                 .make(task_ptr, fiber_entry, hdr.as_ptr().cast::<c_void>())
@@ -424,6 +503,11 @@ impl Sched {
 
     /// An idle fiber, or a freshly mapped one.
     fn acquire(&self) -> io::Result<Hdr> {
+        #[cfg(test)]
+        if self.fail_acquires.get() > 0 {
+            self.fail_acquires.set(self.fail_acquires.get() - 1);
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
         if let Some(h) = self.idle_head.get() {
             // SAFETY: idle fibers are live headers.
             let hr = unsafe { h.as_ref() };

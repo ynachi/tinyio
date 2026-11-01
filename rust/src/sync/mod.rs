@@ -6,7 +6,7 @@ mod latch;
 mod mutex;
 mod scope;
 mod semaphore;
-mod waiters;
+pub(crate) mod waiters;
 
 use std::rc::Rc;
 
@@ -19,7 +19,7 @@ pub use baton::Baton;
 pub use latch::Latch;
 pub use mutex::{Mutex, MutexGuard};
 pub use scope::{Scope, scope};
-pub use semaphore::Semaphore;
+pub use semaphore::{Permit, Semaphore};
 
 mod sealed {
     use std::rc::Rc;

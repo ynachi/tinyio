@@ -307,3 +307,41 @@ fn many_timeouts_all_fire() {
     io.run_until_done();
     assert_eq!(fired.get(), 500);
 }
+
+// Prediction: the deadline counts from when the operation is armed, not from
+// when the tick's clock was first read. Fiber A arms a 5 ms timeout at the start
+// of the tick (which reads the clock, and makes the loop wake at once); fiber B then computes for 400 ms and arms a
+// 300 ms timeout. B still gets the full 300 ms: data written 200 ms after its
+// read started arrives in time. (With the tick's clock reading reused, B's
+// deadline was already past when armed and its read failed at once.)
+#[test]
+fn deadline_counts_from_arming_not_from_the_tick_start() {
+    let (r_a, w_a) = pending_pipe();
+    let (r_b, mut w_b) = pending_pipe();
+    let mut io = io();
+    let outcome = Rc::new(RefCell::new(None));
+    let o = outcome.clone();
+    io.spawn(move |cx| {
+        let _ = cx.timeout(5 * MS).read(&r_a, &mut [0u8; 1], None);
+    })
+    .unwrap();
+    io.spawn(move |cx| {
+        thread::sleep(400 * MS); // a long stretch of work inside one tick
+        let mut buf = [0u8; 1];
+        *o.borrow_mut() = Some(
+            cx.timeout(300 * MS)
+                .read(&r_b, &mut buf, None)
+                .map(|_| buf[0]),
+        );
+    })
+    .unwrap();
+    let writer = thread::spawn(move || {
+        thread::sleep(600 * MS);
+        let _ = w_b.write_all(b"x"); // EPIPE if the read already gave up
+        (w_a, w_b)
+    });
+    io.run_until_done();
+    let _keep = writer.join().unwrap();
+    let got = outcome.borrow_mut().take().unwrap();
+    assert_eq!(got.unwrap(), b'x');
+}

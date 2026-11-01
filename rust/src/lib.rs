@@ -81,4 +81,4 @@ pub use crate::fs::OpenOptions;
 pub use crate::io::Io;
 pub use crate::options::Options;
 pub use crate::remote::{PostError, Remote};
-pub use crate::sync::{Attach, Baton, Latch, Mutex, MutexGuard, Scope, Semaphore, scope};
+pub use crate::sync::{Attach, Baton, Latch, Mutex, MutexGuard, Permit, Scope, Semaphore, scope};

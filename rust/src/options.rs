@@ -9,7 +9,10 @@ use std::io;
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Usable stack bytes per fiber, rounded up to whole pages (minimum 4).
-    /// The spawned closure and the fiber header live at the top of it.
+    /// The spawned closure and the fiber header live at the top of it, so what
+    /// a closure captures is stack the fiber cannot use: `spawn` refuses a
+    /// closure over a quarter of this with `E2BIG`. Overflowing the stack
+    /// itself faults on the guard region (SIGSEGV).
     pub stack_size: usize,
     /// `PROT_NONE` bytes below each stack, rounded up to whole pages. Must be
     /// at least one page.

@@ -152,6 +152,9 @@ pub(crate) struct FiberHeader {
     pub(crate) timed_out: Cell<bool>,
     /// The `user_data` of the op in flight: what a timeout cancel targets.
     pub(crate) op_user_data: Cell<u64>,
+    /// Set when shutdown woke this fiber out of a sync-primitive wait, so the
+    /// wait reports `ECANCELED` instead of success.
+    pub(crate) wait_cancelled: Cell<bool>,
 }
 
 impl FiberHeader {
@@ -170,6 +173,7 @@ impl FiberHeader {
             timer: Cell::new(None),
             timed_out: Cell::new(false),
             op_user_data: Cell::new(0),
+            wait_cancelled: Cell::new(false),
         }
     }
 

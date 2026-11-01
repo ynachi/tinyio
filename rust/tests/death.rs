@@ -113,8 +113,9 @@ fn quiesce_with_a_fiber_parked_on_a_mutex() {
             run_fibers(|io| {
                 let m = std::rc::Rc::new(Mutex::new(io, ()));
                 let m1 = m.clone();
-                io.spawn(move |cx| std::mem::forget(m1.lock(cx))).unwrap();
-                io.spawn(move |cx| drop(m.lock(cx))).unwrap();
+                io.spawn(move |cx| std::mem::forget(m1.lock(cx).unwrap()))
+                    .unwrap();
+                io.spawn(move |cx| drop(m.lock(cx).unwrap())).unwrap();
             });
         },
         &["1 on Mutex (fiber 2)"],
@@ -131,9 +132,10 @@ fn quiesce_names_every_stuck_primitive() {
                 let m = std::rc::Rc::new(Mutex::new(io, ()));
                 let latch = std::rc::Rc::new(Latch::new(io, 1));
                 let m1 = m.clone();
-                io.spawn(move |cx| std::mem::forget(m1.lock(cx))).unwrap();
-                io.spawn(move |cx| drop(m.lock(cx))).unwrap();
-                io.spawn(move |cx| latch.wait(cx)).unwrap();
+                io.spawn(move |cx| std::mem::forget(m1.lock(cx).unwrap()))
+                    .unwrap();
+                io.spawn(move |cx| drop(m.lock(cx).unwrap())).unwrap();
+                io.spawn(move |cx| latch.wait(cx).unwrap()).unwrap();
             });
         },
         &["1 on Mutex (fiber 2)", "1 on Latch (fiber 3)"],
@@ -149,7 +151,7 @@ fn primitive_used_from_another_io() {
             let io1 = Io::new(Options::default()).unwrap();
             let m = std::rc::Rc::new(Mutex::new(&io1, ()));
             let mut io2 = Io::new(Options::default()).unwrap();
-            io2.spawn(move |cx| drop(m.lock(cx))).unwrap();
+            io2.spawn(move |cx| drop(m.lock(cx).unwrap())).unwrap();
             io2.run_until_done();
         },
         &["Mutex used from a different Io"],
@@ -165,8 +167,8 @@ fn baton_second_waiter() {
             run_fibers(|io| {
                 let b = std::rc::Rc::new(Baton::new(io));
                 let b2 = b.clone();
-                io.spawn(move |cx| b.wait(cx)).unwrap();
-                io.spawn(move |cx| b2.wait(cx)).unwrap();
+                io.spawn(move |cx| b.wait(cx).unwrap()).unwrap();
+                io.spawn(move |cx| b2.wait(cx).unwrap()).unwrap();
             });
         },
         &["Baton: second concurrent wait"],
@@ -213,25 +215,5 @@ fn panic_through_scope_with_a_live_child() {
             });
         },
         &["tinyio::scope left with 1 child fiber(s) still running"],
-    );
-}
-
-// Prediction (invariant 10): `stop` with a fiber parked on a Mutex nobody will
-// release finishes the drain, then aborts naming the Mutex. The fiber is never
-// woken or unwound.
-#[test]
-fn stop_with_a_sync_parked_fiber() {
-    death_test(
-        "stop_with_a_sync_parked_fiber",
-        || {
-            let mut io = Io::new(Options::default()).unwrap();
-            let m = std::rc::Rc::new(Mutex::new(&io, ()));
-            let m1 = m.clone();
-            io.spawn(move |cx| std::mem::forget(m1.lock(cx))).unwrap();
-            io.spawn(move |cx| drop(m.lock(cx))).unwrap();
-            io.remote().stop();
-            io.run();
-        },
-        &["cancel_and_drain: quiesced", "1 on Mutex (fiber 2)"],
     );
 }

@@ -16,7 +16,7 @@ use crossbeam_queue::ArrayQueue;
 
 use crate::cx::Cx;
 
-type Task = Box<dyn FnOnce(&Cx) + Send>;
+pub(crate) type Task = Box<dyn FnOnce(&Cx) + Send>;
 
 /// Top bit of `post_state`: the loop has closed its queue.
 const CLOSED: u64 = 1 << 63;

@@ -345,25 +345,31 @@ fn io_moves_then_receives_a_post() {
     assert!(ran.load(Ordering::SeqCst) >= 1);
 }
 
-// Prediction: a mutex held across a cancelled read is handed on during the
-// drain: A, then B, then C each get it exactly once, in order, with no abort.
+// Prediction: fibers waiting for a mutex whose holder is stuck in a read are
+// woken with ECANCELED by the stop (they do not wait for the holder), and the
+// holder, cancelled out of its read, still finishes its critical section.
 #[test]
-fn mutex_handoff_survives_shutdown() {
+fn mutex_waiters_are_cancelled_by_the_stop() {
     let mut io = io();
     let m = Rc::new(Mutex::new(&io, Vec::<&'static str>::new()));
     let (r, _w) = pending_pipe();
     let m1 = m.clone();
     io.spawn(move |cx| {
-        let mut g = m1.lock(cx);
+        let mut g = m1.lock(cx).unwrap();
         g.push("A");
         let mut b = [0u8; 1];
         assert!(is_cancelled(&cx.read(&r, &mut b, None).unwrap_err()));
         g.push("A-cancelled");
     })
     .unwrap();
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
     for name in ["B", "C"] {
-        let m = m.clone();
-        io.spawn(move |cx| m.lock(cx).push(name)).unwrap();
+        let (m, o) = (m.clone(), outcomes.clone());
+        io.spawn(move |cx| {
+            let r = m.lock(cx).map(drop).map_err(|e| is_cancelled(&e));
+            o.borrow_mut().push((name, r));
+        })
+        .unwrap();
     }
     let remote = io.remote();
     let t = thread::spawn(move || {
@@ -372,7 +378,8 @@ fn mutex_handoff_survives_shutdown() {
     });
     io.run();
     t.join().unwrap();
-    assert_eq!(*m.try_lock().unwrap(), ["A", "A-cancelled", "B", "C"]);
+    assert_eq!(*m.try_lock().unwrap(), ["A", "A-cancelled"]);
+    assert_eq!(*outcomes.borrow(), [("B", Err(true)), ("C", Err(true))]);
 }
 
 // Prediction: a scope's parent wakes only after its cancelled children have

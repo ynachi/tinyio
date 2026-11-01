@@ -34,6 +34,28 @@ pub(crate) fn death_test(name: &str, body: fn(), expect: &[&str]) {
     }
 }
 
+/// Run `body` in a child process and assert it exits with status 0. For
+/// bodies that change process-wide state (signal dispositions) or that would
+/// kill the test binary if they went wrong.
+pub(crate) fn child_test(name: &str, body: fn()) {
+    if std::env::var("TINYIO_CASE").as_deref() == Ok(name) {
+        body();
+        std::process::exit(0);
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new(exe)
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("TINYIO_CASE", name)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "child {name} failed: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Abort the process if a test binary runs for more than 60 s: a hung drain
 /// would otherwise stall `cargo test` forever.
 pub(crate) fn watchdog() {

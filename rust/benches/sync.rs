@@ -36,7 +36,7 @@ fn mutex_uncontended(cx: &Cx, n: u64) {
     let m = black_box(&m);
     let start = Instant::now();
     for _ in 0..n {
-        drop(black_box(m.lock(cx)));
+        drop(black_box(m.lock(cx).unwrap()));
     }
     report("Mutex uncontended lock/unlock", start, n);
 }
@@ -46,8 +46,7 @@ fn semaphore_uncontended(cx: &Cx, n: u64) {
     let s = black_box(&s);
     let start = Instant::now();
     for _ in 0..n {
-        s.acquire(cx);
-        s.release();
+        drop(s.acquire(cx).unwrap());
     }
     report("Semaphore uncontended acquire/release", start, n);
 }
@@ -77,13 +76,13 @@ fn mutex_contended(cx: &Cx, n: u64) {
     scope(cx, |s| {
         s.spawn(|c| {
             for _ in 0..n {
-                drop(m.lock(c));
+                drop(m.lock(c).unwrap());
                 c.yield_now().unwrap();
             }
         })
         .unwrap();
         for _ in 0..n {
-            drop(m.lock(cx));
+            drop(m.lock(cx).unwrap());
             cx.yield_now().unwrap();
         }
     });

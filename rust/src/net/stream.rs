@@ -9,7 +9,8 @@ use super::sockopt;
 use crate::cx::Cx;
 
 /// A connected TCP socket. Read and write it with [`Cx::read`] and
-/// [`Cx::write`] (it is an [`AsFd`]), or through [`TcpStream::with`].
+/// [`Cx::send`] (it is an [`AsFd`]), or through [`TcpStream::with`]. Prefer
+/// `send` to `write`: it never raises `SIGPIPE`.
 #[derive(Debug)]
 pub struct TcpStream {
     fd: OwnedFd,
@@ -88,7 +89,7 @@ impl io::Read for Bound<'_> {
 
 impl io::Write for Bound<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.cx.write(self.stream, buf, None)
+        self.cx.send(self.stream, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {

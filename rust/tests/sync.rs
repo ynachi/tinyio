@@ -31,7 +31,7 @@ fn mutex_excludes_across_a_suspend() {
         let (m, torn) = (m.clone(), torn.clone());
         io.spawn(move |cx| {
             for _ in 0..50 {
-                let mut g = m.lock(cx);
+                let mut g = m.lock(cx).unwrap();
                 let before = *g;
                 cx.yield_now().unwrap();
                 if *g != before {
@@ -55,7 +55,7 @@ fn mutex_is_fifo() {
     let order = log();
     let (m0, o0) = (m.clone(), order.clone());
     io.spawn(move |cx| {
-        let g = m0.lock(cx);
+        let g = m0.lock(cx).unwrap();
         cx.yield_now().unwrap(); // let 1, 2, 3 queue up behind us
         cx.yield_now().unwrap();
         o0.borrow_mut().push("holder".into());
@@ -65,7 +65,7 @@ fn mutex_is_fifo() {
     for i in 1..=3 {
         let (m, o) = (m.clone(), order.clone());
         io.spawn(move |cx| {
-            let _g = m.lock(cx);
+            let _g = m.lock(cx).unwrap();
             o.borrow_mut().push(format!("w{i}"));
         })
         .unwrap();
@@ -83,14 +83,14 @@ fn mutex_unlock_hands_over_to_the_waiter() {
     let barged = Rc::new(Cell::new(true));
     let (m1, b) = (m.clone(), barged.clone());
     io.spawn(move |cx| {
-        let g = m1.lock(cx);
+        let g = m1.lock(cx).unwrap();
         cx.yield_now().unwrap(); // the second fiber now waits
         drop(g);
         b.set(m1.try_lock().is_some()); // must be None: ownership moved
     })
     .unwrap();
     let m2 = m.clone();
-    io.spawn(move |cx| drop(m2.lock(cx))).unwrap();
+    io.spawn(move |cx| drop(m2.lock(cx).unwrap())).unwrap();
     io.run_until_done();
     assert!(!barged.get());
 }
@@ -115,12 +115,11 @@ fn semaphore_caps_concurrency() {
     for _ in 0..5 {
         let (sem, inside, peak) = (sem.clone(), inside.clone(), peak.clone());
         io.spawn(move |cx| {
-            sem.acquire(cx);
+            let _permit = sem.acquire(cx).unwrap();
             inside.set(inside.get() + 1);
             peak.set(peak.get().max(inside.get()));
             cx.yield_now().unwrap();
             inside.set(inside.get() - 1);
-            sem.release();
         })
         .unwrap();
     }
@@ -136,16 +135,15 @@ fn semaphore_release_hands_over() {
     let stolen = Rc::new(Cell::new(true));
     let (s1, st) = (sem.clone(), stolen.clone());
     io.spawn(move |cx| {
-        s1.acquire(cx);
+        s1.acquire(cx).unwrap().forget();
         cx.yield_now().unwrap();
         s1.release();
-        st.set(s1.try_acquire());
+        st.set(s1.try_acquire().is_some());
     })
     .unwrap();
     let s2 = sem.clone();
     io.spawn(move |cx| {
-        s2.acquire(cx);
-        s2.release();
+        drop(s2.acquire(cx).unwrap());
     })
     .unwrap();
     io.run_until_done();
@@ -161,7 +159,7 @@ fn latch_releases_waiters_at_zero() {
     for i in 0..2 {
         let (l, o) = (latch.clone(), order.clone());
         io.spawn(move |cx| {
-            l.wait(cx);
+            l.wait(cx).unwrap();
             o.borrow_mut().push(format!("waiter{i}"));
         })
         .unwrap();
@@ -193,7 +191,7 @@ fn latch_at_zero_does_not_block() {
     let d = done.clone();
     let latch = Rc::new(latch);
     io.spawn(move |cx| {
-        latch.wait(cx);
+        latch.wait(cx).unwrap();
         d.set(true);
     })
     .unwrap();
@@ -211,7 +209,7 @@ fn baton_post_then_wait() {
     let done = Rc::new(Cell::new(false));
     let (b2, d) = (b.clone(), done.clone());
     io.spawn(move |cx| {
-        b2.wait(cx);
+        b2.wait(cx).unwrap();
         d.set(true);
     })
     .unwrap();
@@ -227,7 +225,7 @@ fn baton_wait_then_post() {
     let order = log();
     let (b1, o1) = (b.clone(), order.clone());
     io.spawn(move |cx| {
-        b1.wait(cx);
+        b1.wait(cx).unwrap();
         o1.borrow_mut().push("woken".into());
     })
     .unwrap();
@@ -298,7 +296,7 @@ fn scoped_child_may_use_the_parents_cx() {
     let m2 = m.clone();
     io.spawn(move |cx| {
         scope(cx, |s| {
-            s.spawn(|_| *m2.lock(cx) += 1).unwrap();
+            s.spawn(|_| *m2.lock(cx).unwrap() += 1).unwrap();
         });
         assert_eq!(*m2.try_lock().unwrap(), 1);
     })
@@ -315,7 +313,7 @@ fn guard_can_be_dropped_by_another_fiber() {
     let leaked: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(&io, ())));
     let s1 = slot.clone();
     io.spawn(move |cx| {
-        *s1.borrow_mut() = Some(leaked.lock(cx));
+        *s1.borrow_mut() = Some(leaked.lock(cx).unwrap());
     })
     .unwrap();
     let s2 = slot.clone();
@@ -352,4 +350,131 @@ fn nested_scopes_join_inside_out() {
     .unwrap();
     io.run_until_done();
     assert_eq!(*order.borrow(), ["inner-child", "outer-child", "after"]);
+}
+
+// Prediction: `stop` wakes fibers parked on a Mutex, Semaphore, Latch and Baton
+// with ECANCELED, and the loop returns; nothing aborts. A wait begun after the
+// stop fails at once instead of parking, and the primitives stay consistent.
+#[test]
+fn stop_wakes_every_kind_of_sync_waiter() {
+    let mut io = io();
+    let remote = io.remote();
+    let m = Rc::new(Mutex::new(&io, ()));
+    let sem = Rc::new(Semaphore::new(&io, 0));
+    let latch = Rc::new(Latch::new(&io, 1));
+    let baton = Rc::new(Baton::new(&io));
+    let seen = log();
+
+    let (m1, s) = (m.clone(), seen.clone());
+    io.spawn(move |cx| {
+        let _held = m1.lock(cx).unwrap();
+        let r = cx
+            .sleep(Duration::from_secs(3600))
+            .map_err(|e| tinyio::is_cancelled(&e));
+        s.borrow_mut().push(format!("holder {r:?}"));
+    })
+    .unwrap();
+    let (m2, s) = (m.clone(), seen.clone());
+    io.spawn(move |cx| {
+        let first = m2.lock(cx).map(drop).map_err(|e| tinyio::is_cancelled(&e));
+        let again = m2.lock(cx).map(drop).map_err(|e| tinyio::is_cancelled(&e));
+        s.borrow_mut().push(format!("mutex {first:?} {again:?}"));
+    })
+    .unwrap();
+    let (sem2, s) = (sem.clone(), seen.clone());
+    io.spawn(move |cx| {
+        let r = sem2
+            .acquire(cx)
+            .map(drop)
+            .map_err(|e| tinyio::is_cancelled(&e));
+        s.borrow_mut().push(format!("semaphore {r:?}"));
+    })
+    .unwrap();
+    let (l, s) = (latch.clone(), seen.clone());
+    io.spawn(move |cx| {
+        let r = l.wait(cx).map_err(|e| tinyio::is_cancelled(&e));
+        s.borrow_mut().push(format!("latch {r:?}"));
+    })
+    .unwrap();
+    let (b, s) = (baton.clone(), seen.clone());
+    io.spawn(move |cx| {
+        let r = b.wait(cx).map_err(|e| tinyio::is_cancelled(&e));
+        s.borrow_mut().push(format!("baton {r:?}"));
+    })
+    .unwrap();
+
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        remote.stop();
+    });
+    io.run();
+    stopper.join().unwrap();
+
+    let mut got = seen.borrow().clone();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "baton Err(true)",
+            "holder Err(true)",
+            "latch Err(true)",
+            "mutex Err(true) Err(true)",
+            "semaphore Err(true)",
+        ]
+    );
+    // Nothing was handed a permit or a lock on the way out.
+    assert!(m.try_lock().is_some());
+    assert!(sem.try_acquire().is_none());
+    assert!(!baton.is_posted());
+}
+
+// Prediction: a Permit gives its permit back when dropped, including on an
+// early return; `forget` keeps it taken until `release`.
+#[test]
+fn permit_returns_on_drop_and_forget_keeps_it() {
+    let mut io = io();
+    let sem = Rc::new(Semaphore::new(&io, 1));
+    let s = sem.clone();
+    io.spawn(move |cx| {
+        let early = |cx: &tinyio::Cx| -> Result<(), ()> {
+            let _p = s.acquire(cx).map_err(|_| ())?;
+            Err(()) // leaves without an explicit release
+        };
+        assert!(early(cx).is_err());
+        let p = s.try_acquire().expect("the permit came back");
+        p.forget();
+        assert!(s.try_acquire().is_none(), "forget keeps it taken");
+        s.release();
+        assert!(s.try_acquire().is_some());
+    })
+    .unwrap();
+    io.run_until_done();
+}
+
+// Prediction: waiters on a Semaphore are served strictly in the order they arrived.
+#[test]
+fn semaphore_is_fifo() {
+    let mut io = io();
+    let sem = Rc::new(Semaphore::new(&io, 1));
+    let order = log();
+    let (s0, o0) = (sem.clone(), order.clone());
+    io.spawn(move |cx| {
+        let p = s0.acquire(cx).unwrap();
+        for _ in 0..4 {
+            cx.yield_now().unwrap(); // let 1, 2, 3 queue up behind us
+        }
+        o0.borrow_mut().push("holder".into());
+        drop(p);
+    })
+    .unwrap();
+    for i in 1..=3 {
+        let (s, o) = (sem.clone(), order.clone());
+        io.spawn(move |cx| {
+            let _p = s.acquire(cx).unwrap();
+            o.borrow_mut().push(format!("w{i}"));
+        })
+        .unwrap();
+    }
+    io.run_until_done();
+    assert_eq!(*order.borrow(), ["holder", "w1", "w2", "w3"]);
 }

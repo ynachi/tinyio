@@ -69,7 +69,9 @@ impl Cx {
     /// Start another fiber on this thread. It runs after the current one
     /// next suspends. `f` must own everything it uses (`'static`); it cannot
     /// capture this `Cx`, and receives its own. `ECANCELED` once the runtime
-    /// is shutting down.
+    /// is shutting down; `E2BIG` if the closure's captures exceed a quarter of
+    /// [`Options::stack_size`](crate::Options::stack_size); `EINVAL` if it needs
+    /// an alignment above 64.
     pub fn spawn<F>(&self, f: F) -> io::Result<FiberId>
     where
         F: FnOnce(&Cx) + 'static,
@@ -193,6 +195,11 @@ impl Cx {
 
     /// `write(2)` at `offset`, or at the file position when `None`. May write
     /// fewer bytes than `buf.len()`.
+    ///
+    /// Like `write(2)`, this raises `SIGPIPE` on a pipe or socket whose peer is
+    /// gone if the process leaves that signal at its default action (Rust
+    /// programs ignore it from `main`; a library hosted elsewhere may not).
+    /// Use [`send`](Self::send) for sockets.
     pub fn write(&self, fd: &impl AsFd, buf: &[u8], offset: Option<u64>) -> io::Result<usize> {
         self.write_with(fd, buf, offset, None)
     }
@@ -210,6 +217,28 @@ impl Cx {
             .offset(off)
             .build();
         // SAFETY: as in `read`: `buf` and `fd` are borrowed across the call.
+        unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
+    }
+
+    /// `send(2)` with `MSG_NOSIGNAL`: write to a connected socket, failing
+    /// with `EPIPE` when the peer is gone. Unlike [`write`](Self::write) it never
+    /// raises `SIGPIPE`, whatever the process's signal disposition is. May send
+    /// fewer bytes than `buf.len()`. `ENOTSOCK` if `fd` is not a socket.
+    pub fn send(&self, fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
+        self.send_with(fd, buf, None)
+    }
+
+    fn send_with(
+        &self,
+        fd: &impl AsFd,
+        buf: &[u8],
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
+        let len = buf.len().min(MAX_RW_LEN) as u32;
+        let entry = opcode::Send::new(Fd(fd.as_fd().as_raw_fd()), buf.as_ptr(), len)
+            .flags(libc::MSG_NOSIGNAL)
+            .build();
+        // SAFETY: as in `write`: `buf` and `fd` are borrowed across the call.
         unsafe { self.syscall(&entry, timeout) }.map(|n| n as usize)
     }
 
@@ -417,6 +446,11 @@ impl Timed<'_> {
         self.cx.write_with(fd, buf, offset, Some(self.d))
     }
 
+    /// [`Cx::send`] with the deadline.
+    pub fn send(&self, fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
+        self.cx.send_with(fd, buf, Some(self.d))
+    }
+
     /// [`Cx::accept`] with the deadline.
     pub fn accept(&self, listener: &impl AsFd) -> io::Result<OwnedFd> {
         self.cx
@@ -455,6 +489,16 @@ fn file_offset(offset: Option<u64>) -> io::Result<u64> {
 /// down (`ECANCELED`). It has no `io::ErrorKind`, so match the raw code.
 pub fn is_cancelled(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::ECANCELED)
+}
+
+#[cfg(test)]
+pub(crate) mod test_signals {
+    /// Set SIGPIPE's disposition for this process (tests only).
+    pub(crate) fn sigpipe(ignore: bool) {
+        let handler = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
+        // SAFETY: signal() takes a plain disposition constant, no pointers.
+        unsafe { libc::signal(libc::SIGPIPE, handler) };
+    }
 }
 
 #[cfg(test)]

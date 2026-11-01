@@ -51,15 +51,16 @@ fn main() -> io::Result<()> {
             for (i, (_, addr)) in targets.iter().enumerate() {
                 let (gate, results) = (&gate, &results);
                 let spawned = s.spawn(move |cx| {
-                    gate.acquire(cx);
                     let started = Instant::now();
-                    let outcome = TcpStream::connect_timeout(cx, *addr, Duration::from_secs(2));
-                    gate.release();
+                    // The permit goes back when it drops, however the probe ends.
+                    let outcome = gate.acquire(cx).and_then(|_permit| {
+                        TcpStream::connect_timeout(cx, *addr, Duration::from_secs(2))
+                    });
                     let ms = started.elapsed().as_secs_f64() * 1000.0;
                     results.borrow_mut()[i] = Some(outcome.map(|_| ms));
                 });
                 if let Err(e) = spawned {
-                    eprintln!("spawn: {e}");
+                    results.borrow_mut()[i] = Some(Err(e));
                 }
             }
         }); // every probe has finished here
@@ -69,8 +70,11 @@ fn main() -> io::Result<()> {
                 Some(Err(e)) if e.kind() == io::ErrorKind::TimedOut => {
                     println!("{host:<24} DOWN  (timeout)")
                 }
-                Some(Err(_)) => println!("{host:<24} DOWN  (refused)"),
-                None => {}
+                Some(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    println!("{host:<24} DOWN  (refused)")
+                }
+                Some(Err(e)) => println!("{host:<24} DOWN  ({e})"),
+                None => println!("{host:<24} not probed"),
             }
         }
     })?;

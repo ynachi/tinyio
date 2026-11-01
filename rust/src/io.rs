@@ -69,6 +69,10 @@ impl Io {
         self.sched.invalidate_clock();
         self.sched.drain_remote();
         self.sched.resume_ready(self.sched.opts().batch_max_size);
+        // A fiber that just finished may have freed the stack a stalled post waits for.
+        if self.sched.has_stalled() {
+            self.sched.drain_remote();
+        }
 
         // Quiesce check, BEFORE the blocking wait: phase 1 may just have
         // finished the last fiber, and waiting now would wait for a CQE that
@@ -169,6 +173,7 @@ impl Io {
     fn cancel_and_drain(&self) {
         self.sched.close_posts();
         self.sched.begin_stop();
+        self.sched.cancel_sync_waits();
         let mut cancel_sent = self.sched.inflight() == 0;
         let mut errors = 0;
         while !self.sched.quiesced() {
@@ -202,7 +207,7 @@ mod tests {
     use super::*;
     use crate::cx::is_cancelled;
     use crate::detail::fiber::WaitKind;
-    use crate::testutil::{death_test, watchdog};
+    use crate::testutil::{child_test, death_test, watchdog};
 
     fn io() -> Io {
         watchdog();
@@ -369,12 +374,49 @@ mod tests {
         );
     }
 
-    // Prediction: writing to a pipe whose reader is gone fails with EPIPE, not a signal kill
-    // of the process we are testing in (io_uring reports it as a result code; the process
-    // would only die on SIGPIPE if it were raised, which io_uring does not do for this op).
+    // Prediction: a posted closure that cannot get a fiber while other fibers
+    // are live waits and runs once one is available; it is not dropped.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn broken_pipe_is_an_error_not_a_signal() {
+    fn posted_task_waits_when_no_fiber_can_be_had() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut io = io();
+        io.spawn(|cx| {
+            let _ = cx.sleep(Duration::from_millis(30));
+        })
+        .unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        io.remote()
+            .post(move |_| r.store(true, Ordering::SeqCst))
+            .unwrap();
+        io.sched().fail_next_acquires(1);
+        io.run_until_done();
+        assert!(ran.load(Ordering::SeqCst), "the posted task was dropped");
+    }
+
+    // Prediction: with no fiber live to free a stack, a posted closure that
+    // cannot get one is dropped (and the loop ends rather than waiting for ever).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn posted_task_is_dropped_when_nothing_can_free_a_stack() {
+        use std::sync::Arc;
+        let mut io = io();
+        let token = Arc::new(());
+        let t = token.clone();
+        io.remote().post(move |_| drop(t)).unwrap();
+        io.sched().fail_next_acquires(1);
+        io.run_until_done();
+        assert_eq!(Arc::strong_count(&token), 1, "the closure was kept");
+    }
+
+    // Prediction: with SIGPIPE ignored (what Rust's runtime does before main),
+    // writing to a pipe whose reader is gone fails with EPIPE.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn broken_pipe_is_an_error_when_sigpipe_is_ignored() {
+        crate::cx::test_signals::sigpipe(true);
         let (r, mut w) = std::io::pipe().unwrap();
         drop(r);
         let mut io = io();
@@ -388,5 +430,29 @@ mod tests {
         .unwrap();
         io.run_until_done();
         assert_eq!(code.get(), libc::EPIPE);
+    }
+
+    // Prediction: even with SIGPIPE at its default action, `send` on a socket
+    // whose peer is gone returns EPIPE and the process survives (MSG_NOSIGNAL).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn send_to_a_closed_peer_is_epipe_even_with_default_sigpipe() {
+        child_test(
+            "io::tests::send_to_a_closed_peer_is_epipe_even_with_default_sigpipe",
+            || {
+                crate::cx::test_signals::sigpipe(false);
+                let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+                drop(b);
+                let mut io = io();
+                io.spawn(move |cx| {
+                    // The first send may succeed into the buffer on some kernels
+                    // for TCP; for a socketpair whose peer closed it fails at once.
+                    let e = cx.send(&a, b"x").unwrap_err();
+                    assert_eq!(e.raw_os_error(), Some(libc::EPIPE));
+                })
+                .unwrap();
+                io.run_until_done();
+            },
+        );
     }
 }

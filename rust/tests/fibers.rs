@@ -118,14 +118,14 @@ fn started_closure_drops_captures_once() {
     assert_eq!(drops.get(), 1);
 }
 
-// Prediction: a 64 KiB capture lands on the 256 KiB fiber stack: a local of the
+// Prediction: a 48 KiB capture lands on the 256 KiB fiber stack: a local of the
 // fiber and the capture are within one stack's distance of each other.
 #[test]
 fn large_capture_lands_on_the_fiber_stack() {
     let mut io = io();
     let ok = Rc::new(Cell::new(false));
     let o = ok.clone();
-    let big = [7u8; 64 * 1024];
+    let big = [7u8; 48 * 1024];
     io.spawn(move |_| {
         let local = 0u8;
         let a = std::ptr::from_ref(&local) as usize;
@@ -138,17 +138,19 @@ fn large_capture_lands_on_the_fiber_stack() {
     assert!(ok.get());
 }
 
-// Prediction: a closure over half the stack is ENOMEM, and the Io stays usable.
+// Prediction: a closure over a quarter of the stack is refused with E2BIG (so
+// it cannot leave the fiber too little stack to run), and the Io stays usable.
 #[test]
 fn oversized_closure_fails_cleanly() {
     let mut io = io();
-    let huge = [0u8; 200 * 1024]; // > 128 KiB = half of the 256 KiB stack
+    let huge = [0u8; 120 * 1024]; // > 64 KiB = a quarter of the 256 KiB stack
     let err = io
         .spawn(move |_| {
             let _ = &huge;
         })
         .unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc_enomem()));
+    assert_eq!(err.raw_os_error(), Some(libc_e2big()));
+    assert_eq!(err.kind(), std::io::ErrorKind::ArgumentListTooLong);
     let n = Rc::new(Cell::new(0));
     let m = n.clone();
     io.spawn(move |_| m.set(1)).unwrap();
@@ -156,9 +158,22 @@ fn oversized_closure_fails_cleanly() {
     assert_eq!(n.get(), 1);
 }
 
-// ENOMEM on Linux; spelled out so the test needs no libc dependency.
-fn libc_enomem() -> i32 {
-    12
+// Prediction: a closure just under the limit is accepted and runs.
+#[test]
+fn closure_under_the_limit_runs() {
+    let mut io = io();
+    let big = [7u8; 60 * 1024]; // < 64 KiB
+    let sum = Rc::new(Cell::new(0usize));
+    let s = sum.clone();
+    io.spawn(move |_| s.set(big.iter().map(|&b| b as usize).sum()))
+        .unwrap();
+    io.run_until_done();
+    assert_eq!(sum.get(), 7 * 60 * 1024);
+}
+
+// E2BIG on Linux; spelled out so the test needs no libc dependency.
+fn libc_e2big() -> i32 {
+    7
 }
 
 // Prediction: guard_size = 0 is rejected by validation (plan, section 8).
