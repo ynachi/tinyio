@@ -343,3 +343,43 @@ fn connect_timeout_and_timed_accept_addr() {
         ["fast=true", "peer_is_loopback=true", "quiet=Err(TimedOut)"]
     );
 }
+
+// Prediction: `TcpListener::accept` hands back a TcpStream directly; the stream
+// reports its own and its peer's address (from getsockname/getpeername, no
+// duplicated descriptor), can be closed through the ring via `OwnedFd::from`,
+// and a never-connected socket reports NotConnected for its peer.
+#[test]
+fn listener_accept_stream_addresses_and_ring_close() {
+    let mut io = io();
+    let listener = Rc::new(TcpListener::bind(loopback()).unwrap());
+    let addr = listener.local_addr().unwrap();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (l, lg) = (listener.clone(), log.clone());
+    io.spawn(move |cx| {
+        let s: TcpStream = l.accept(cx).unwrap();
+        lg.borrow_mut()
+            .push(format!("local_ok={}", s.local_addr().unwrap() == addr));
+        lg.borrow_mut().push(format!(
+            "peer_is_loopback={}",
+            s.peer_addr().unwrap().ip().is_loopback()
+        ));
+        cx.close(std::os::fd::OwnedFd::from(s)).unwrap();
+        lg.borrow_mut().push("closed through the ring".to_string());
+    })
+    .unwrap();
+    io.spawn(move |cx| {
+        let c = TcpStream::connect(cx, addr).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(cx.read(&c, &mut b, None).unwrap(), 0, "the server closed");
+    })
+    .unwrap();
+    io.run_until_done();
+    assert_eq!(
+        *log.borrow(),
+        [
+            "local_ok=true",
+            "peer_is_loopback=true",
+            "closed through the ring"
+        ]
+    );
+}

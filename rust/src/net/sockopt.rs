@@ -2,10 +2,10 @@
 //! (`SO_REUSEPORT`, the listen backlog). Every function is safe to call.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
-use super::addr::encode;
+use super::addr::{RawAddr, decode, encode};
 
 fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
     if rc < 0 {
@@ -81,4 +81,41 @@ pub(crate) fn listener(addr: &SocketAddr, backlog: i32, reuse_port: bool) -> io:
     // SAFETY: listen takes integers only.
     check(unsafe { libc::listen(fd.as_raw_fd(), backlog) })?;
     Ok(fd)
+}
+
+type NameFn =
+    unsafe extern "C" fn(libc::c_int, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int;
+
+/// `getsockname` or `getpeername`, decoded.
+fn name(fd: &impl AsFd, query: NameFn) -> io::Result<SocketAddr> {
+    let mut raw = RawAddr::zeroed();
+    let mut len = size_of::<RawAddr>() as libc::socklen_t;
+    // SAFETY: `raw` has room for `len` bytes and both outlive the call; the fd
+    // is borrowed for it.
+    check(unsafe {
+        query(
+            fd.as_fd().as_raw_fd(),
+            raw.bytes.as_mut_ptr().cast(),
+            &raw mut len,
+        )
+    })?;
+    decode(&raw, len).ok_or_else(|| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
+}
+
+pub(crate) fn local_addr(fd: &impl AsFd) -> io::Result<SocketAddr> {
+    name(fd, libc::getsockname)
+}
+
+pub(crate) fn peer_addr(fd: &impl AsFd) -> io::Result<SocketAddr> {
+    name(fd, libc::getpeername)
+}
+
+pub(crate) fn shutdown(fd: &impl AsFd, how: Shutdown) -> io::Result<()> {
+    let how = match how {
+        Shutdown::Read => libc::SHUT_RD,
+        Shutdown::Write => libc::SHUT_WR,
+        Shutdown::Both => libc::SHUT_RDWR,
+    };
+    // SAFETY: shutdown takes integers only; the fd is borrowed for the call.
+    check(unsafe { libc::shutdown(fd.as_fd().as_raw_fd(), how) }).map(drop)
 }

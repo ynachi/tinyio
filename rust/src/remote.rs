@@ -201,8 +201,12 @@ impl Remote {
     }
 
     /// Run `f` as a fiber on the runtime's thread. On `Err` the closure is
-    /// dropped unrun. `Ok` means queued: if the runtime shuts down before the
-    /// loop gets to it, the closure is dropped unrun.
+    /// dropped unrun. `Ok` means queued, not run: the closure is dropped unrun
+    /// if the runtime shuts down before the loop gets to it, and also, with an
+    /// error logged, if the process is so short of memory that no fiber stack
+    /// can be mapped and no running fiber is left to give one back. That is
+    /// out-of-memory, not a protocol failure, so it is a logged drop and not an
+    /// abort. A caller that needs to know a closure ran should make it report back.
     ///
     /// The closure must be `Send`:
     ///

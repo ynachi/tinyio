@@ -10,6 +10,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::ptr::{self, NonNull};
 use std::time::Duration;
@@ -276,19 +277,23 @@ impl Ring {
     pub(crate) fn reap(&self, mut on_fiber: impl FnMut(NonNull<FiberHeader>)) -> bool {
         const BATCH: usize = 64;
         let mut woke = false;
+        // Uninitialised on purpose: zeroing 1 KiB on every call showed up as a
+        // memset-sized loop in each tick, whether one CQE was waiting or none.
+        let mut batch = [MaybeUninit::<(u64, i32)>::uninit(); BATCH];
         loop {
-            let mut batch = [(0u64, 0i32); BATCH];
             let n = self.with(|ring| {
                 let mut cq = ring.completion();
                 let mut n = 0;
                 while n < BATCH {
                     let Some(cqe) = cq.next() else { break };
-                    batch[n] = (cqe.user_data(), cqe.result());
+                    batch[n].write((cqe.user_data(), cqe.result()));
                     n += 1;
                 }
                 n
             });
-            for &(raw, res) in &batch[..n] {
+            for slot in &batch[..n] {
+                // SAFETY: the first `n` slots were written just above.
+                let (raw, res) = unsafe { slot.assume_init() };
                 match UserData::decode(raw) {
                     UserData::Wake => {
                         self.wake_inflight.set(false);
@@ -453,6 +458,44 @@ mod tests {
             s.clear_sleep();
         }
         producer.join().unwrap();
+    }
+
+    // Prediction (the kernel fact a deferred timeout cancel relies on): an
+    // ASYNC_CANCEL queued BEFORE an operation with the same `user_data` runs
+    // before that operation exists, so it finds nothing (ENOENT) and the later
+    // read completes normally. A timeout cancel that stays in the SQ after a
+    // failed submit therefore cannot hit the fiber's next operation, which
+    // reuses the user_data.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_queued_cancel_runs_before_a_later_op_with_the_same_user_data() {
+        use io_uring::{IoUring, opcode, types::Fd};
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let mut ring = IoUring::new(8).unwrap();
+        let (r, mut w) = std::io::pipe().unwrap();
+        let mut byte = [0u8; 1];
+        let cancel = opcode::AsyncCancel::new(7).build().user_data(100);
+        let read = opcode::Read::new(Fd(r.as_raw_fd()), byte.as_mut_ptr(), 1)
+            .build()
+            .user_data(7);
+        // SAFETY: `byte` outlives the read, which completes before the end of
+        // the test (a byte is written below and the CQEs are waited for).
+        unsafe {
+            let mut sq = ring.submission();
+            sq.push(&cancel).unwrap();
+            sq.push(&read).unwrap();
+        }
+        ring.submit().unwrap();
+        w.write_all(b"x").unwrap();
+        ring.submit_and_wait(2).unwrap();
+        let mut results: Vec<(u64, i32)> = ring
+            .completion()
+            .map(|c| (c.user_data(), c.result()))
+            .collect();
+        results.sort();
+        assert_eq!(results, [(7, 1), (100, -libc::ENOENT)]);
     }
 
     // Prediction: with TWO producers racing to post into a sleeping owner, one

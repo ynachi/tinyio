@@ -40,17 +40,16 @@ impl TcpStream {
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        // A duplicate of the descriptor, only so std can ask the kernel.
-        std::net::TcpStream::from(self.fd.try_clone()?).peer_addr()
+        sockopt::peer_addr(&self.fd)
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        std::net::TcpStream::from(self.fd.try_clone()?).local_addr()
+        sockopt::local_addr(&self.fd)
     }
 
     /// Shut down one or both directions. Blocking, but it never waits.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        std::net::TcpStream::from(self.fd.try_clone()?).shutdown(how)
+        sockopt::shutdown(&self.fd, how)
     }
 
     /// Bind this stream to `cx` so `std::io::Read` and `Write` work on it
@@ -58,6 +57,14 @@ impl TcpStream {
     /// have nowhere to take a `Cx`, hence the adapter. Each call parks the fiber.
     pub fn with<'a>(&'a self, cx: &'a Cx) -> Bound<'a> {
         Bound { stream: self, cx }
+    }
+}
+
+impl From<TcpStream> for OwnedFd {
+    /// Take the descriptor back, e.g. to close it through the ring with
+    /// [`Cx::close`] (dropping a `TcpStream` closes it with a blocking `close(2)`).
+    fn from(stream: TcpStream) -> OwnedFd {
+        stream.fd
     }
 }
 

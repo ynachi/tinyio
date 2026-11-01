@@ -91,6 +91,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+compile_error!(
+    "tinyio supports Linux on x86_64 and aarch64 only: it needs io_uring, and the fiber context switch is hand-written assembly for those two CPUs"
+);
+
 mod check;
 mod cx;
 mod detail;

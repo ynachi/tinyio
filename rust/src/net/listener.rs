@@ -4,7 +4,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
+use super::TcpStream;
 use super::sockopt;
+use crate::cx::Cx;
 
 /// A listening TCP socket. Accept with [`Cx::accept`](crate::Cx::accept) or
 /// [`Cx::accept_addr`](crate::Cx::accept_addr); it is an [`AsFd`] for both.
@@ -39,10 +41,15 @@ impl TcpListener {
         })
     }
 
+    /// Wait for a connection and return it as a [`TcpStream`]
+    /// ([`Cx::accept`](crate::Cx::accept) with the wrapping done).
+    pub fn accept(&self, cx: &Cx) -> io::Result<TcpStream> {
+        cx.accept(self).map(TcpStream::from)
+    }
+
     /// The bound address (useful after binding port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        // A duplicate of the descriptor, only so std can ask the kernel.
-        std::net::TcpListener::from(self.fd.try_clone()?).local_addr()
+        sockopt::local_addr(&self.fd)
     }
 }
 

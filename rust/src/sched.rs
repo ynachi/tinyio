@@ -299,6 +299,12 @@ impl Sched {
             }
         }
         self.expired.set(due);
+        // If this submit fails, the cancel SQEs stay in the SQ and go out with
+        // the next submit. That cannot hit a later operation of the same fiber
+        // even though it reuses the same `user_data` (its `Completion` sits at
+        // the same address in its `syscall` frame): the SQ is consumed in order,
+        // and the later operation's SQE is queued behind the cancel, so the
+        // kernel runs the cancel while the later operation does not exist yet.
         if issued && let Err(e) = self.ring.submit(false, || self.reap()) {
             crate::check::error(format_args!("timeout cancel submit failed: {e}"));
         }
