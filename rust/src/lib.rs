@@ -9,6 +9,15 @@
 //! cause undefined behavior. `unsafe` is confined to the modules that switch
 //! stacks, talk to the ring, and wrap a few libc calls.
 //!
+//! # Requirements
+//!
+//! Linux 6.9 or later (x86_64 or aarch64). 6.9 added `IORING_OP_FTRUNCATE`, the
+//! newest opcode the crate submits, and there is no fallback for an older
+//! kernel. [`Io::new`] asks the kernel which opcodes it supports (a probe, not a
+//! version string: distributions backport) and returns an error of kind
+//! [`Unsupported`](std::io::ErrorKind::Unsupported) that names the missing
+//! opcode, so a caller can report it.
+//!
 //! # Shutdown
 //!
 //! [`Remote::stop`] makes [`Io::run`] cancel everything and return. I/O in
@@ -104,6 +113,7 @@ mod cx;
 mod detail;
 mod fs;
 mod io;
+mod kernel;
 pub mod net;
 mod options;
 mod remote;

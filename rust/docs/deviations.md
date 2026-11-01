@@ -156,6 +156,10 @@ A second review (of 1595515) led to these; each has a test that predicts the beh
 
 **48. Smaller changes.** `TcpListener::accept(&self, cx)` returns a `TcpStream`; `From<TcpStream> for OwnedFd` lets a stream be closed through the ring with `Cx::close`; the crate refuses to compile off Linux x86_64/aarch64 with a message saying why (not exercised here: only the supported target's standard library is installed); `peer_addr`, `local_addr` and `shutdown` call `getpeername`, `getsockname` and `shutdown` directly in `net/sockopt.rs` instead of duplicating the descriptor for std (two syscalls fewer per call).
 
+## File operations
+
+**49. The kernel floor is 6.9, not the plan's 6.1.** The file API submits `IORING_OP_FTRUNCATE`, which is 6.9. There is no fallback and nothing branches on the kernel version: `Io::new` registers an io_uring probe and requires every opcode on `kernel::REQUIRED` (the one list, next to the check), returning `ErrorKind::Unsupported` with the opcode's name and "requires Linux 6.9 or later" otherwise. A kernel too old to create the ring at all (`EINVAL`/`ENOSYS` from setup) gets the same kind of error. The check is a pure function over the answers, so the unit tests feed it a set without `Ftruncate`; `Ring::push` checks in debug builds that every SQE's opcode is on the list, so an operation added without updating it fails its first test. The C++ tree keeps 6.1.
+
 ## Process note
 
 A first attempt at checking item 1 by "mutation" changed nothing: `cargo fmt` had

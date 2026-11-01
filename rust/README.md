@@ -33,7 +33,12 @@ scripts/ab.sh pingpong   # paired A/B against the C++ build (also: context_switc
 make docker-test
 ```
 
-Linux only: io_uring (kernel 6.1+ from stage 2), x86_64 and aarch64.
+Linux only: io_uring, x86_64 and aarch64, **kernel 6.9 or later**. 6.9 is the
+kernel that added `IORING_OP_FTRUNCATE`, the newest opcode the file API submits;
+there is no fallback for an older kernel. `Io::new` asks the kernel which opcodes
+it supports (`io_uring_register_probe`, not `uname`, since distributions backport)
+and returns an `ErrorKind::Unsupported` error naming the missing one. The C++
+runtime keeps its own 6.1 floor.
 `scripts/gate.sh` is the plan's review gate as a script.
 
 Deviations from the plan, with evidence: [`docs/deviations.md`](docs/deviations.md).

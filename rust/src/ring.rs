@@ -131,7 +131,7 @@ impl Ring {
     /// Create the ring: `SINGLE_ISSUER | DEFER_TASKRUN | TASKRUN_FLAG`, created
     /// disabled and enabled at once. `Io` is `!Send`, so the creating thread is
     /// the one that runs the loop, which is what `SINGLE_ISSUER` binds to.
-    /// The CQ is twice the SQ. Kernel floor: 6.1, no fallback.
+    /// The CQ is twice the SQ. Kernel floor: 6.9 (see `kernel.rs`), no fallback.
     pub(crate) fn open(&self, entries: u32) -> io::Result<()> {
         let ring = IoUring::<Entry, cqueue::Entry>::builder()
             .setup_single_issuer()
@@ -140,8 +140,13 @@ impl Ring {
             .setup_r_disabled()
             .setup_cqsize(entries.saturating_mul(2))
             .setup_clamp()
-            .build(entries)?;
+            .build(entries)
+            .map_err(crate::kernel::setup_failed)?;
         ring.submitter().register_enable_rings()?;
+        // The kernel floor (src/kernel.rs): ask, rather than parse `uname`.
+        let mut probe = io_uring::Probe::new();
+        ring.submitter().register_probe(&mut probe)?;
+        crate::kernel::check_supported(|op| probe.is_supported(op))?;
         // SAFETY: single thread; no `with` borrow is active (we are in `open`).
         let slot = unsafe { &mut *self.ring.get() };
         check!(slot.is_none(), "ring opened twice");
@@ -185,6 +190,11 @@ impl Ring {
     /// until this submission's CQE has been reaped. For a fiber's op that is
     /// the blocked `syscall` frame (invariant 2).
     pub(crate) unsafe fn push(&self, entry: &Entry, ud: UserData) -> Result<(), PushError> {
+        crate::check::dcheck!(
+            crate::kernel::is_required(entry.get_opcode()),
+            "opcode {} is submitted but not on kernel::REQUIRED",
+            entry.get_opcode()
+        );
         let mut entry = entry.clone();
         entry.set_user_data(ud.encode());
         // SAFETY: forwarded from this fn's contract.
@@ -381,6 +391,27 @@ mod tests {
                 UserData::decode(0b11);
             },
             &["corrupt user_data"],
+        );
+    }
+
+    // Prediction: an SQE whose opcode is not on `kernel::REQUIRED` aborts the
+    // push in a debug build, naming the opcode, so an operation added without
+    // updating the list fails its first test instead of reaching production
+    // (where `Io::new` would not have probed for it).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[cfg_attr(miri, ignore)]
+    fn death_unlisted_opcode_is_caught() {
+        crate::testutil::death_test(
+            "ring::tests::death_unlisted_opcode_is_caught",
+            || {
+                let ring = Ring::closed();
+                ring.open(8).unwrap();
+                let nop = io_uring::opcode::Nop::new().build();
+                // SAFETY: the entry carries no pointers.
+                let _ = unsafe { ring.push(&nop, UserData::Cancel) };
+            },
+            &["not on kernel::REQUIRED"],
         );
     }
 

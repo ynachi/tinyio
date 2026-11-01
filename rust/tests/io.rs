@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Layer 3: I/O through the ring. Files in a temp dir, pipes and socketpairs.
-//! Each test states its prediction first. Needs Linux 6.1+.
+//! Each test states its prediction first. Needs Linux 6.9+.
 
 mod common;
 
